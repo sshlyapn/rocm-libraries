@@ -15,166 +15,8 @@ namespace hipdnn_frontend::graph
 class PointwiseAttributes : public Attributes<PointwiseAttributes>
 {
 public:
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseMode get_mode() const
-    {
-        return mode;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::optional<float> get_relu_lower_clip() const
-    {
-        return relu_lower_clip;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::optional<float> get_relu_upper_clip() const
-    {
-        return relu_upper_clip;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::optional<float> get_relu_lower_clip_slope() const
-    {
-        return relu_lower_clip_slope;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::optional<float> get_swish_beta() const
-    {
-        return swish_beta;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::optional<float> get_elu_alpha() const
-    {
-        return elu_alpha;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::optional<float> get_softplus_beta() const
-    {
-        return softplus_beta;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::optional<int64_t> get_axis() const
-    {
-        return axis;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_input_0() const
-    {
-        return getInput(InputNames::IN_0);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_input_1() const
-    {
-        return getInput(InputNames::IN_1);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_input_2() const
-    {
-        return getInput(InputNames::IN_2);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_output_0() const
-    {
-        return getOutput(OutputNames::OUT_0);
-    }
-
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_mode(PointwiseMode value)
-    {
-        mode = value;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_relu_lower_clip(float value)
-    {
-        relu_lower_clip = value;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_relu_upper_clip(float value)
-    {
-        relu_upper_clip = value;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_relu_lower_clip_slope(float value)
-    {
-        relu_lower_clip_slope = value;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_swish_beta(float value)
-    {
-        swish_beta = value;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_elu_alpha(float value)
-    {
-        elu_alpha = value;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_softplus_beta(float value)
-    {
-        softplus_beta = value;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_axis(int64_t value)
-    {
-        axis = value;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_input_0(const std::shared_ptr<TensorAttributes>& input0)
-    {
-        inputs[InputNames::IN_0] = input0;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_input_0(std::shared_ptr<TensorAttributes>&& input0)
-    {
-        inputs[InputNames::IN_0] = std::move(input0);
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_input_1(const std::shared_ptr<TensorAttributes>& input1)
-    {
-        inputs[InputNames::IN_1] = input1;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_input_1(std::shared_ptr<TensorAttributes>&& input1)
-    {
-        inputs[InputNames::IN_1] = std::move(input1);
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_input_2(const std::shared_ptr<TensorAttributes>& input2)
-    {
-        inputs[InputNames::IN_2] = input2;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_input_2(std::shared_ptr<TensorAttributes>&& input2)
-    {
-        inputs[InputNames::IN_2] = std::move(input2);
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_output_0(const std::shared_ptr<TensorAttributes>& output0)
-    {
-        outputs[OutputNames::OUT_0] = output0;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    PointwiseAttributes& set_output_0(std::shared_ptr<TensorAttributes>&& output0)
-    {
-        outputs[OutputNames::OUT_0] = std::move(output0);
-        return *this;
-    }
-
     enum class InputNames
-    {
+    {   
         IN_0 = 0,
         IN_1 = 1,
         IN_2 = 2,
@@ -201,6 +43,34 @@ public:
     std::optional<float> softplus_beta = std::nullopt;
     // NOLINTEND(readability-identifier-naming)
 
+    ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(PointwiseAttributes, input_0, InputNames::IN_0)
+    ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(PointwiseAttributes, input_1, InputNames::IN_1)
+    ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(PointwiseAttributes, input_2, InputNames::IN_2)
+    ATTRS_DEFAULT_OUTPUT_TENSOR_ACCESSOR(PointwiseAttributes, output_0, OutputNames::OUT_0)
+
+    ATTRS_DEFAULT_MEMBER_ACCESSOR(PointwiseAttributes, mode, PointwiseMode)
+
+    ATTRS_DEFAULT_MEMBER_GETTER(PointwiseAttributes, relu_lower_clip, std::optional<float>)
+    ATTRS_DEFAULT_MEMBER_SETTER(PointwiseAttributes, relu_lower_clip, float)
+
+    ATTRS_DEFAULT_MEMBER_GETTER(PointwiseAttributes, relu_upper_clip, std::optional<float>)
+    ATTRS_DEFAULT_MEMBER_SETTER(PointwiseAttributes, relu_upper_clip, float)
+
+    ATTRS_DEFAULT_MEMBER_GETTER(PointwiseAttributes, relu_lower_clip_slope, std::optional<float>)
+    ATTRS_DEFAULT_MEMBER_SETTER(PointwiseAttributes, relu_lower_clip_slope, float)
+
+    ATTRS_DEFAULT_MEMBER_GETTER(PointwiseAttributes, axis, std::optional<int64_t>)
+    ATTRS_DEFAULT_MEMBER_SETTER(PointwiseAttributes, axis, int64_t)
+
+    ATTRS_DEFAULT_MEMBER_GETTER(PointwiseAttributes, swish_beta, std::optional<float>)
+    ATTRS_DEFAULT_MEMBER_SETTER(PointwiseAttributes, swish_beta, float)
+
+    ATTRS_DEFAULT_MEMBER_GETTER(PointwiseAttributes, elu_alpha, std::optional<float>)
+    ATTRS_DEFAULT_MEMBER_SETTER(PointwiseAttributes, elu_alpha, float)
+
+    ATTRS_DEFAULT_MEMBER_GETTER(PointwiseAttributes, softplus_beta, std::optional<float>)
+    ATTRS_DEFAULT_MEMBER_SETTER(PointwiseAttributes, softplus_beta, float)
+
     flatbuffers::Offset<hipdnn_sdk::data_objects::PointwiseAttributes>
         pack_attributes(flatbuffers::FlatBufferBuilder& builder) const // NOLINT
     {
@@ -223,26 +93,6 @@ public:
             swish_beta,
             elu_alpha,
             softplus_beta);
-    }
-
-private:
-    std::shared_ptr<TensorAttributes> getInput(InputNames name) const
-    {
-        auto it = inputs.find(name);
-        if(it != inputs.end())
-        {
-            return it->second;
-        }
-        return nullptr;
-    }
-    std::shared_ptr<TensorAttributes> getOutput(OutputNames name) const
-    {
-        auto it = outputs.find(name);
-        if(it != outputs.end())
-        {
-            return it->second;
-        }
-        return nullptr;
     }
 };
 typedef PointwiseAttributes Pointwise_attributes;

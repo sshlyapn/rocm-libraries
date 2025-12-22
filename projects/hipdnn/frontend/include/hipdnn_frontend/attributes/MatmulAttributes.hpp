@@ -30,95 +30,11 @@ public:
 
     std::unordered_map<InputNames, std::shared_ptr<TensorAttributes>> inputs;
     std::unordered_map<OutputNames, std::shared_ptr<TensorAttributes>> outputs;
- 
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_a() const
-    {
-        return getInput(InputNames::A);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_b() const
-    {
-        return getInput(InputNames::B);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_c() const
-    {
-        return getOutput(OutputNames::C);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    MatmulAttributes& set_a(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setInput(InputNames::A, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    MatmulAttributes& set_a(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setInput(InputNames::A, std::move(value));
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    MatmulAttributes& set_b(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setInput(InputNames::B, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    MatmulAttributes& set_b(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setInput(InputNames::B, std::move(value));
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    MatmulAttributes& set_c(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setOutput(OutputNames::C, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    MatmulAttributes& set_c(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setOutput(OutputNames::C, std::move(value));
-    }
 
-private:
-    std::shared_ptr<TensorAttributes> getInput(InputNames name) const
-    {
-        auto it = inputs.find(name);
-        if(it != inputs.end())
-        {
-            return it->second;
-        }
-        return nullptr;
-    }
+    ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(MatmulAttributes, a, InputNames::A)
+    ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(MatmulAttributes, b, InputNames::B)
 
-    std::shared_ptr<TensorAttributes> getOutput(OutputNames name) const
-    {
-        auto it = outputs.find(name);
-        if(it != outputs.end())
-        {
-            return it->second;
-        }
-        return nullptr;
-    }
-
-    MatmulAttributes& setInput(InputNames name, const std::shared_ptr<TensorAttributes>& value)
-    {
-        inputs[name] = value;
-        return *this;
-    }
-    MatmulAttributes& setInput(InputNames name, std::shared_ptr<TensorAttributes>&& value)
-    {
-        inputs[name] = std::move(value);
-        return *this;
-    }
-
-    MatmulAttributes& setOutput(OutputNames name, const std::shared_ptr<TensorAttributes>& value)
-    {
-        outputs[name] = value;
-        return *this;
-    }
-    MatmulAttributes& setOutput(OutputNames name, std::shared_ptr<TensorAttributes>&& value)
-    {
-        outputs[name] = std::move(value);
-        return *this;
-    }
+    ATTRS_DEFAULT_OUTPUT_TENSOR_ACCESSOR(MatmulAttributes, c, OutputNames::C)
 };
 
 typedef MatmulAttributes Batchnorm_attributes;

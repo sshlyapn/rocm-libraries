@@ -41,204 +41,22 @@ public:
     // NOLINTNEXTLINE(readability-identifier-naming)
     std::vector<std::shared_ptr<TensorAttributes>> peer_stats;
 
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_x() const
-    {
-        return getInput(InputNames::X);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_scale() const
-    {
-        return getInput(InputNames::SCALE);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_bias() const
-    {
-        return getInput(InputNames::BIAS);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_epsilon() const
-    {
-        return getInput(InputNames::EPSILON);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    const std::vector<std::shared_ptr<TensorAttributes>>& get_peer_stats() const
-    {
-        return peer_stats;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_prev_running_mean() const
-    {
-        return getInput(InputNames::PREV_RUNNING_MEAN);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_prev_running_variance() const
-    {
-        return getInput(InputNames::PREV_RUNNING_VARIANCE);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_momentum() const
-    {
-        return getInput(InputNames::MOMENTUM);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_y() const
-    {
-        return getOutput(OutputNames::Y);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_mean() const
-    {
-        return getOutput(OutputNames::MEAN);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_inv_variance() const
-    {
-        return getOutput(OutputNames::INV_VARIANCE);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_next_running_mean() const
-    {
-        return getOutput(OutputNames::NEXT_RUNNING_MEAN);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    std::shared_ptr<TensorAttributes> get_next_running_variance() const
-    {
-        return getOutput(OutputNames::NEXT_RUNNING_VARIANCE);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_x(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setInput(InputNames::X, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_x(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setInput(InputNames::X, std::move(value));
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_scale(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setInput(InputNames::SCALE, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_scale(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setInput(InputNames::SCALE, std::move(value));
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_bias(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setInput(InputNames::BIAS, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_bias(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setInput(InputNames::BIAS, std::move(value));
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_epsilon(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setInput(InputNames::EPSILON, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_epsilon(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setInput(InputNames::EPSILON, std::move(value));
-    }
+    ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(BatchnormAttributes, x, InputNames::X)
+    ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(BatchnormAttributes, scale, InputNames::SCALE)
+    ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(BatchnormAttributes, bias, InputNames::BIAS)
+    ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(BatchnormAttributes, prev_running_mean, InputNames::PREV_RUNNING_MEAN)
+    ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(BatchnormAttributes, prev_running_variance, InputNames::PREV_RUNNING_VARIANCE)
+    ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(BatchnormAttributes, momentum, InputNames::MOMENTUM)
+    ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(BatchnormAttributes, epsilon, InputNames::EPSILON)
 
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_peer_stats(const std::vector<std::shared_ptr<TensorAttributes>>& value)
-    {
-        peer_stats = value;
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_peer_stats(std::vector<std::shared_ptr<TensorAttributes>>&& value)
-    {
-        peer_stats = std::move(value);
-        return *this;
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_prev_running_mean(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setInput(InputNames::PREV_RUNNING_MEAN, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_prev_running_mean(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setInput(InputNames::PREV_RUNNING_MEAN, std::move(value));
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_prev_running_variance(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setInput(InputNames::PREV_RUNNING_VARIANCE, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_prev_running_variance(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setInput(InputNames::PREV_RUNNING_VARIANCE, std::move(value));
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_momentum(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setInput(InputNames::MOMENTUM, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_momentum(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setInput(InputNames::MOMENTUM, std::move(value));
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_y(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setOutput(OutputNames::Y, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_y(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setOutput(OutputNames::Y, std::move(value));
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_mean(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setOutput(OutputNames::MEAN, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_mean(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setOutput(OutputNames::MEAN, std::move(value));
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_inv_variance(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setOutput(OutputNames::INV_VARIANCE, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_inv_variance(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setOutput(OutputNames::INV_VARIANCE, std::move(value));
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_next_running_mean(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setOutput(OutputNames::NEXT_RUNNING_MEAN, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_next_running_mean(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setOutput(OutputNames::NEXT_RUNNING_MEAN, std::move(value));
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_next_running_variance(const std::shared_ptr<TensorAttributes>& value)
-    {
-        return setOutput(OutputNames::NEXT_RUNNING_VARIANCE, value);
-    }
-    // NOLINTNEXTLINE(readability-identifier-naming)
-    BatchnormAttributes& set_next_running_variance(std::shared_ptr<TensorAttributes>&& value)
-    {
-        return setOutput(OutputNames::NEXT_RUNNING_VARIANCE, std::move(value));
-    }
+    ATTRS_DEFAULT_OUTPUT_TENSOR_ACCESSOR(BatchnormAttributes, y, OutputNames::Y)
+    ATTRS_DEFAULT_OUTPUT_TENSOR_ACCESSOR(BatchnormAttributes, mean, OutputNames::MEAN)
+    ATTRS_DEFAULT_OUTPUT_TENSOR_ACCESSOR(BatchnormAttributes, inv_variance, OutputNames::INV_VARIANCE)
+    ATTRS_DEFAULT_OUTPUT_TENSOR_ACCESSOR(BatchnormAttributes, next_running_mean, OutputNames::NEXT_RUNNING_MEAN)
+    ATTRS_DEFAULT_OUTPUT_TENSOR_ACCESSOR(BatchnormAttributes, next_running_variance, OutputNames::NEXT_RUNNING_VARIANCE)
+
+    ATTRS_DEFAULT_MEMBER_ACCESSOR(BatchnormAttributes, peer_stats, std::vector<std::shared_ptr<TensorAttributes>>)
+
     // NOLINTBEGIN(readability-identifier-naming)
     BatchnormAttributes&
         set_previous_running_stats(const std::shared_ptr<TensorAttributes>& mean,
@@ -299,49 +117,6 @@ public:
                             : flatbuffers::nullopt,
             nextRunningVariance ? flatbuffers::Optional<int64_t>(nextRunningVariance->get_uid())
                                 : flatbuffers::nullopt);
-    }
-
-private:
-    std::shared_ptr<TensorAttributes> getInput(InputNames name) const
-    {
-        auto it = inputs.find(name);
-        if(it != inputs.end())
-        {
-            return it->second;
-        }
-        return nullptr;
-    }
-
-    std::shared_ptr<TensorAttributes> getOutput(OutputNames name) const
-    {
-        auto it = outputs.find(name);
-        if(it != outputs.end())
-        {
-            return it->second;
-        }
-        return nullptr;
-    }
-
-    BatchnormAttributes& setInput(InputNames name, const std::shared_ptr<TensorAttributes>& value)
-    {
-        inputs[name] = value;
-        return *this;
-    }
-    BatchnormAttributes& setInput(InputNames name, std::shared_ptr<TensorAttributes>&& value)
-    {
-        inputs[name] = std::move(value);
-        return *this;
-    }
-
-    BatchnormAttributes& setOutput(OutputNames name, const std::shared_ptr<TensorAttributes>& value)
-    {
-        outputs[name] = value;
-        return *this;
-    }
-    BatchnormAttributes& setOutput(OutputNames name, std::shared_ptr<TensorAttributes>&& value)
-    {
-        outputs[name] = std::move(value);
-        return *this;
     }
 };
 
