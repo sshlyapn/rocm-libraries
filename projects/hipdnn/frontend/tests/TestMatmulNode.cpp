@@ -213,11 +213,11 @@ TEST(TestMatmulNode, InferPropertiesNode_InferBatchedDimsAndStrides)
 {
     MatmulAttributes attrs;
     auto a = std::make_shared<TensorAttributes>();
-    a->set_dim({2, 4, 8}); // [B=2, M=4, K=8]
+    a->set_dim({2, 4, 8});
     attrs.set_a(a);
 
     auto b = std::make_shared<TensorAttributes>();
-    b->set_dim({1, 8, 5}); // [B=1, K=8, N=5]
+    b->set_dim({1, 8, 5});
     attrs.set_b(b);
 
     auto c = std::make_shared<TensorAttributes>();
@@ -230,15 +230,13 @@ TEST(TestMatmulNode, InferPropertiesNode_InferBatchedDimsAndStrides)
 
     auto dims = c->get_dim();
     ASSERT_EQ(dims.size(), 3u);
-    EXPECT_EQ(dims[0], 2); // max(2,1)
-    EXPECT_EQ(dims[1], 4); // M
-    EXPECT_EQ(dims[2], 5); // N
+    EXPECT_EQ(dims[0], 2);
+    EXPECT_EQ(dims[1], 4);
+    EXPECT_EQ(dims[2], 5);
 
     auto strides = c->get_stride();
     ASSERT_EQ(strides.size(), 3u);
-    EXPECT_EQ(strides[2], 1);  // N stride
-    EXPECT_EQ(strides[1], 5);  // M stride
-    EXPECT_EQ(strides[0], 20); // B stride = M*N
+    EXPECT_EQ(strides[2], 1);
+    EXPECT_EQ(strides[1], 5);
+    EXPECT_EQ(strides[0], 20);
 }
-
-

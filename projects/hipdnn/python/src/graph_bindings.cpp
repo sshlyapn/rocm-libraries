@@ -8,6 +8,7 @@
 #include <hipdnn_frontend/attributes/ConvolutionDgradAttributes.hpp>
 #include <hipdnn_frontend/attributes/ConvolutionFpropAttributes.hpp>
 #include <hipdnn_frontend/attributes/ConvolutionWgradAttributes.hpp>
+#include <hipdnn_frontend/attributes/MatmulAttributes.hpp>
 #include <hipdnn_frontend/attributes/PointwiseAttributes.hpp>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -114,6 +115,7 @@ void graph_bindings(nb::module_& m)
                                std::shared_ptr<graph::TensorAttributes>,
                                graph::PointwiseAttributes>(&graph::Graph::pointwise))
         .def("conv_fprop", &graph::Graph::conv_fprop)
+        .def("matmul", &graph::Graph::matmul)
         .def("conv_dgrad", &graph::Graph::conv_dgrad)
         .def("conv_wgrad", &graph::Graph::conv_wgrad)
         .def("set_preferred_engine_id_ext", &graph::Graph::set_preferred_engine_id_ext)

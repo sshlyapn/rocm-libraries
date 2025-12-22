@@ -44,5 +44,5 @@ public:
     }
 };
 
-typedef MatmulAttributes Batchnorm_attributes;
+typedef MatmulAttributes Matmul_attributes;
 } // namespace hipdnn_frontend::graph
