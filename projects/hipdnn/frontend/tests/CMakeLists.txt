@@ -29,6 +29,7 @@ add_executable(
     TestConvolutionWgradAttributes.cpp
     TestConvolutionWgradNode.cpp
     TestMatmulAttributes.cpp
+    TestMatmulNode.cpp
     TestError.cpp
     TestGraph.cpp
     TestGraphAttributes.cpp

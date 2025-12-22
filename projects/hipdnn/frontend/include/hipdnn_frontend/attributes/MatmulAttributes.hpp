@@ -4,7 +4,7 @@
 
 #include "Attributes.hpp"
 #include "TensorAttributes.hpp"
-// #include <hipdnn_sdk/data_objects/batchnorm_attributes_generated.h>
+#include <hipdnn_sdk/data_objects/matmul_attributes_generated.h>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -35,6 +35,13 @@ public:
     ATTRS_DEFAULT_INPUT_TENSOR_ACCESSOR(MatmulAttributes, b, InputNames::B)
 
     ATTRS_DEFAULT_OUTPUT_TENSOR_ACCESSOR(MatmulAttributes, c, OutputNames::C)
+
+    flatbuffers::Offset<hipdnn_sdk::data_objects::MatmulAttributes>
+        pack_attributes(flatbuffers::FlatBufferBuilder& builder) const // NOLINT
+    {
+        return hipdnn_sdk::data_objects::CreateMatmulAttributes(
+            builder, get_a()->get_uid(), get_b()->get_uid(), get_c()->get_uid());
+    }
 };
 
 typedef MatmulAttributes Batchnorm_attributes;
