@@ -153,6 +153,97 @@ struct GemmTile1DPartitioner
 };
 
 /**
+ * @brief Class providing 1D WGP index mapping into 2D output C-tile space with
+ *        N-dimension chunked (column-major) tile ordering.
+ *
+ * Tiles are enumerated in column-major order: all M-tiles for a given N-tile are
+ * visited before advancing to the next N-tile.  This means that in a persistent
+ * kernel the first M_blocks tiles form the first N-chunk, the next M_blocks tiles
+ * form the second N-chunk, and so on:
+ *
+ *   tile_idx 0         → (M0, N0)
+ *   tile_idx 1         → (M1, N0)
+ *   ...
+ *   tile_idx M_blocks-1→ (M_{last}, N0)    ← end of chunk 0
+ *   tile_idx M_blocks  → (M0, N1)          ← start of chunk 1
+ *   ...
+ *
+ * This is the natural ordering for "compute M×(N/SPLIT) first, then next chunk".
+ *
+ * @tparam BlockGemmShape_  A class providing basic GEMM parameters. \link TileGemmShape
+ */
+template <typename BlockGemmShape_>
+struct GemmTileNChunked1DPartitioner
+{
+    using BlockGemmShape = remove_cvref_t<BlockGemmShape_>;
+
+    static constexpr index_t MPerBlock = BlockGemmShape::kM;
+    static constexpr index_t NPerBlock = BlockGemmShape::kN;
+    static constexpr index_t KPerBlock = BlockGemmShape::kK;
+
+    CK_TILE_HOST_DEVICE GemmTileNChunked1DPartitioner() noexcept = delete;
+
+    /**
+     * @brief Construct a new GemmTileNChunked1DPartitioner object.
+     *
+     * @param M     GEMM's M dimension.
+     * @param N     GEMM's N dimension.
+     */
+    CK_TILE_HOST_DEVICE GemmTileNChunked1DPartitioner(index_t M, [[maybe_unused]] index_t N) noexcept
+    {
+        M_ = M;
+    }
+
+    /**
+     * @brief Calculates GEMM kernel grid size (total number of tiles).
+     *
+     * @param M     GEMM's M dimension.
+     * @param N     GEMM's N dimension.
+     * @return index_t  Total number of output tiles.
+     */
+    CK_TILE_HOST_DEVICE static auto
+    GridSize(index_t M, index_t N) noexcept(noexcept(MPerBlock != 0 && NPerBlock != 0)) -> index_t
+    {
+        const index_t GridDimX = (M + MPerBlock - 1) / MPerBlock;
+        const index_t GridDimY = (N + NPerBlock - 1) / NPerBlock;
+        return GridDimX * GridDimY;
+    }
+
+    /**
+     * @brief Calculate number of loop iterations over GEMM's K dimension.
+     *
+     * @param K         GEMM's K dimension.
+     * @return index_t  The number of loop iterations over K dimension.
+     */
+    CK_TILE_HOST_DEVICE static auto GetLoopNum(index_t K) noexcept -> index_t
+    {
+        return integer_divide_ceil(K, KPerBlock);
+    }
+
+    /**
+     * @brief Calculate workgroup 1D index mapping into 2D output C-tile space
+     *        using column-major (N-chunked) ordering.
+     *
+     * Column-major: iN = tile_idx / MBlocks,  iM = tile_idx % MBlocks
+     *
+     * @param blockIdx      WGP's 1D index.
+     * @return const tuple<index_t, index_t>    Tuple containing 2D output C-tile index (iM, iN).
+     */
+    CK_TILE_DEVICE auto
+    GetOutputTileIndex(index_t blockIdx) noexcept -> const tuple<index_t, index_t>
+    {
+        const index_t MBlocks = integer_divide_ceil(M_, MPerBlock);
+
+        const index_t iN = amd_wave_read_first_lane(blockIdx / MBlocks);
+        const index_t iM = amd_wave_read_first_lane(blockIdx - iN * MBlocks);
+        return make_tuple(iM, iN);
+    }
+
+    private:
+    CK_TILE_DEVICE static index_t M_;
+};
+
+/**
  * @brief `GemmTile1DPartitioner::GetOutputTileIndex`'s std::false specialization,
  * checking expression validity in-place for ill-formed.
  */
