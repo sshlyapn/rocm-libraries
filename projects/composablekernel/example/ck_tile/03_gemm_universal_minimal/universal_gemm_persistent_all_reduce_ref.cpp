@@ -863,33 +863,91 @@ int main(int argc, char** argv)
                   << (num_post_work > 0 ? " (reduced rows only)" : " (full M×N)") << "\n";
 
         // --- Benchmark: GEMM + Reduce + AllGather ---
-        const float persistent_ms = ck_tile::launch_kernel(
-            s,
-            ck_tile::make_kernel<kBlockPerCu>(
-                PersistKernel{}, persistent_grids, persistent_blocks, 0, persistent_kargs),
-            [&](const ck_tile::stream_config& sc) {
-                // Separate reduction kernel (only if tokens_per_reduction > 0)
-                if(reduce_grid_size > 0)
-                {
-                    reduce_kernel<<<reduce_grid_size, reduce_block_size, 0, sc.stream_id_>>>(
-                        reduce_kargs);
-                }
-                // NCCL AllGather: send reduced rows (skip when no reduction)
-                if(tokens_per_reduction > 0)
-                {
-                    const void* ag_send_ptr = (dE_reduced != nullptr)
-                        ? static_cast<const void*>(dE_reduced)
-                        : static_cast<const void*>(dE);
-                    nccl_check(ncclAllGather(
-                        ag_send_ptr,
-                        static_cast<void*>(dE_all),
-                        ag_send_count,
-                        ncclFloat16,
-                        nccl_comm,
-                        sc.stream_id_),
-                        "ncclAllGather");
-                }
-            });
+        //
+        // NOTE: We intentionally do NOT use ck_tile::launch_kernel() here because
+        // its launch_and_check() uses short-circuit fold evaluation:
+        //     (callable(sc), hipPeekAtLastError()) && ...
+        // If hipPeekAtLastError() detects a (possibly stale async) HIP error after
+        // the GEMM callable, the NCCL AllGather callable is NEVER called and
+        // HIP_CHECK_ERROR throws.  That kills this MPI rank while other ranks
+        // still call AllGather → NCCL deadlock → GPU hang → system unreachable.
+        //
+        // Instead we use a manual timing loop with:
+        //  - a dedicated (non-null) HIP stream  (avoids null-stream sync pitfalls)
+        //  - an MPI_Barrier so all ranks start together
+        //  - unconditional NCCL calls (no short-circuit) so ranks stay in sync
+        //  - explicit hipStreamSynchronize between warmup and timed phases
+
+        // Dedicated stream for the benchmark (avoids null-stream implicit sync)
+        hipStream_t bench_stream;
+        hip_check(hipStreamCreate(&bench_stream), "hipStreamCreate(bench)");
+
+        // Resolve NCCL send pointer once
+        const void* ag_send_ptr = (dE_reduced != nullptr)
+            ? static_cast<const void*>(dE_reduced)
+            : static_cast<const void*>(dE);
+
+        // The kernel entry point that make_kernel would have produced
+        const auto gemm_kernel =
+            ck_tile::kentry<kBlockPerCu, PersistKernel,
+                            typename PersistKernel::KernelArgs>;
+
+        // One iteration: GEMM → reduce → AllGather, all on bench_stream
+        auto run_one_iter = [&]() {
+            gemm_kernel<<<persistent_grids, persistent_blocks, 0, bench_stream>>>(
+                persistent_kargs);
+            if(reduce_grid_size > 0)
+            {
+                reduce_kernel<<<reduce_grid_size, reduce_block_size, 0, bench_stream>>>(
+                    reduce_kargs);
+            }
+            if(tokens_per_reduction > 0)
+            {
+                nccl_check(ncclAllGather(
+                    ag_send_ptr,
+                    static_cast<void*>(dE_all),
+                    ag_send_count,
+                    ncclFloat16,
+                    nccl_comm,
+                    bench_stream),
+                    "ncclAllGather");
+            }
+        };
+
+        // Synchronize all MPI ranks so they enter the timing loop together.
+#if defined(CK_TILE_EXAMPLE_USE_MPI) && CK_TILE_EXAMPLE_USE_MPI
+        MPI_Barrier(MPI_COMM_WORLD);
+#endif
+
+        // --- Warmup ---
+        for(int i = 0; i < warmup; i++)
+        {
+            run_one_iter();
+        }
+        // Drain the warmup work and catch any async errors before timing.
+        hip_check(hipStreamSynchronize(bench_stream), "hipStreamSynchronize(warmup)");
+
+        // --- Timed phase ---
+        hipEvent_t t_start, t_stop;
+        hip_check(hipEventCreate(&t_start), "hipEventCreate(start)");
+        hip_check(hipEventCreate(&t_stop),  "hipEventCreate(stop)");
+
+        hip_check(hipEventRecord(t_start, bench_stream), "hipEventRecord(start)");
+        for(int i = 0; i < repeat; i++)
+        {
+            run_one_iter();
+        }
+        hip_check(hipEventRecord(t_stop, bench_stream), "hipEventRecord(stop)");
+        hip_check(hipEventSynchronize(t_stop), "hipEventSynchronize(stop)");
+
+        float persistent_ms = 0.0f;
+        hip_check(hipEventElapsedTime(&persistent_ms, t_start, t_stop),
+                  "hipEventElapsedTime");
+        persistent_ms /= static_cast<float>(repeat);
+
+        hip_check(hipEventDestroy(t_start), "hipEventDestroy(start)");
+        hip_check(hipEventDestroy(t_stop),  "hipEventDestroy(stop)");
+        hip_check(hipStreamDestroy(bench_stream), "hipStreamDestroy(bench)");
 
         const double persistent_tflops =
             (persistent_ms > 0.0f)
@@ -1001,11 +1059,11 @@ int main(int argc, char** argv)
             if(tokens_per_reduction > 0)
             {
                 std::cout << "Running NCCL AllGather..." << std::flush;
-                const void* ag_send_ptr = (dE_reduced != nullptr)
+                const void* verify_ag_send_ptr = (dE_reduced != nullptr)
                     ? static_cast<const void*>(dE_reduced)
                     : static_cast<const void*>(dE);
                 nccl_check(ncclAllGather(
-                    ag_send_ptr, static_cast<void*>(dE_all),
+                    verify_ag_send_ptr, static_cast<void*>(dE_all),
                     ag_send_count, ncclFloat16, nccl_comm, nullptr),
                     "ncclAllGather(verify)");
                 hip_check(hipDeviceSynchronize(), "sync(verify allgather)");

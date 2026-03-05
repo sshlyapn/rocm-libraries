@@ -31,6 +31,7 @@ import re
 import glob
 import signal
 import sys
+import threading
 from datetime import datetime
 from itertools import product
 
@@ -45,6 +46,9 @@ BUILD_DIR = "."
 FUSED_EXE       = "tile_example_gemm_universal_persistent_all_reduce"
 REF_DEFAULT_EXE = "tile_example_gemm_universal_persistent_all_reduce_ref_default"
 REF_RDC_EXE     = "tile_example_gemm_universal_persistent_all_reduce_ref_rdc"
+
+# REF_DEFAULT_EXE = "rccl_issue_reproducer"
+# REF_RDC_EXE     = "rccl_issue_reproducer"
 
 # MPI launcher for multi-GPU runs
 MPI_LAUNCHER = "mpiexec"
@@ -83,7 +87,7 @@ M_VALUES = M_VALUES_FULL
 N_VALUES = [4096, 8192, 16384]
 
 # K: several options (must be multiples of KPerBlock=64 for config 1)
-K_VALUES = [2048, 4096, 8192]
+K_VALUES = [2048, 4096, 8192, 16384]
 
 # ---- Fused-kernel specific ----
 # Number of N-chunks for chunked all-reduce signalling.
@@ -94,15 +98,17 @@ K_VALUES = [2048, 4096, 8192]
 NUM_CHUNKS_VALUES_FULL = [2, 4, 8, 16]
 NUM_CHUNKS_VALUES_SHORT = [4, 8]
 NUM_CHUNKS_VALUES_SINGLE = [8]
+NUM_CHUNKS_VALUES_TEST = [8, 16]
 
-NUM_CHUNKS_VALUES = NUM_CHUNKS_VALUES_SINGLE
+NUM_CHUNKS_VALUES = NUM_CHUNKS_VALUES_TEST
 
 # Rows per reduction group. Must be <= warp_size (64).
 # Creates num_post_work = ceil(M / tokens_per_reduction) groups.
 TOKENS_PER_REDUCTION_VALUES_FULL = [1, 2, 3, 8]
-TOKENS_PER_REDUCTION_VALUES_SHORT = [1, 2]
+TOKENS_PER_REDUCTION_VALUES_SHORT = [1, 2, 8]
+TOKENS_PER_REDUCTION_VALUES_TEST = [0]
 
-TOKENS_PER_REDUCTION_VALUES = TOKENS_PER_REDUCTION_VALUES_SHORT
+TOKENS_PER_REDUCTION_VALUES = TOKENS_PER_REDUCTION_VALUES_TEST
 
 # Number of WGs dedicated to GEMM compute (fused kernel).
 # MaxOccupancyGridSize = 256 on MI350X with config 1 (kBlockPerCu=1, 256 CUs).
@@ -110,8 +116,9 @@ TOKENS_PER_REDUCTION_VALUES = TOKENS_PER_REDUCTION_VALUES_SHORT
 # Sweep several values to find the best compute / PP WG balance.
 NUM_COMPUTE_WGS_FUSED_VALUES_FULL = [128, 160, 192, 224, 248]
 NUM_COMPUTE_WGS_FUSED_VALUES_SHORT = [192, 224]
+NUM_COMPUTE_WGS_FUSED_VALUES_TEST = [192, 208]
 
-NUM_COMPUTE_WGS_FUSED_VALUES = NUM_COMPUTE_WGS_FUSED_VALUES_SHORT
+NUM_COMPUTE_WGS_FUSED_VALUES = NUM_COMPUTE_WGS_FUSED_VALUES_TEST
 
 # ---- Ref-kernel specific ----
 # All WGs do GEMM (no PP WGs). 256 = full occupancy on MI350X.
@@ -144,39 +151,144 @@ def estimate_rocshmem_heap_bytes(M, N, tpr, num_ranks=NUM_RANKS, elem_bytes=2):
         ag_total_bytes = num_ranks × ceil(M / tpr) × N × elem_bytes
     on the symmetric heap via rocshmem_malloc.
 
-    Returns the required heap size in bytes, rounded UP to the nearest 1 GiB.
-    Always returns at least 1 GiB.
+    The heap must be strictly LARGER than the buffer to accommodate rocSHMEM
+    internal metadata and alignment overhead.  We round the buffer size up to
+    the next GiB and then add 1 GiB of headroom.  Always returns at least 2 GiB.
     """
     if tpr <= 0:
-        return 1 << 30  # 1 GiB default
+        return 2 << 30  # 2 GiB default
     num_post_work = (M + tpr - 1) // tpr
     ag_total_bytes = num_ranks * num_post_work * N * elem_bytes
     one_gib = 1 << 30
-    heap_gib = (ag_total_bytes + one_gib - 1) // one_gib
-    heap_gib = max(heap_gib, 1)
+    buf_gib = (ag_total_bytes + one_gib - 1) // one_gib
+    heap_gib = buf_gib + 1  # +1 GiB headroom for rocSHMEM metadata
+    heap_gib = max(heap_gib, 2)
     return heap_gib * one_gib
 
 
-def run_cmd(cmd, timeout=TIMEOUT, env=None):
-    """Run command, return (stdout, stderr, returncode)."""
+def run_cmd(cmd, timeout=TIMEOUT, env=None, log_fp=None):
+    """Run command, return (stdout, stderr, returncode).
+
+    When *log_fp* is provided, stdout is streamed line-by-line to that file
+    **in real time** (flushed after every line).  This ensures partial output
+    is persisted even if the system crashes mid-run.  The full stdout is still
+    returned as a string for parsing.
+
+    stderr is collected in a background thread and returned at the end.
+    """
+    if log_fp is None:
+        # Legacy path — fully-buffered (kept for callers that don't pass log_fp)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                               env=env)
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return "", "TIMEOUT after {}s".format(timeout), -1
+        except Exception as e:
+            return "", str(e), -1
+
+    # --- Streaming path -------------------------------------------------
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           env=env)
-        return r.stdout, r.stderr, r.returncode
-    except subprocess.TimeoutExpired:
-        return "", "TIMEOUT after {}s".format(timeout), -1
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env)
     except Exception as e:
         return "", str(e), -1
 
+    stdout_lines = []
+    stderr_lines = []
+
+    def _drain_stderr():
+        for line in proc.stderr:
+            stderr_lines.append(line)
+
+    t = threading.Thread(target=_drain_stderr, daemon=True)
+    t.start()
+
+    try:
+        for line in proc.stdout:
+            stdout_lines.append(line)
+            log_fp.write(line)
+            log_fp.flush()
+
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        return "".join(stdout_lines), "TIMEOUT after {}s".format(timeout), -1
+    except Exception as e:
+        proc.kill()
+        proc.wait()
+        return "".join(stdout_lines), str(e), -1
+
+    t.join(timeout=5)
+    return "".join(stdout_lines), "".join(stderr_lines), proc.returncode
+
+
+# ---- GPU health monitoring ---------------------------------------------------
+
+# Patterns that indicate a fatal or pre-fatal GPU condition in dmesg.
+_GPU_ERROR_PATTERNS = re.compile(
+    r'uncorrectable.+error|'
+    r'device lost from bus|'
+    r'GPU reset begin|'
+    r'ERREVENT_ATHUB_INTERRUPT|'
+    r'RAS table recovery failed|'
+    r'Oops:.*PREEMPT',
+    re.IGNORECASE)
+
+def get_dmesg_gpu_errors():
+    """Return list of new GPU-related dmesg lines since last boot.
+
+    Only returns lines matching fatal/pre-fatal patterns.
+    Lightweight: reads from /dev/kmsg via dmesg.
+    """
+    try:
+        r = subprocess.run(
+            ["dmesg", "--level=emerg,alert,crit,err", "--ctime", "--nocolor"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return []
+        return [ln for ln in r.stdout.splitlines() if _GPU_ERROR_PATTERNS.search(ln)]
+    except Exception:
+        return []
+
+
+def check_gpu_health(log_fp, baseline_errors):
+    """Check dmesg for NEW GPU errors since *baseline_errors*.
+
+    Returns (is_healthy, new_errors_list).
+    """
+    current = get_dmesg_gpu_errors()
+    new_errors = current[len(baseline_errors):]
+    if new_errors:
+        log_fp.write("\n!!! GPU HEALTH CHECK — NEW ERRORS DETECTED !!!\n")
+        for e in new_errors:
+            log_fp.write("  {}\n".format(e))
+        log_fp.flush()
+    return (len(new_errors) == 0), new_errors
+
 
 def parse_persistent_ms(stdout):
-    """Extract avg_ms and tflops from the [persistent...] output line."""
-    m = re.search(
+    """Extract avg_ms and tflops from the [persistent...] output line.
+
+    All 8 MPI ranks print this line (no rank-0 guard in C++), so we find
+    *all* matches and return the **maximum** avg_ms across ranks (= true
+    wall-clock time of the collective) and the corresponding tflops.
+    """
+    matches = re.findall(
         r'\[persistent[^\]]*\]\s+avg_ms=([0-9.eE+-]+)\s+tflops=([0-9.eE+-]+)',
         stdout)
-    if m:
-        return float(m.group(1)), float(m.group(2))
-    return None, None
+    if not matches:
+        return None, None
+    # Pick the rank with the highest (= slowest) avg_ms
+    best_ms, best_tflops = None, None
+    for ms_str, tf_str in matches:
+        ms = float(ms_str)
+        tf = float(tf_str)
+        if best_ms is None or ms > best_ms:
+            best_ms, best_tflops = ms, tf
+    return best_ms, best_tflops
 
 
 def parse_grid_size(stdout):
@@ -308,6 +420,9 @@ def main():
                              "existing benchmark_results_*.csv; the timing CSV and "
                              "log file are derived automatically. Already-completed "
                              "cases are skipped.")
+    parser.add_argument("--run_ref_only", action="store_true", default=False,
+                        help="Only run the reference kernels (ref_default + ref_rdc), "
+                             "skip all fused kernel cases.")
     args = parser.parse_args()
 
     # ---- Resolve output file paths ----
@@ -331,8 +446,13 @@ def main():
     ref_default_path = exe_path(REF_DEFAULT_EXE)
     ref_rdc_path     = exe_path(REF_RDC_EXE)
 
-    # Check executables exist
-    for name, path in [("fused", fused_path), ("ref_default", ref_default_path), ("ref_rdc", ref_rdc_path)]:
+    run_ref_only = args.run_ref_only
+
+    # Check executables exist (skip fused check when --run_ref_only)
+    exes_to_check = [("ref_default", ref_default_path), ("ref_rdc", ref_rdc_path)]
+    if not run_ref_only:
+        exes_to_check.insert(0, ("fused", fused_path))
+    for name, path in exes_to_check:
         if not os.path.isfile(path):
             print(f"ERROR: executable not found: {path}")
             print(f"  Make sure BUILD_DIR is set correctly (currently: '{BUILD_DIR}')")
@@ -342,18 +462,19 @@ def main():
     cases = []
 
     # Fused kernel: M × N × K × num_chunks × tokens_per_reduction × num_compute_wgs
-    for M, N, K, nc, tpr, cwg in product(M_VALUES, N_VALUES, K_VALUES,
-                                          NUM_CHUNKS_VALUES,
-                                          TOKENS_PER_REDUCTION_VALUES,
-                                          NUM_COMPUTE_WGS_FUSED_VALUES):
-        cases.append({
-            'variant': 'fused',
-            'exe': fused_path,
-            'M': M, 'N': N, 'K': K,
-            'num_chunks': nc,
-            'tpr': tpr,
-            'cwg': cwg,
-        })
+    if not run_ref_only:
+        for M, N, K, nc, tpr, cwg in product(M_VALUES, N_VALUES, K_VALUES,
+                                              NUM_CHUNKS_VALUES,
+                                              TOKENS_PER_REDUCTION_VALUES,
+                                              NUM_COMPUTE_WGS_FUSED_VALUES):
+            cases.append({
+                'variant': 'fused',
+                'exe': fused_path,
+                'M': M, 'N': N, 'K': K,
+                'num_chunks': nc,
+                'tpr': tpr,
+                'cwg': cwg,
+            })
 
     # Ref kernels (default + rdc): M × N × K × tokens_per_reduction
     for tag, path in [('ref_default', ref_default_path), ('ref_rdc', ref_rdc_path)]:
@@ -372,16 +493,19 @@ def main():
     n_fused = sum(1 for c in cases if c['variant'] == 'fused')
     n_ref   = total - n_fused
 
-    print(f"\nTest matrix:")
+    mode_str = "ref-only" if run_ref_only else "fused + ref"
+    print(f"\nTest matrix ({mode_str}):")
     print(f"  M values:  {len(M_VALUES)}  {M_VALUES}")
     print(f"  N values:  {N_VALUES}")
     print(f"  K values:  {K_VALUES}")
-    print(f"  Chunks:    {NUM_CHUNKS_VALUES} (fused only)")
+    if not run_ref_only:
+        print(f"  Chunks:    {NUM_CHUNKS_VALUES} (fused only)")
+        print(f"  num_compute_wgs (fused): {NUM_COMPUTE_WGS_FUSED_VALUES}")
     print(f"  tokens_per_reduction: {TOKENS_PER_REDUCTION_VALUES}")
-    print(f"  num_compute_wgs (fused): {NUM_COMPUTE_WGS_FUSED_VALUES}")
     print(f"  num_compute_wgs (ref):   {NUM_COMPUTE_WGS_REF}")
     print(f"  Config:    {CONFIG_ID}")
-    print(f"\n  Fused cases:       {n_fused}")
+    if not run_ref_only:
+        print(f"\n  Fused cases:       {n_fused}")
     print(f"  Ref cases:         {n_ref} ({n_ref//2} default + {n_ref//2} rdc)")
     print(f"  Total cases:       {total}")
     # ---- Resume: load already-completed keys ----
@@ -430,7 +554,7 @@ def main():
 
     def print_summary(completed_idx):
         """Print summary (called on normal exit or Ctrl+C)."""
-        tag = "INTERRUPTED" if interrupted else "complete"
+        tag = "GPU_ABORT" if gpu_abort else ("INTERRUPTED" if interrupted else "complete")
         print("\n" + "=" * 50)
         print("Benchmark {}!  ({}/{} cases)".format(tag, completed_idx, total))
         if skipped_perf or skipped_timing:
@@ -445,6 +569,12 @@ def main():
         print("  Logs:     {}".format(LOG_FILE))
         print("=" * 50)
 
+    # ---- Build the resume command for the log ----
+    resume_cmd = "python3 {} --resume {}".format(
+        os.path.abspath(sys.argv[0]), os.path.abspath(RESULT_CSV))
+    if run_ref_only:
+        resume_cmd += " --run_ref_only"
+
     # Open in append mode when resuming (headers already exist), write mode otherwise.
     file_mode = 'a' if resuming else 'w'
 
@@ -458,13 +588,61 @@ def main():
             writer.writeheader()
             timing_writer.writeheader()
 
+        # ---- Write log header with invocation, config, and resume cmd ----
+        now_hdr = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if resuming:
             log_fp.write("\n\n{}\n".format("=" * 70))
-            log_fp.write("=== RESUMED at {} ===\n".format(
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-            log_fp.write("{}\n\n".format("=" * 70))
+            log_fp.write("=== RESUMED at {} ===\n".format(now_hdr))
+            log_fp.write("{}\n".format("=" * 70))
+        else:
+            log_fp.write("{}\n".format("=" * 70))
+            log_fp.write("  Benchmark started at {}\n".format(now_hdr))
+            log_fp.write("{}\n".format("=" * 70))
+
+        log_fp.write("\n--- Invocation command ---\n")
+        log_fp.write("  {}\n".format(" ".join(sys.argv)))
+        log_fp.write("  CWD: {}\n".format(os.getcwd()))
+
+        log_fp.write("\n--- Test configuration ---\n")
+        log_fp.write("  Mode:                    {}\n".format(
+            "ref-only" if run_ref_only else "fused + ref"))
+        log_fp.write("  BUILD_DIR:               {}\n".format(os.path.abspath(BUILD_DIR)))
+        log_fp.write("  MPI_LAUNCHER:            {} {}\n".format(MPI_LAUNCHER, " ".join(MPI_FLAGS)))
+        log_fp.write("  NUM_RANKS:               {}\n".format(NUM_RANKS))
+        log_fp.write("  CONFIG_ID:               {}\n".format(CONFIG_ID))
+        log_fp.write("  M_VALUES ({}):          {}\n".format(len(M_VALUES), M_VALUES))
+        log_fp.write("  N_VALUES:                {}\n".format(N_VALUES))
+        log_fp.write("  K_VALUES:                {}\n".format(K_VALUES))
+        if not run_ref_only:
+            log_fp.write("  NUM_CHUNKS_VALUES:       {}\n".format(NUM_CHUNKS_VALUES))
+            log_fp.write("  NUM_COMPUTE_WGS (fused): {}\n".format(NUM_COMPUTE_WGS_FUSED_VALUES))
+        log_fp.write("  TOKENS_PER_REDUCTION:    {}\n".format(TOKENS_PER_REDUCTION_VALUES))
+        log_fp.write("  NUM_COMPUTE_WGS (ref):   {}\n".format(NUM_COMPUTE_WGS_REF))
+        log_fp.write("  WARMUP:                  {}\n".format(WARMUP))
+        log_fp.write("  REPEAT:                  {}\n".format(REPEAT))
+        log_fp.write("  TIMEOUT:                 {}s\n".format(TIMEOUT))
+        log_fp.write("  Total cases:             {} (fused: {}, ref: {})\n".format(
+            total, n_fused, n_ref))
+
+        log_fp.write("\n--- Output files ---\n")
+        log_fp.write("  Results CSV: {}\n".format(os.path.abspath(RESULT_CSV)))
+        log_fp.write("  Timing CSV:  {}\n".format(os.path.abspath(TIMING_CSV)))
+        log_fp.write("  Log file:    {}\n".format(os.path.abspath(LOG_FILE)))
+
+        log_fp.write("\n--- Resume command ---\n")
+        log_fp.write("  {}\n".format(resume_cmd))
+        log_fp.write("\n{}\n\n".format("=" * 70))
+        log_fp.flush()
 
         last_completed = 0
+
+        # ---- GPU health baseline (snapshot dmesg errors before benchmarking) ----
+        dmesg_baseline = get_dmesg_gpu_errors()
+        if dmesg_baseline:
+            log_fp.write("NOTE: {} pre-existing GPU errors in dmesg at start.\n\n".format(
+                len(dmesg_baseline)))
+            log_fp.flush()
+        gpu_abort = False   # set True when fatal GPU errors are detected
 
         try:
             for idx, case in enumerate(cases, 1):
@@ -481,6 +659,10 @@ def main():
                     skipped_perf += 1
                     if case['variant'] == 'fused':
                         skipped_timing += 1
+                    # Print a compact skip notice every 100 cases (avoid flooding)
+                    if skipped_perf % 100 == 0 or idx == total:
+                        print("  (skipped {}/{} so far — already done)".format(
+                            idx, total), flush=True)
                     last_completed = idx
                     continue
 
@@ -527,15 +709,22 @@ def main():
 
                 # ---- Run perf (unless already done) ----
                 if not perf_done:
-                    stdout, stderr, rc = run_cmd(cmd, env=run_env)
-
-                    # Write log
+                    # Write STARTING marker BEFORE launching — survives crashes.
+                    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     log_fp.write("\n{}\n".format("=" * 70))
-                    log_fp.write("[{}/{}] PERF {}\n".format(idx, total, desc))
+                    log_fp.write("[{}/{}] STARTING PERF {}  @ {}\n".format(
+                        idx, total, desc, now_str))
                     log_fp.write("CMD: {}\n".format(" ".join(cmd)))
-                    log_fp.write("Return code: {}\n".format(rc))
                     log_fp.write("{}\n".format("=" * 70))
-                    log_fp.write(stdout)
+                    log_fp.flush()
+
+                    # Run with real-time streaming to log file.
+                    stdout, stderr, rc = run_cmd(cmd, env=run_env, log_fp=log_fp)
+
+                    # Write completion marker with return code.
+                    end_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    log_fp.write("\n--- FINISHED  Return code: {}  @ {} ---\n".format(
+                        rc, end_str))
                     if stderr.strip():
                         log_fp.write("\n--- STDERR ---\n{}\n".format(stderr))
                     log_fp.flush()
@@ -566,6 +755,17 @@ def main():
                     }
                     writer.writerow(perf_row)
                     csv_fp.flush()
+
+                    # ---- GPU health check after perf run ----
+                    healthy, new_errs = check_gpu_health(log_fp, dmesg_baseline)
+                    if not healthy:
+                        gpu_abort = True
+                        print("\n!!! GPU ERROR DETECTED after case {}/{} — "
+                              "aborting benchmark. !!!\n".format(idx, total),
+                              flush=True)
+                        for e in new_errs:
+                            print("  dmesg: {}".format(e), flush=True)
+                        break
                 else:
                     skipped_perf += 1
 
@@ -575,15 +775,22 @@ def main():
 
                     timing_cmd = cmd + ["--timing", "1"]
                     print("  + timing run...", flush=True)
-                    t_stdout, t_stderr, t_rc = run_cmd(timing_cmd, env=run_env)
 
-                    # Log timing run
+                    # Write STARTING marker for timing run.
+                    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     log_fp.write("\n{}\n".format("-" * 70))
-                    log_fp.write("[{}/{}] TIMING {}\n".format(idx, total, desc))
+                    log_fp.write("[{}/{}] STARTING TIMING {}  @ {}\n".format(
+                        idx, total, desc, now_str))
                     log_fp.write("CMD: {}\n".format(" ".join(timing_cmd)))
-                    log_fp.write("Return code: {}\n".format(t_rc))
                     log_fp.write("{}\n".format("-" * 70))
-                    log_fp.write(t_stdout)
+                    log_fp.flush()
+
+                    t_stdout, t_stderr, t_rc = run_cmd(timing_cmd, env=run_env,
+                                                       log_fp=log_fp)
+
+                    end_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    log_fp.write("\n--- FINISHED  Return code: {}  @ {} ---\n".format(
+                        t_rc, end_str))
                     if t_stderr.strip():
                         log_fp.write("\n--- STDERR ---\n{}\n".format(t_stderr))
                     log_fp.flush()
@@ -624,6 +831,17 @@ def main():
                     }
                     timing_writer.writerow(timing_row)
                     timing_fp.flush()
+
+                    # GPU health check after timing run
+                    healthy, new_errs = check_gpu_health(log_fp, dmesg_baseline)
+                    if not healthy:
+                        gpu_abort = True
+                        print("\n!!! GPU ERROR DETECTED after timing case {}/{} — "
+                              "aborting benchmark. !!!\n".format(idx, total),
+                              flush=True)
+                        for e in new_errs:
+                            print("  dmesg: {}".format(e), flush=True)
+                        break
                 elif case['variant'] == 'fused' and timing_done:
                     skipped_timing += 1
 
@@ -637,6 +855,17 @@ def main():
                   flush=True)
             print("*** Resume with:  python3 {} --resume {} ***\n".format(
                 sys.argv[0], RESULT_CSV), flush=True)
+
+        if gpu_abort:
+            log_fp.write("\n\n{}\n".format("!" * 70))
+            log_fp.write("!!! BENCHMARK ABORTED — fatal GPU errors detected in dmesg.\n")
+            log_fp.write("!!! Last completed case: {}/{}\n".format(last_completed, total))
+            log_fp.write("!!! Check dmesg / journalctl for details.\n")
+            log_fp.write("{}\n".format("!" * 70))
+            log_fp.flush()
+            print("\n*** Benchmark ABORTED due to GPU hardware errors. ***")
+            print("*** Resume with:  python3 {} --resume {} ***\n".format(
+                sys.argv[0], RESULT_CSV))
 
     # ---- Final summary (always printed) ----
     print_summary(last_completed)

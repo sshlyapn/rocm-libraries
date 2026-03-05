@@ -98,6 +98,15 @@ if(GPU_TARGETS MATCHES "gfx94|gfx95|gfx90a")
     -mllvm -enable-noalias-to-md-conversion=0
   )
 
+  # --- RCCL issue reproducer (standalone, no CK-tile kernel deps) ---
+  add_executable(rccl_issue_reproducer rccl_issue_reproducer.cpp)
+  set_source_files_properties(rccl_issue_reproducer.cpp PROPERTIES LANGUAGE HIP)
+  target_link_libraries(rccl_issue_reproducer PRIVATE roc::rccl)
+  if(MPI_CXX_FOUND)
+    target_link_libraries(rccl_issue_reproducer PRIVATE MPI::MPI_CXX)
+    target_compile_definitions(rccl_issue_reproducer PRIVATE CK_TILE_EXAMPLE_USE_MPI=1)
+  endif()
+
   if(CK_USE_OCP_FP8)
     target_compile_definitions(tile_example_gemm_universal_minimal PRIVATE CK_TILE_USE_OCP_FP8)
     target_compile_definitions(tile_example_gemm_universal_persistent PRIVATE CK_TILE_USE_OCP_FP8)
