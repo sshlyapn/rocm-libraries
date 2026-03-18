@@ -1,0 +1,126 @@
+================================================================================
+  DISASSEMBLY SUMMARY — Non-Persistent GEMM Kernels (Cfg1)
+  Config: BlockTile=256x256x64, BlockWarps=2x2x1, WarpTile=32x32x16
+  UsePersistentKernel=false, PadK=false
+================================================================================
+
+--------------------------------------------------------------------------------
+Binary: tile_example_gemm_universal_persistent_all_reduce_ref_default_RM_CM_RM_both_schedulers_disabled
+Short:  RM_CM_RM_both_schedulers_disabled
+--------------------------------------------------------------------------------
+  Kernels in binary:
+    [1] addr=0x0000000000003700  size=0x00000000000005b0 (1456 bytes)  => reduce_kernel
+    [2] addr=0x0000000000003d00  size=0x00000000000067c0 (26560 bytes)  => GEMM Non-Persistent (B=CM, PadK=false)
+    [3] addr=0x000000000000a500  size=0x00000000000069dc (27100 bytes)  => GEMM Persistent (B=CM, PadK=false)
+  Total kernels: 3
+
+  Extracted non-persistent GEMM: lines 296-4489 (4194 lines)
+  Output file: RM_CM_RM_both_schedulers_disabled_non_persistent_gemm.asm
+
+--------------------------------------------------------------------------------
+Binary: tile_example_gemm_universal_persistent_all_reduce_ref_default_RM_CM_RM_both_schedulers_enabled
+Short:  RM_CM_RM_both_schedulers_enabled
+--------------------------------------------------------------------------------
+  Kernels in binary:
+    [1] addr=0x0000000000003700  size=0x00000000000005b0 (1456 bytes)  => reduce_kernel
+    [2] addr=0x0000000000003d00  size=0x000000000000678c (26508 bytes)  => GEMM Non-Persistent (B=CM, PadK=false)
+    [3] addr=0x000000000000a500  size=0x00000000000069a4 (27044 bytes)  => GEMM Persistent (B=CM, PadK=false)
+  Total kernels: 3
+
+  Extracted non-persistent GEMM: lines 296-4476 (4181 lines)
+  Output file: RM_CM_RM_both_schedulers_enabled_non_persistent_gemm.asm
+
+--------------------------------------------------------------------------------
+Binary: tile_example_gemm_universal_persistent_all_reduce_ref_default_RM_RM_RM_both_schedulers_disabled
+Short:  RM_RM_RM_both_schedulers_disabled
+--------------------------------------------------------------------------------
+  Kernels in binary:
+    [1] addr=0x0000000000003700  size=0x00000000000005b0 (1456 bytes)  => reduce_kernel
+    [2] addr=0x0000000000003d00  size=0x0000000000007670 (30320 bytes)  => GEMM Non-Persistent (B=RM, PadK=false)
+    [3] addr=0x000000000000b400  size=0x0000000000007908 (30984 bytes)  => GEMM Persistent (B=RM, PadK=false)
+  Total kernels: 3
+
+  Extracted non-persistent GEMM: lines 296-5046 (4751 lines)
+  Output file: RM_RM_RM_both_schedulers_disabled_non_persistent_gemm.asm
+
+--------------------------------------------------------------------------------
+Binary: tile_example_gemm_universal_persistent_all_reduce_ref_default_RM_RM_RM_both_schedulers_enabled
+Short:  RM_RM_RM_both_schedulers_enabled
+--------------------------------------------------------------------------------
+  Kernels in binary:
+    [1] addr=0x0000000000003700  size=0x00000000000005b0 (1456 bytes)  => reduce_kernel
+    [2] addr=0x0000000000003d00  size=0x000000000000764c (30284 bytes)  => GEMM Non-Persistent (B=RM, PadK=false)
+    [3] addr=0x000000000000b400  size=0x00000000000078e4 (30948 bytes)  => GEMM Persistent (B=RM, PadK=false)
+  Total kernels: 3
+
+  Extracted non-persistent GEMM: lines 296-5037 (4742 lines)
+  Output file: RM_RM_RM_both_schedulers_enabled_non_persistent_gemm.asm
+
+--------------------------------------------------------------------------------
+Binary: tile_example_gemm_universal_persistent_all_reduce_ref_default_RM_RM_RM_loop_disabled_last_enabled
+Short:  RM_RM_RM_loop_disabled_last_enabled
+--------------------------------------------------------------------------------
+  Kernels in binary:
+    [1] addr=0x0000000000003700  size=0x00000000000005b0 (1456 bytes)  => reduce_kernel
+    [2] addr=0x0000000000003d00  size=0x0000000000007650 (30288 bytes)  => GEMM Non-Persistent (B=RM, PadK=false)
+    [3] addr=0x000000000000b400  size=0x00000000000078e8 (30952 bytes)  => GEMM Persistent (B=RM, PadK=false)
+  Total kernels: 3
+
+  Extracted non-persistent GEMM: lines 296-5038 (4743 lines)
+  Output file: RM_RM_RM_loop_disabled_last_enabled_non_persistent_gemm.asm
+
+--------------------------------------------------------------------------------
+Binary: tile_example_gemm_universal_persistent_all_reduce_ref_default_RM_RM_RM_loop_enabled_last_disabled
+Short:  RM_RM_RM_loop_enabled_last_disabled
+--------------------------------------------------------------------------------
+  Kernels in binary:
+    [1] addr=0x0000000000003700  size=0x00000000000005b0 (1456 bytes)  => reduce_kernel
+    [2] addr=0x0000000000003d00  size=0x000000000000766c (30316 bytes)  => GEMM Non-Persistent (B=RM, PadK=false)
+    [3] addr=0x000000000000b400  size=0x0000000000007904 (30980 bytes)  => GEMM Persistent (B=RM, PadK=false)
+  Total kernels: 3
+
+  Extracted non-persistent GEMM: lines 296-5045 (4750 lines)
+  Output file: RM_RM_RM_loop_enabled_last_disabled_non_persistent_gemm.asm
+
+--------------------------------------------------------------------------------
+Binary: tile_example_gemm_universal_persistent_all_reduce_ref_default_RM_CM_RM_both_schedulers_enabled_both_VMEM_read_commented_out_plus_extra_fixes_for_transposed_read
+Short:  RM_CM_RM_both_VMEM_read_commented_out
+Test:   #6 — Remove only VMEM_READ groups from Stage 1 — WORKS FINE
+--------------------------------------------------------------------------------
+  Kernels in binary:
+    [1] addr=0x0000000000003700  size=0x00000000000005b0 (1456 bytes)  => reduce_kernel
+    [2] addr=0x0000000000003d00  size=0x0000000000006794 (26516 bytes)  => GEMM Non-Persistent (B=CM, PadK=false)
+    [3] addr=0x000000000000a500  size=0x00000000000069b0 (27056 bytes)  => GEMM Persistent (B=CM, PadK=false)
+  Total kernels: 3
+
+  Extracted non-persistent GEMM: 4183 lines
+  Output file: RM_CM_RM_both_VMEM_read_commented_out_non_persistent_gemm.asm
+
+--------------------------------------------------------------------------------
+Binary: tile_example_gemm_universal_persistent_all_reduce_ref_default_RM_CM_RM_both_schedulers_enabled_stage1_skipped_plus_extra_fixes_for_transposed_read
+Short:  RM_CM_RM_stage1_skipped
+Test:   #7 — Remove Stage 1 entirely, keep only Stage 2 — WORKS FINE
+--------------------------------------------------------------------------------
+  Kernels in binary:
+    [1] addr=0x0000000000003700  size=0x00000000000005b0 (1456 bytes)  => reduce_kernel
+    [2] addr=0x0000000000003d00  size=0x000000000000689c (26780 bytes)  => GEMM Non-Persistent (B=CM, PadK=false)
+    [3] addr=0x000000000000a600  size=0x0000000000006a4c (27212 bytes)  => GEMM Persistent (B=CM, PadK=false)
+  Total kernels: 3
+
+  Extracted non-persistent GEMM: 4235 lines
+  Output file: RM_CM_RM_stage1_skipped_non_persistent_gemm.asm
+
+--------------------------------------------------------------------------------
+Binary: tile_example_gemm_universal_persistent_all_reduce_ref_default_RM_CM_RM_both_schedulers_enabled_stage2_skipped_plus_extra_fixes_for_transposed_read
+Short:  RM_CM_RM_stage2_skipped
+Test:   #8 — Remove Stage 2 entirely, keep only Stage 1 — HANG
+--------------------------------------------------------------------------------
+  Kernels in binary:
+    [1] addr=0x0000000000003700  size=0x00000000000005b0 (1456 bytes)  => reduce_kernel
+    [2] addr=0x0000000000003d00  size=0x000000000000678c (26508 bytes)  => GEMM Non-Persistent (B=CM, PadK=false)
+    [3] addr=0x000000000000a500  size=0x00000000000069a8 (27048 bytes)  => GEMM Persistent (B=CM, PadK=false)
+  Total kernels: 3
+
+  Extracted non-persistent GEMM: 4181 lines
+  Output file: RM_CM_RM_stage2_skipped_non_persistent_gemm.asm
+

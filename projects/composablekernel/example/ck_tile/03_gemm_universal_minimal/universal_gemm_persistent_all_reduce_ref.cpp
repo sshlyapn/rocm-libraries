@@ -10,6 +10,7 @@
 //
 // Used for performance comparison against the fused rocSHMEM version.
 
+#include "ck_tile/ops/common/tensor_layout.hpp"
 #include <hip/hip_runtime.h>
 #include <rccl/rccl.h>
 
@@ -27,6 +28,12 @@
 #include <random>
 #include <type_traits>
 #include <vector>
+
+// Disable AMD buffer instructions (buffer_load_dword*/buffer_store_dword*) to bypass SRD
+// hardware range checking and use pure software is_valid_element bounds checks instead.
+// This overrides the defaults in ck_tile/core/config.hpp (which set both to 1).
+// #define CK_TILE_USE_AMD_BUFFER_LOAD 0
+// #define CK_TILE_USE_AMD_BUFFER_STORE 0
 
 #include "ck_tile/core/arch/arch.hpp"
 #include "ck_tile/host/kernel_launch.hpp"
@@ -94,7 +101,7 @@ using AccDataType = float;
 using EDataType   = ck_tile::fp16_t;
 
 using ALayout = ck_tile::tensor_layout::gemm::RowMajor;
-using BLayout = ck_tile::tensor_layout::gemm::RowMajor;
+using BLayout = ck_tile::tensor_layout::gemm::ColumnMajor;
 using ELayout = ck_tile::tensor_layout::gemm::RowMajor;
 
 
@@ -451,10 +458,11 @@ struct KernelConfig
     using NonPersistentEpilogue = ck_tile::CShuffleEpilogue<NonPersistentEpilogueProblem>;
 
     // --- Kernel types ---
-    // Persistent (wrapped with PersistentGemmKernel for persistent tile loop)
-    using PersistentKernelBase =
+    // Use CK's built-in persistent kernel directly (no custom wrapper).
+    // The built-in operator() uses get_grid_size() as stride — we control
+    // the grid size from the host side via persistent_grids.x.
+    using PersistentKernel =
         ck_tile::UniversalGemmKernel<TilePartitioner, PersistentPipeline, PersistentEpilogue>;
-    using PersistentKernel = PersistentGemmKernel<PersistentKernelBase>;
 
     // Non-persistent reference (plain UniversalGemmKernel — no wrapper)
     using NonPersistentKernel =
@@ -465,29 +473,51 @@ struct KernelConfig
 // Kernel configurations (identical to fused version).
 // -----------------------------------------------------------------------
 //                                  M    N    K    Mw Nw Kw  Mxdl Nxdl DblBuf V4   PadM  PadN  PadK  BPC
-using Cfg0 = KernelConfig<         128, 128, 64,   2, 2, 1,  16,  16,  false, false>;
+// using Cfg0 = KernelConfig<         128, 128, 64,   2, 2, 1,  16,  16,  false, false>;
+// using Cfg1 = KernelConfig<         256, 256, 64,   2, 2, 1,  32,  32,  false, false>;
+// using Cfg2 = KernelConfig<         256, 256, 128,  2, 2, 1,  32,  32,  false, false>;
+// using Cfg3 = KernelConfig<         128, 128, 128,  2, 2, 1,  16,  16,  false, false>;
+// // --- occupancy + padding ---
+// using Cfg4 = KernelConfig<         256, 256, 64,   2, 2, 1,  32,  32,  false, false, false, false, false, 2>;
+// using Cfg5 = KernelConfig<         128, 128, 64,   2, 2, 1,  16,  16,  false, false, false, false, false, 2>;
+// using Cfg6 = KernelConfig<         128, 128, 128,  2, 2, 1,  16,  16,  false, false, false, false, false, 2>;
+// using Cfg7 = KernelConfig<         256, 256, 64,   2, 2, 1,  32,  32,  false, false, true,  true,  true,  1>;
+// // --- warp layout ---
+// using Cfg8 = KernelConfig<         128, 128, 64,   4, 1, 1,  32,  32,  false, false>;
+// using Cfg9 = KernelConfig<         128, 128, 64,   1, 4, 1,  32,  32,  false, false>;
+// // --- V4 pipeline ---
+// using Cfg10 = KernelConfig<        256, 256, 64,   2, 2, 1,  32,  32,  true,  true>;
+// using Cfg11 = KernelConfig<        128, 128, 64,   2, 2, 1,  32,  32,  true,  true>;
+// using Cfg12 = KernelConfig<        128, 128, 32,   2, 2, 1,  32,  32,  true,  true>;
+// using Cfg13 = KernelConfig<        128, 128, 64,   2, 2, 1,  16,  16,  true,  true>;
+// using Cfg14 = KernelConfig<         64,  64, 64,   1, 1, 1,  32,  32,  true,  true>;
+
 using Cfg1 = KernelConfig<         256, 256, 64,   2, 2, 1,  32,  32,  false, false>;
-using Cfg2 = KernelConfig<         256, 256, 128,  2, 2, 1,  32,  32,  false, false>;
-using Cfg3 = KernelConfig<         128, 128, 128,  2, 2, 1,  16,  16,  false, false>;
+using Cfg0 = Cfg1;
+using Cfg2 = Cfg1;
+using Cfg3 = Cfg1;
 // --- occupancy + padding ---
-using Cfg4 = KernelConfig<         256, 256, 64,   2, 2, 1,  32,  32,  false, false, false, false, false, 2>;
-using Cfg5 = KernelConfig<         128, 128, 64,   2, 2, 1,  16,  16,  false, false, false, false, false, 2>;
-using Cfg6 = KernelConfig<         128, 128, 128,  2, 2, 1,  16,  16,  false, false, false, false, false, 2>;
-using Cfg7 = KernelConfig<         256, 256, 64,   2, 2, 1,  32,  32,  false, false, true,  true,  true,  1>;
+using Cfg4 = Cfg1;
+using Cfg5 = Cfg1;
+using Cfg6 = Cfg1;
+using Cfg7 = Cfg1;
 // --- warp layout ---
-using Cfg8 = KernelConfig<         128, 128, 64,   4, 1, 1,  32,  32,  false, false>;
-using Cfg9 = KernelConfig<         128, 128, 64,   1, 4, 1,  32,  32,  false, false>;
+using Cfg8 = Cfg1;
+using Cfg9 = Cfg1;
 // --- V4 pipeline ---
-using Cfg10 = KernelConfig<        256, 256, 64,   2, 2, 1,  32,  32,  true,  true>;
-using Cfg11 = KernelConfig<        128, 128, 64,   2, 2, 1,  32,  32,  true,  true>;
-using Cfg12 = KernelConfig<        128, 128, 32,   2, 2, 1,  32,  32,  true,  true>;
-using Cfg13 = KernelConfig<        128, 128, 64,   2, 2, 1,  16,  16,  true,  true>;
-using Cfg14 = KernelConfig<         64,  64, 64,   1, 1, 1,  32,  32,  true,  true>;
+using Cfg10 = Cfg1;
+using Cfg11 = Cfg1;
+using Cfg12 = Cfg1;
+using Cfg13 = Cfg1;
+using Cfg14 = Cfg1;
 
 } // namespace
 
 int main(int argc, char** argv)
 {
+    std::cout << "Remove Stage 2 entirely, keep only Stage 1.\n";
+    // std::cout << "Running: Loop - ENABLED scheduling, Last - ENABLED scheduling.\n";
+    std::cout << "Layouts: A: " << ALayout::name << ", B: " << BLayout::name << ", E: " << ELayout::name << " \n";
     // -----------------------------------------------------------------------
     // MPI + NCCL initialization (same pattern as universal_gemm_chuncked.cpp).
     // -----------------------------------------------------------------------
@@ -524,21 +554,8 @@ int main(int argc, char** argv)
               << "] local_rank=" << local_rank
               << " -> GPU " << device_id << "/" << num_devices << "\n";
 
-    // NCCL communicator
-    ncclUniqueId uid{};
-    if(world_rank == 0)
-    {
-        nccl_check(ncclGetUniqueId(&uid), "ncclGetUniqueId");
-    }
-#if defined(CK_TILE_EXAMPLE_USE_MPI) && CK_TILE_EXAMPLE_USE_MPI
-    MPI_Bcast(&uid, static_cast<int>(sizeof(uid)), MPI_BYTE, 0, MPI_COMM_WORLD);
-#endif
-
+    // NCCL communicator (initialized after arg parsing, so --skip_nccl can gate it)
     ncclComm_t nccl_comm{};
-    nccl_check(ncclCommInitRank(&nccl_comm, /*nranks=*/world_size, uid, /*rank=*/world_rank),
-               "ncclCommInitRank");
-
-    std::cout << "[rank " << world_rank << "/" << world_size << "] NCCL initialized\n";
 
     ck_tile::index_t M = 4096;
     ck_tile::index_t N = 4096;
@@ -551,6 +568,9 @@ int main(int argc, char** argv)
     int config_id      = 0;
     uint32_t forced_num_compute_wgs  = 0;
     uint32_t tokens_per_reduction = 0;
+    bool sync_each = false;  // hipStreamSynchronize after every kernel launch
+    bool skip_nccl = false;  // skip NCCL init/destroy entirely (pure GEMM isolation test)
+    bool non_persistent = false;  // use grid_size = total_tiles (1 tile/WG, no persistent loop)
 
     // Minimal CLI (same as fused version):
     for(int i = 1; i < argc; ++i)
@@ -588,6 +608,12 @@ int main(int argc, char** argv)
             tokens_per_reduction = static_cast<uint32_t>(parse_long(need_value("--tokens_per_reduction"), "--tokens_per_reduction"));
         else if(std::strcmp(key, "--config") == 0)
             config_id = static_cast<int>(parse_long(need_value("--config"), "--config"));
+        else if(std::strcmp(key, "--sync_each") == 0)
+            sync_each = (parse_long(need_value("--sync_each"), "--sync_each") != 0);
+        else if(std::strcmp(key, "--skip_nccl") == 0)
+            skip_nccl = (parse_long(need_value("--skip_nccl"), "--skip_nccl") != 0);
+        else if(std::strcmp(key, "--non_persistent") == 0)
+            non_persistent = (parse_long(need_value("--non_persistent"), "--non_persistent") != 0);
         else if(std::strcmp(key, "--help") == 0 || std::strcmp(key, "-h") == 0)
         {
             std::cout << "Usage:\n"
@@ -596,10 +622,41 @@ int main(int argc, char** argv)
                       << "    [--verify 0|1] [--flush_cache 0|1] [--compare 0|1]\n"
                       << "    [--forced_num_compute_wgs N]\n"
                       << "    [--tokens_per_reduction T] [--config 0-14]\n"
+                      << "    [--sync_each 0|1]  (sync after every kernel launch)\n"
+                      << "    [--skip_nccl 0|1]  (skip NCCL init/destroy, pure GEMM test)\n"
+                      << "    [--non_persistent 0|1]  (grid_size=total_tiles, 1 tile/WG, no persistent loop)\n"
                       << "\n"
-                      << "  Reference version: persistent GEMM + separate reduction + NCCL AllGather\n";
+                      << "  Reference version: persistent GEMM + separate reduction + NCCL AllGather\n"
+                      << "\n"
+                      << "  Debug env vars:\n"
+                      << "    AMD_LOG_LEVEL=4       (max HIP runtime verbosity)\n"
+                      << "    HSA_ENABLE_SDMA=0     (disable SDMA, use shader copy)\n"
+                      << "    GPU_MAX_HW_QUEUES=N   (limit HW queues per device)\n";
             return 0;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // NCCL initialization (gated by --skip_nccl).
+    // -----------------------------------------------------------------------
+    if(!skip_nccl)
+    {
+        ncclUniqueId uid{};
+        if(world_rank == 0)
+        {
+            nccl_check(ncclGetUniqueId(&uid), "ncclGetUniqueId");
+        }
+#if defined(CK_TILE_EXAMPLE_USE_MPI) && CK_TILE_EXAMPLE_USE_MPI
+        MPI_Bcast(&uid, static_cast<int>(sizeof(uid)), MPI_BYTE, 0, MPI_COMM_WORLD);
+#endif
+        nccl_check(ncclCommInitRank(&nccl_comm, /*nranks=*/world_size, uid, /*rank=*/world_rank),
+                   "ncclCommInitRank");
+        std::cout << "[rank " << world_rank << "/" << world_size << "] NCCL initialized\n";
+    }
+    else
+    {
+        std::cout << "[rank " << world_rank << "/" << world_size
+                  << "] --skip_nccl=1: NCCL NOT initialized (pure GEMM isolation test)\n";
     }
 
     const ck_tile::index_t stride_A = K;
@@ -608,10 +665,33 @@ int main(int argc, char** argv)
 
     // -----------------------------------------------------------------------
     // Allocate host / device memory.
+    //
+    // OOB-padding: allocate extra elements beyond the logical M×K / K×N
+    // so that any speculative or boundary-tile loads that overshoot the
+    // logical tensor land in valid (zero-filled) GPU memory instead of
+    // causing a page fault.  The kernel still receives the original M/N/K
+    // and the SRD range is set to the logical size, so correctness is
+    // unchanged — this only prevents VM faults from unmapped pages.
     // -----------------------------------------------------------------------
     const std::size_t size_a = static_cast<std::size_t>(M) * static_cast<std::size_t>(K);
     const std::size_t size_b = static_cast<std::size_t>(K) * static_cast<std::size_t>(N);
     const std::size_t size_e = static_cast<std::size_t>(M) * static_cast<std::size_t>(N);
+
+    // Pad by a few extra tile-rows/columns (256 * max(K,N) elements ≈ a few MB).
+    constexpr std::size_t kOobPadTiles = 0;   // number of extra tile-rows/cols
+    constexpr std::size_t kTileDim     = 256;  // largest tile dimension
+    const std::size_t pad_a = kOobPadTiles * kTileDim * static_cast<std::size_t>(K);
+    const std::size_t pad_b = kOobPadTiles * kTileDim * static_cast<std::size_t>(N);
+    const std::size_t pad_e = kOobPadTiles * kTileDim * static_cast<std::size_t>(N);
+
+    const std::size_t alloc_a = size_a + pad_a;
+    const std::size_t alloc_b = size_b + pad_b;
+    const std::size_t alloc_e = size_e + pad_e;
+
+    std::cout << "[OOB-pad] size_a=" << size_a << " alloc_a=" << alloc_a
+              << " (+" << pad_a << " elems)\n";
+    std::cout << "[OOB-pad] size_b=" << size_b << " alloc_b=" << alloc_b
+              << " (+" << pad_b << " elems)\n";
 
     std::vector<ADataType> hA(size_a);
     std::vector<BDataType> hB(size_b);
@@ -626,8 +706,11 @@ int main(int argc, char** argv)
 
     ADataType* dA = nullptr;
     BDataType* dB = nullptr;
-    hip_check(hipMalloc(&dA, sizeof(ADataType) * size_a), "hipMalloc(A)");
-    hip_check(hipMalloc(&dB, sizeof(BDataType) * size_b), "hipMalloc(B)");
+    hip_check(hipMalloc(&dA, sizeof(ADataType) * alloc_a), "hipMalloc(A)");
+    hip_check(hipMalloc(&dB, sizeof(BDataType) * alloc_b), "hipMalloc(B)");
+    // Zero the entire allocation (including padding) so OOB reads get 0.
+    hip_check(hipMemset(dA, 0, sizeof(ADataType) * alloc_a), "hipMemset(A)");
+    hip_check(hipMemset(dB, 0, sizeof(BDataType) * alloc_b), "hipMemset(B)");
 
     // Output buffer: each PE gets its own dE via hipMalloc.
     // After reduction, NCCL AllGather collects reduced rows into dE_all:
@@ -638,7 +721,8 @@ int main(int argc, char** argv)
     // const int my_pe = device_id;
 
     EDataType* dE = nullptr;
-    hip_check(hipMalloc(&dE, sizeof(EDataType) * size_e), "hipMalloc(E)");
+    hip_check(hipMalloc(&dE, sizeof(EDataType) * alloc_e), "hipMalloc(E)");
+    hip_check(hipMemset(dE, 0, sizeof(EDataType) * alloc_e), "hipMemset(E)");
 
     // dE_all is allocated later, after num_post_work is known (see below).
     EDataType* dE_all = nullptr;
@@ -784,40 +868,73 @@ int main(int argc, char** argv)
         using NonPersistKernel = typename decltype(non_persistent_kernel_tag)::type;
         constexpr int kBlockPerCu = decltype(block_per_cu_tag)::value;
 
-        // --- Persistent kernel args ---
-        auto persistent_kargs = PersistKernel::MakeKernelArgs(host_args);
+        // --- Kernel args (same UniversalGemmKernelArgs struct for both kernel types) ---
+        auto gemm_kargs = PersistKernel::MakeKernelArgs(host_args);
 
-        if(!PersistKernel::IsSupportedArgument(persistent_kargs))
+        if(!PersistKernel::IsSupportedArgument(gemm_kargs))
         {
-            std::cerr << "Persistent kernel does not support the provided arguments "
+            std::cerr << "Kernel does not support the provided arguments "
                          "(alignment/padding/shape).\n";
             std::cerr
                 << "Try setting M,N,K to multiples of the tile sizes, or enable padding.\n";
             return 1;
         }
 
-        dim3 persistent_grids        = PersistKernel::MaxOccupancyGridSize(s);
-        const dim3 persistent_blocks = PersistKernel::BlockSize();
+        // --- Determine grid size and kernel function pointer ---
+        //
+        // --non_persistent: launch the truly non-persistent kernel (NonPersistKernel)
+        //   which uses blockIdx.x directly — one WG per tile, no while-loop.
+        //   Grid = total_tiles (= TilePartitioner::GridSize(M,N) * k_batch).
+        //
+        // Default (persistent): launch PersistKernel with MaxOccupancy grid.
+        //   The built-in persistent operator() uses get_grid_size() as stride.
+        dim3 bench_grids;
+        dim3 bench_blocks;
 
-        if(forced_num_compute_wgs > 0)
+        // We store a type-erased kernel function pointer.  Both kernel types
+        // accept the same KernelArgs (UniversalGemmKernelArgs), so the function
+        // signature is identical.
+        using KernelFnPtr = void(*)(typename PersistKernel::KernelArgs);
+        KernelFnPtr gemm_kernel_fn = nullptr;
+
+        if(non_persistent)
         {
-            if (forced_num_compute_wgs < persistent_grids.x) {
-                std::cerr << "WARNING: Using less CUs than the total number of CUs available. "
-                          << "Using " << forced_num_compute_wgs << " CUs instead of "
-                          << persistent_grids.x << " CUs.\n";
-            }
-            persistent_kargs.num_compute_wgs = forced_num_compute_wgs;
-            persistent_grids.x               = forced_num_compute_wgs;
+            // True non-persistent path: compile & launch NonPersistKernel
+            bench_grids  = NonPersistKernel::GridSize(M, N, k_batch);
+            bench_blocks = NonPersistKernel::BlockSize();
+            gemm_kernel_fn =
+                ck_tile::kentry<kBlockPerCu, NonPersistKernel,
+                                typename NonPersistKernel::KernelArgs>;
+
+            std::cout << "NON-PERSISTENT mode: using NonPersistKernel (no while-loop)"
+                      << " grid_size=" << bench_grids.x
+                      << " (= total_tiles, one WG per tile)\n";
         }
         else
         {
-            persistent_kargs.num_compute_wgs = persistent_grids.x;
+            // Persistent path (default)
+            bench_grids  = PersistKernel::MaxOccupancyGridSize(s);
+            bench_blocks = PersistKernel::BlockSize();
+            gemm_kernel_fn =
+                ck_tile::kentry<kBlockPerCu, PersistKernel,
+                                typename PersistKernel::KernelArgs>;
+
+            if(forced_num_compute_wgs > 0)
+            {
+                if(static_cast<uint32_t>(forced_num_compute_wgs) < bench_grids.x)
+                {
+                    std::cerr << "WARNING: Using fewer WGs than max occupancy. "
+                              << "Using " << forced_num_compute_wgs << " WGs instead of "
+                              << bench_grids.x << " WGs.\n";
+                }
+                bench_grids.x = forced_num_compute_wgs;
+            }
         }
 
         if(tokens_per_reduction == 0)
         {
             std::cerr << "WARNING: tokens_per_reduction == 0, skipping reduction and AllGather. "
-                      << "Benchmarking pure persistent GEMM only.\n";
+                      << "Benchmarking pure GEMM only.\n";
         }
 
         // --- Reduction kernel args ---
@@ -845,22 +962,32 @@ int main(int argc, char** argv)
             ? static_cast<int>((reduce_total_work + warps_per_reduce_block - 1) / warps_per_reduce_block)
             : 0;
 
-        std::cout << "Persistent kernel (n_chunked, ref)"
-                  << " grid_size=" << persistent_grids.x
-                  << " block_size=" << persistent_blocks.x
-                  << " num_compute_wgs=" << persistent_kargs.num_compute_wgs
+        const char* mode_label = non_persistent
+            ? "NON-Persistent kernel (n_chunked, ref) [true non-persistent, no while-loop]"
+            : "Persistent kernel (n_chunked, ref) [CK built-in persistent loop]";
+        std::cout << mode_label
+                  << " grid_size=" << bench_grids.x
+                  << " block_size=" << bench_blocks.x
                   << " num_post_work=" << num_post_work
                   << " tokens_per_reduction=" << tokens_per_reduction
                   << " kBlockPerCu=" << kBlockPerCu
+                  << " sync_each=" << sync_each
                   << "\n";
         if(reduce_grid_size > 0)
         {
             std::cout << "Reduction kernel: grid_size=" << reduce_grid_size
                       << " block_size=" << reduce_block_size << "\n";
         }
-        std::cout << "NCCL AllGather: n_pes=" << n_pes
-                  << " sendcount=" << ag_send_count
-                  << (num_post_work > 0 ? " (reduced rows only)" : " (full M×N)") << "\n";
+        if(!skip_nccl)
+        {
+            std::cout << "NCCL AllGather: n_pes=" << n_pes
+                      << " sendcount=" << ag_send_count
+                      << (num_post_work > 0 ? " (reduced rows only)" : " (full M×N)") << "\n";
+        }
+        else
+        {
+            std::cout << "NCCL AllGather: SKIPPED (--skip_nccl=1)\n";
+        }
 
         // --- Benchmark: GEMM + Reduce + AllGather ---
         //
@@ -887,21 +1014,34 @@ int main(int argc, char** argv)
             ? static_cast<const void*>(dE_reduced)
             : static_cast<const void*>(dE);
 
-        // The kernel entry point that make_kernel would have produced
-        const auto gemm_kernel =
-            ck_tile::kentry<kBlockPerCu, PersistKernel,
-                            typename PersistKernel::KernelArgs>;
-
         // One iteration: GEMM → reduce → AllGather, all on bench_stream
+        int iter_count = 0;
         auto run_one_iter = [&]() {
-            gemm_kernel<<<persistent_grids, persistent_blocks, 0, bench_stream>>>(
-                persistent_kargs);
+            gemm_kernel_fn<<<bench_grids, bench_blocks, 0, bench_stream>>>(
+                gemm_kargs);
+            if(sync_each)
+            {
+                auto err = hipStreamSynchronize(bench_stream);
+                if(err != hipSuccess)
+                {
+                    std::cerr << "[rank " << world_rank
+                              << "] hipStreamSynchronize FAILED after GEMM launch # "
+                              << iter_count << ": " << hipGetErrorString(err)
+                              << " (code " << static_cast<int>(err) << ")\n";
+                    std::abort();
+                }
+            }
             if(reduce_grid_size > 0)
             {
                 reduce_kernel<<<reduce_grid_size, reduce_block_size, 0, bench_stream>>>(
                     reduce_kargs);
+                if(sync_each)
+                {
+                    hip_check(hipStreamSynchronize(bench_stream),
+                              "hipStreamSynchronize(reduce)");
+                }
             }
-            if(tokens_per_reduction > 0)
+            if(tokens_per_reduction > 0 && !skip_nccl)
             {
                 nccl_check(ncclAllGather(
                     ag_send_ptr,
@@ -911,7 +1051,13 @@ int main(int argc, char** argv)
                     nccl_comm,
                     bench_stream),
                     "ncclAllGather");
+                if(sync_each)
+                {
+                    hip_check(hipStreamSynchronize(bench_stream),
+                              "hipStreamSynchronize(allgather)");
+                }
             }
+            ++iter_count;
         };
 
         // Synchronize all MPI ranks so they enter the timing loop together.
@@ -940,72 +1086,92 @@ int main(int argc, char** argv)
         hip_check(hipEventRecord(t_stop, bench_stream), "hipEventRecord(stop)");
         hip_check(hipEventSynchronize(t_stop), "hipEventSynchronize(stop)");
 
-        float persistent_ms = 0.0f;
-        hip_check(hipEventElapsedTime(&persistent_ms, t_start, t_stop),
+        float bench_ms = 0.0f;
+        hip_check(hipEventElapsedTime(&bench_ms, t_start, t_stop),
                   "hipEventElapsedTime");
-        persistent_ms /= static_cast<float>(repeat);
+        bench_ms /= static_cast<float>(repeat);
 
         hip_check(hipEventDestroy(t_start), "hipEventDestroy(start)");
         hip_check(hipEventDestroy(t_stop),  "hipEventDestroy(stop)");
         hip_check(hipStreamDestroy(bench_stream), "hipStreamDestroy(bench)");
 
-        const double persistent_tflops =
-            (persistent_ms > 0.0f)
-                ? (flops / (static_cast<double>(persistent_ms) * 1.0e-3) / 1.0e12)
+        const double bench_tflops =
+            (bench_ms > 0.0f)
+                ? (flops / (static_cast<double>(bench_ms) * 1.0e-3) / 1.0e12)
                 : 0.0;
 
-        // --- Optional: non-persistent kernel for comparison ---
-        float non_persistent_ms      = 0.0f;
-        double non_persistent_tflops = 0.0;
+        // --- Optional: comparison kernel (the "other" mode) ---
+        // If main benchmark is non-persistent → compare against persistent.
+        // If main benchmark is persistent    → compare against non-persistent.
+        float compare_ms      = 0.0f;
+        double compare_tflops = 0.0;
+        const char* compare_label = non_persistent ? "persistent" : "non-persistent";
 
         if(compare_non_persistent)
         {
             hip_check(hipMemset(dE, 0, sizeof(EDataType) * size_e), "hipMemset(E, compare)");
 
-            const auto non_persistent_kargs = NonPersistKernel::MakeKernelArgs(host_args);
+            // Both kernel types share the same KernelArgs type
+            const auto compare_kargs = PersistKernel::MakeKernelArgs(host_args);
 
-            if(!NonPersistKernel::IsSupportedArgument(non_persistent_kargs))
+            if(non_persistent)
             {
-                std::cerr << "Non-persistent kernel does not support the provided arguments.\n";
+                // Main = non-persistent → comparison = persistent
+                const dim3 cmp_grids  = PersistKernel::MaxOccupancyGridSize(s);
+                const dim3 cmp_blocks = PersistKernel::BlockSize();
+
+                std::cout << "Persistent comparison (n_chunked)"
+                          << " grid_size=" << cmp_grids.x
+                          << " block_size=" << cmp_blocks.x << "\n";
+
+                compare_ms = ck_tile::launch_kernel(
+                    s,
+                    ck_tile::make_kernel<kBlockPerCu>(
+                        PersistKernel{}, cmp_grids, cmp_blocks, 0, compare_kargs));
             }
             else
             {
-                const dim3 np_grids  = NonPersistKernel::GridSize(M, N, k_batch);
-                const dim3 np_blocks = NonPersistKernel::BlockSize();
+                // Main = persistent → comparison = non-persistent
+                const dim3 cmp_grids  = NonPersistKernel::GridSize(M, N, k_batch);
+                const dim3 cmp_blocks = NonPersistKernel::BlockSize();
 
-                std::cout << "Non-persistent reference (n_chunked)"
-                          << " grid_size=" << np_grids.x
-                          << " block_size=" << np_blocks.x << "\n";
+                std::cout << "Non-persistent comparison (n_chunked)"
+                          << " grid_size=" << cmp_grids.x
+                          << " block_size=" << cmp_blocks.x << "\n";
 
-                non_persistent_ms = ck_tile::launch_kernel(
+                compare_ms = ck_tile::launch_kernel(
                     s,
                     ck_tile::make_kernel<kBlockPerCu>(
-                        NonPersistKernel{}, np_grids, np_blocks, 0, non_persistent_kargs));
-
-                non_persistent_tflops =
-                    (non_persistent_ms > 0.0f)
-                        ? (flops / (static_cast<double>(non_persistent_ms) * 1.0e-3) / 1.0e12)
-                        : 0.0;
+                        NonPersistKernel{}, cmp_grids, cmp_blocks, 0, compare_kargs));
             }
+
+            compare_tflops =
+                (compare_ms > 0.0f)
+                    ? (flops / (static_cast<double>(compare_ms) * 1.0e-3) / 1.0e12)
+                    : 0.0;
         }
 
         // --- Summary ---
+        const char* main_tag = non_persistent
+            ? "non-persistent+reduce+allgather"
+            : "persistent+reduce+allgather";
         std::cout << "\n";
-        std::cout << "UniversalGemm persistent kernel benchmark (REF: GEMM + Reduce + NCCL AllGather)\n";
+        std::cout << "UniversalGemm " << (non_persistent ? "NON-PERSISTENT" : "PERSISTENT")
+                  << " kernel benchmark (REF: GEMM + Reduce + NCCL AllGather)\n";
         std::cout << "M=" << M << " N=" << N << " K=" << K
                   << " partitioner=n_chunked"
                   << " config=" << config_id << "\n";
         std::cout << "warmup=" << warmup << " repeat=" << repeat
                   << " kBlockPerCu=" << kBlockPerCu << "\n";
         std::cout << "\n";
-        std::cout << "  [persistent+reduce+allgather] avg_ms=" << persistent_ms
-                  << "  tflops=" << persistent_tflops << "\n";
-        if(compare_non_persistent && non_persistent_ms > 0.0f)
+        std::cout << "  [" << main_tag << "] avg_ms=" << bench_ms
+                  << "  tflops=" << bench_tflops << "\n";
+        if(compare_non_persistent && compare_ms > 0.0f)
         {
-            std::cout << "  [non-persistent]              avg_ms=" << non_persistent_ms
-                      << "  tflops=" << non_persistent_tflops << "\n";
-            const float speedup = non_persistent_ms / persistent_ms;
-            std::cout << "  speedup (persistent+ref / non-persistent) = " << speedup << "x\n";
+            std::cout << "  [" << compare_label << " comparison]    avg_ms=" << compare_ms
+                      << "  tflops=" << compare_tflops << "\n";
+            const float speedup = compare_ms / bench_ms;
+            std::cout << "  speedup (main / comparison) = " << speedup << "x\n";
         }
         // --- Full reference verification ---
         if(verify)
@@ -1039,15 +1205,27 @@ int main(int argc, char** argv)
             hip_check(hipMemset(dE_all, 0, sizeof(EDataType) * size_ag_total),
                       "hipMemset(E_all, verify)");
 
-            // 3. Run persistent GEMM once (not timed)
-            std::cout << "Running GEMM kernel..." << std::flush;
+            // 3. Run GEMM once (not timed) — same kernel type as the benchmark
+            std::cout << "Running GEMM kernel (" << (non_persistent ? "non-persistent" : "persistent")
+                      << ")..." << std::flush;
             {
                 ck_tile::stream_config sv{};
-                ck_tile::launch_kernel(
-                    sv,
-                    ck_tile::make_kernel<kBlockPerCu>(
-                        PersistKernel{}, persistent_grids, persistent_blocks,
-                        0, persistent_kargs));
+                if(non_persistent)
+                {
+                    ck_tile::launch_kernel(
+                        sv,
+                        ck_tile::make_kernel<kBlockPerCu>(
+                            NonPersistKernel{}, bench_grids, bench_blocks,
+                            0, gemm_kargs));
+                }
+                else
+                {
+                    ck_tile::launch_kernel(
+                        sv,
+                        ck_tile::make_kernel<kBlockPerCu>(
+                            PersistKernel{}, bench_grids, bench_blocks,
+                            0, gemm_kargs));
+                }
             }
 
             // 4. Run reduction + AllGather (if tokens_per_reduction > 0)
@@ -1056,7 +1234,7 @@ int main(int argc, char** argv)
                 std::cout << "Running reduction kernel..." << std::flush;
                 reduce_kernel<<<reduce_grid_size, reduce_block_size>>>(reduce_kargs);
             }
-            if(tokens_per_reduction > 0)
+            if(tokens_per_reduction > 0 && !skip_nccl)
             {
                 std::cout << "Running NCCL AllGather..." << std::flush;
                 const void* verify_ag_send_ptr = (dE_reduced != nullptr)
@@ -1154,6 +1332,7 @@ int main(int argc, char** argv)
                 }
 
                 // Validate AllGather (each PE's slice should match ref_reduced)
+                if(!skip_nccl)
                 {
                     std::vector<EDataType> hAG_gpu(size_ag_total);
                     hip_check(hipMemcpy(hAG_gpu.data(), dE_all,
@@ -1280,7 +1459,10 @@ int main(int argc, char** argv)
     if(d_token_map)
         hip_check(hipFree(d_token_map), "hipFree(token_map)");
 
-    nccl_check(ncclCommDestroy(nccl_comm), "ncclCommDestroy");
+    if(!skip_nccl)
+    {
+        nccl_check(ncclCommDestroy(nccl_comm), "ncclCommDestroy");
+    }
 
     return rc;
 }

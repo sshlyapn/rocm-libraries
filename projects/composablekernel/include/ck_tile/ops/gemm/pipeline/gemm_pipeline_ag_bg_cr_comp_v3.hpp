@@ -285,13 +285,43 @@ struct GemmPipelineAgBgCrCompV3 : public BaseGemmPipelineAgBgCrCompV3<Problem>
                                                 (MPerXDL * NPerXDL * KPerXDL);
 
             // A/B split schedule
-            // compiler is likely to use ds_read2 when instruction width smaller than 16bytes
-            constexpr auto num_ds_read_inst_a =
-                A_LDS_Read_Width * sizeof(ADataType) / APackedSize == 16 ? A_LDS_Read_Inst_Num
-                                                                         : A_LDS_Read_Inst_Num / 2;
-            constexpr auto num_ds_read_inst_b =
-                B_LDS_Read_Width * sizeof(BDataType) / BPackedSize == 16 ? B_LDS_Read_Inst_Num
-                                                                         : B_LDS_Read_Inst_Num / 2;
+            // Logical byte width per LDS read for A and B
+            constexpr auto a_read_byte_width =
+                A_LDS_Read_Width * sizeof(ADataType) / APackedSize;
+            constexpr auto b_read_byte_width =
+                B_LDS_Read_Width * sizeof(BDataType) / BPackedSize;
+
+            // Transposed LDS reads (ds_read_b64_tr) are capped at 8 bytes per
+            // instruction regardless of the logical read width.  When the logical
+            // width exceeds 8 bytes the compiler emits multiple 8-byte transposed
+            // reads, so the actual instruction count is higher.  Non-transposed
+            // reads with byte_width < 16 can be paired into ds_read2 by the
+            // compiler, halving the instruction count.
+            constexpr auto num_ds_read_inst_a = []() {
+                if constexpr(Base::is_a_load_tr)
+                {
+                    // 8-byte transposed reads, no ds_read2 pairing
+                    return A_LDS_Read_Inst_Num *
+                           ((a_read_byte_width + index_t(7)) / index_t(8));
+                }
+                else
+                {
+                    return a_read_byte_width == 16 ? A_LDS_Read_Inst_Num
+                                                   : A_LDS_Read_Inst_Num / 2;
+                }
+            }();
+            constexpr auto num_ds_read_inst_b = []() {
+                if constexpr(Base::is_b_load_tr)
+                {
+                    return B_LDS_Read_Inst_Num *
+                           ((b_read_byte_width + index_t(7)) / index_t(8));
+                }
+                else
+                {
+                    return b_read_byte_width == 16 ? B_LDS_Read_Inst_Num
+                                                   : B_LDS_Read_Inst_Num / 2;
+                }
+            }();
 
             constexpr auto num_ds_write_inst_a = A_LDS_Write_Inst_Num;
             constexpr auto num_ds_write_inst_b = B_LDS_Write_Inst_Num;
@@ -302,10 +332,11 @@ struct GemmPipelineAgBgCrCompV3 : public BaseGemmPipelineAgBgCrCompV3<Problem>
             constexpr auto num_mfma_inst = C_MFMA_Inst_Num;
 
             constexpr auto mfma_cycle = NPerXDL == 16 ? 16 : 32;
+            // Transposed reads are always 8-byte (4-cycle issue)
             constexpr auto ds_read_a_issue_cycle =
-                A_LDS_Read_Width * sizeof(ADataType) / APackedSize == 16 ? 8 : 4;
+                (Base::is_a_load_tr || a_read_byte_width < 16) ? 4 : 8;
             constexpr auto ds_read_b_issue_cycle =
-                B_LDS_Read_Width * sizeof(BDataType) / BPackedSize == 16 ? 8 : 4;
+                (Base::is_b_load_tr || b_read_byte_width < 16) ? 4 : 8;
             constexpr auto ds_read_a_mfma_rate =
                 (mfma_cycle - 4 + 2 * ds_read_a_issue_cycle - 1) / (2 * ds_read_a_issue_cycle);
             constexpr auto ds_read_b_mfma_rate =
@@ -331,6 +362,10 @@ struct GemmPipelineAgBgCrCompV3 : public BaseGemmPipelineAgBgCrCompV3<Problem>
             constexpr auto num_dswrite_per_issue_a = num_ds_write_inst_a / num_buffer_load_inst_a;
             constexpr auto num_dswrite_per_issue_b = num_ds_write_inst_b / num_buffer_load_inst_b;
 
+            // (void)num_dswrite_per_issue_a;
+            // (void)num_dswrite_per_issue_b;
+            // (void)num_mfma_per_issue;
+
             static_for<0, num_buffer_load_inst_a, 1>{}([&](auto i) {
                 ignore = i;
                 static_for<0, num_dswrite_per_issue_a, 1>{}([&](auto idswrite) {
@@ -355,37 +390,37 @@ struct GemmPipelineAgBgCrCompV3 : public BaseGemmPipelineAgBgCrCompV3<Problem>
             });
 
             // stage 2
-            static_for<0, num_dsread_a_mfma, 1>{}([&](auto i) {
-                if constexpr((num_ds_read_inst_a - (i + 1) * ds_read_a_mfma_rate) >=
-                             ds_read_a_mfma_rate)
-                {
-                    __builtin_amdgcn_sched_group_barrier(0x100, ds_read_a_mfma_rate, 0); // DS read
-                }
-                else
-                {
-                    __builtin_amdgcn_sched_group_barrier(
-                        0x100,
-                        num_ds_read_inst_a - (num_dsread_a_mfma - 1) * ds_read_a_mfma_rate,
-                        0); // DS read
-                }
-                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-            });
+            // static_for<0, num_dsread_a_mfma, 1>{}([&](auto i) {
+            //     if constexpr((num_ds_read_inst_a - (i + 1) * ds_read_a_mfma_rate) >=
+            //                  ds_read_a_mfma_rate)
+            //     {
+            //         __builtin_amdgcn_sched_group_barrier(0x100, ds_read_a_mfma_rate, 0); // DS read
+            //     }
+            //     else
+            //     {
+            //         __builtin_amdgcn_sched_group_barrier(
+            //             0x100,
+            //             num_ds_read_inst_a - (num_dsread_a_mfma - 1) * ds_read_a_mfma_rate,
+            //             0); // DS read
+            //     }
+            //     __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+            // });
 
-            static_for<0, num_dsread_b_mfma, 1>{}([&](auto i) {
-                if constexpr((num_ds_read_inst_b - (i + 1) * ds_read_b_mfma_rate) >=
-                             ds_read_b_mfma_rate)
-                {
-                    __builtin_amdgcn_sched_group_barrier(0x100, ds_read_b_mfma_rate, 0); // DS read
-                }
-                else
-                {
-                    __builtin_amdgcn_sched_group_barrier(
-                        0x100,
-                        num_ds_read_inst_b - (num_dsread_b_mfma - 1) * ds_read_b_mfma_rate,
-                        0); // DS read
-                }
-                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-            });
+            // static_for<0, num_dsread_b_mfma, 1>{}([&](auto i) {
+            //     if constexpr((num_ds_read_inst_b - (i + 1) * ds_read_b_mfma_rate) >=
+            //                  ds_read_b_mfma_rate)
+            //     {
+            //         __builtin_amdgcn_sched_group_barrier(0x100, ds_read_b_mfma_rate, 0); // DS read
+            //     }
+            //     else
+            //     {
+            //         __builtin_amdgcn_sched_group_barrier(
+            //             0x100,
+            //             num_ds_read_inst_b - (num_dsread_b_mfma - 1) * ds_read_b_mfma_rate,
+            //             0); // DS read
+            //     }
+            //     __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+            // });
         }
 
         template <bool HasHotLoop,
@@ -517,12 +552,20 @@ struct GemmPipelineAgBgCrCompV3 : public BaseGemmPipelineAgBgCrCompV3<Problem>
             }
 
             // global read 1
+            // Guard the second prefill load: when num_loop == 1 (Odd tail, no hot
+            // loop), this load would access K-offset = KPerBlock which is OOB.
+            // The Even tail (num_loop == 2) does consume this data, so only skip
+            // when num_loop < PrefetchStages (i.e. num_loop == 1).
+            if(num_loop > 1)
+            {
+                elementwise_As_res =
+                    load_tile_with_elementwise(a_copy_dram_window, a_element_func);
+                move_tile_window(a_copy_dram_window, a_dram_tile_window_step);
 
-            elementwise_As_res = load_tile_with_elementwise(a_copy_dram_window, a_element_func);
-            move_tile_window(a_copy_dram_window, a_dram_tile_window_step);
-
-            elementwise_Bs_res = load_tile_with_elementwise(b_copy_dram_window, b_element_func);
-            move_tile_window(b_copy_dram_window, b_dram_tile_window_step);
+                elementwise_Bs_res =
+                    load_tile_with_elementwise(b_copy_dram_window, b_element_func);
+                move_tile_window(b_copy_dram_window, b_dram_tile_window_step);
+            }
 
             block_sync_lds();
             block_gemm.LocalPrefetch(
@@ -533,8 +576,10 @@ struct GemmPipelineAgBgCrCompV3 : public BaseGemmPipelineAgBgCrCompV3<Problem>
             // main body
             if constexpr(HasHotLoop)
             {
+                // Run all but the last hot-loop iteration with global prefetch.
                 index_t i = 0;
-                do
+                while(i < (num_loop - 2))
+                // do
                 {
                     block_sync_lds();
 
@@ -579,7 +624,46 @@ struct GemmPipelineAgBgCrCompV3 : public BaseGemmPipelineAgBgCrCompV3<Problem>
                     __builtin_amdgcn_sched_barrier(0);
 
                     i += 1;
-                } while(i < (num_loop - 1));
+                }
+                // } while(i < (num_loop - 1));
+
+                // Peeled last hot-loop iteration: skip the global prefetch to
+                // avoid OOB access beyond the K dimension
+                {
+                    block_sync_lds();
+
+                    if constexpr(is_a_col_major && !is_a_load_tr_v())
+                    {
+                        auto a_shuffle_tmp = make_static_distributed_tensor<ADataType>(
+                            Policy::template MakeShuffledARegTileDistribution<Problem>());
+                        transpose_tile2d(a_shuffle_tmp, elementwise_As_res);
+                        Base::LocalPrefill(a_copy_lds_window, a_shuffle_tmp);
+                    }
+                    else
+                    {
+                        Base::LocalPrefill(a_copy_lds_window, elementwise_As_res);
+                    }
+                    if constexpr(is_b_row_major && !is_b_load_tr_v())
+                    {
+                        auto b_shuffle_tmp = make_static_distributed_tensor<BDataType>(
+                            Policy::template MakeShuffledBRegTileDistribution<Problem>());
+                        transpose_tile2d(b_shuffle_tmp, elementwise_Bs_res);
+                        Base::LocalPrefill(b_copy_lds_window, b_shuffle_tmp);
+                    }
+                    else
+                    {
+                        Base::LocalPrefill(b_copy_lds_window, elementwise_Bs_res);
+                    }
+
+                    block_gemm(c_block_tile, a_lds_gemm_window, b_lds_gemm_window);
+
+                    block_sync_lds();
+
+                    block_gemm.LocalPrefetch(
+                        a_lds_gemm_window, b_lds_gemm_window, is_a_load_tr_v, is_b_load_tr_v);
+                    HotLoopScheduler();
+                    __builtin_amdgcn_sched_barrier(0);
+                }
             }
             // tail
             if constexpr(TailNum == TailNumber::Odd)
