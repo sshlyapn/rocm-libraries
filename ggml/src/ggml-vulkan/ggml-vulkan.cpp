@@ -2144,6 +2144,7 @@ struct vk_instance_t {
     PFN_vkSetDebugUtilsObjectNameEXT pfn_vkSetDebugUtilsObjectNameEXT = {};
     PFN_vkQueueBeginDebugUtilsLabelEXT pfn_vkQueueBeginDebugUtilsLabelEXT = {};
     PFN_vkQueueEndDebugUtilsLabelEXT   pfn_vkQueueEndDebugUtilsLabelEXT   = {};
+    PFN_vkQueueInsertDebugUtilsLabelEXT pfn_vkQueueInsertDebugUtilsLabelEXT = {};
     PFN_vkCmdBeginDebugUtilsLabelEXT   pfn_vkCmdBeginDebugUtilsLabelEXT   = {};
     PFN_vkCmdEndDebugUtilsLabelEXT pfn_vkCmdEndDebugUtilsLabelEXT = {};
     PFN_vkCmdInsertDebugUtilsLabelEXT  pfn_vkCmdInsertDebugUtilsLabelEXT  = {};
@@ -6502,6 +6503,7 @@ static void ggml_vk_instance_init() {
         vk_instance.pfn_vkSetDebugUtilsObjectNameEXT = (PFN_vkSetDebugUtilsObjectNameEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkSetDebugUtilsObjectNameEXT");
         vk_instance.pfn_vkQueueBeginDebugUtilsLabelEXT = (PFN_vkQueueBeginDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkQueueBeginDebugUtilsLabelEXT");
         vk_instance.pfn_vkQueueEndDebugUtilsLabelEXT = (PFN_vkQueueEndDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkQueueEndDebugUtilsLabelEXT");
+        vk_instance.pfn_vkQueueInsertDebugUtilsLabelEXT = (PFN_vkQueueInsertDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkQueueInsertDebugUtilsLabelEXT");
         vk_instance.pfn_vkCmdBeginDebugUtilsLabelEXT = (PFN_vkCmdBeginDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkCmdBeginDebugUtilsLabelEXT");
         vk_instance.pfn_vkCmdEndDebugUtilsLabelEXT =   (PFN_vkCmdEndDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkCmdEndDebugUtilsLabelEXT");
         vk_instance.pfn_vkCmdInsertDebugUtilsLabelEXT = (PFN_vkCmdInsertDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkCmdInsertDebugUtilsLabelEXT");
@@ -15887,10 +15889,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
+        // GGML_VK_ONE_SUBMIT: force the entire graph into a single vkQueueSubmit so a
+        // whole token can be captured in one RGP/SQTT trace. Disables early submits.
+        static const bool one_submit = getenv("GGML_VK_ONE_SUBMIT") != nullptr;
+        if (one_submit) {
+            almost_ready = false;
+        }
         bool submit = (submitted_nodes >= nodes_per_submit) ||
                       (mul_mat_bytes_per_submit != 0 && mul_mat_bytes >= mul_mat_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
+        if (one_submit) {
+            submit = (i + ctx->num_additional_fused_ops >= last_node);
+        }
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
@@ -15980,6 +15991,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     if (!ctx->device->support_async) {
         ggml_vk_synchronize(ctx);
+    }
+
+    // GGML_VK_FRAME_MARKER: emit an AmdFrameEnd queue debug label once per graph
+    // compute (one decode token) so AMDVLK's PAL GpuProfiler treats each token as a
+    // frame boundary. This lets the file-based GpuProfiler (GpuProfilerMode=3) dump
+    // one RGP/SQTT trace per token in a headless compute app that never calls
+    // vkQueuePresentKHR. No-op on RADV / when debug utils is unavailable.
+    if (vk_instance.debug_utils_support && vk_instance.pfn_vkQueueInsertDebugUtilsLabelEXT &&
+        getenv("GGML_VK_FRAME_MARKER") != nullptr) {
+        vk::DebugUtilsLabelEXT dul = {};
+        dul.pLabelName = "AmdFrameEnd";
+        vk_instance.pfn_vkQueueInsertDebugUtilsLabelEXT(ctx->device->compute_queue.queue, reinterpret_cast<VkDebugUtilsLabelEXT*>(&dul));
     }
 
     return GGML_STATUS_SUCCESS;
