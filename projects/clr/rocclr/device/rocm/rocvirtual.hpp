@@ -30,6 +30,7 @@
 #include "device/device.hpp"
 #include "os/os.hpp"
 #include <stack>
+#include <unordered_map>
 
 namespace amd::roc {
 class Device;
@@ -487,6 +488,28 @@ class VirtualGPU : public device::VirtualDevice {
                                 bool blocking, const hsa_ven_amd_aqlprofile_1_00_pfn_t* extApi);
   void dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal = false,
                              hsa_signal_t signal = hsa_signal_t{0});
+
+  // EXPERIMENTAL (HIP_PWS_FENCE=1, gfx11 only): inter-kernel PWS deferred-wait
+  // fence. Replaces the firmware AQL packet-scope cache fence with an inline
+  // vendor PM4-IB packet (CS_PARTIAL_FLUSH + RELEASE_MEM(PWS) + ACQUIRE_MEM(PWS))
+  // so the cache flush overlaps the next dispatch instead of stalling the CP.
+  bool pwsFenceActive();         //!< env gate, cached
+  bool ensurePwsIb();            //!< lazily build the executable PWS PM4 IB
+  void injectPwsFence();         //!< append the vendor PM4-IB packet to the live queue
+  void capturePwsFence(uint8_t* dst);  //!< record the vendor PM4-IB packet into a graph slot
+
+  // EXPERIMENTAL (HIP_PM4_GRAPH=1, gfx11 only): replay a captured all-dispatch
+  // hipGraph as ONE PM4 indirect buffer (lean raw-PM4 dispatch front-end + in-place
+  // PWS fence between every dispatch) launched by a single vendor PM4-IB packet.
+  // This transfers the raw-PM4 PWS speedup into the HIP runtime: one CP jump for the
+  // whole graph (the IB-jump cost amortizes to ~0), unlike per-dispatch injection.
+  struct Pm4GraphIb { void* ib = nullptr; uint32_t dw = 0; bool supported = false; };
+  std::unordered_map<const void*, Pm4GraphIb> pm4Graphs_;  //!< compiled IB cache, keyed by packet[0]
+  int pm4GraphState_ = -1;       //!< HIP_PM4_GRAPH env gate: -1 unknown, 0 off, 1 on
+  bool pm4GraphActive();
+  void* allocExecIbFromData(const uint32_t* data, uint32_t dw);  //!< stage data into an executable IB
+  Pm4GraphIb buildPm4GraphIb(void* const* packets, size_t numPackets);
+  bool tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking, bool attach_signal);
   void dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveDepSignal = false,
                                   hsa_signal_t signal = hsa_signal_t{0},
                                   hsa_signal_value_t value = 0, hsa_signal_value_t mask = 0,
@@ -628,6 +651,10 @@ class VirtualGPU : public device::VirtualDevice {
   std::atomic<bool> fence_dirty_;      //!< Fence modified flag
 
   std::atomic<uint> lastUsedSdmaEngineMask_;  //!< Last Used SDMA Engine mask
+  void* pwsIbBuf_ = nullptr;                  //!< executable IB holding the PWS fence PM4
+  uint32_t pwsIbDw_ = 0;                       //!< dword count of the PWS PM4 IB (16 or 18)
+  int pwsFenceState_ = -1;                    //!< PWS fence env gate: -1 unknown, 0 off, 1 on
+
   uint64_t last_write_index_ = 0;             //!< The last HW queue write index for any packet
   uint64_t last_barrier_index_ = 0;           //!< The last HW queue write index for a packet
                                               //!< with a complition signal

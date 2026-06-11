@@ -1263,6 +1263,17 @@ bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& pa
     return false;
   }
 
+  // EXPERIMENTAL: replay an all-dispatch captured graph as one PM4 IB (single CP
+  // jump, lean raw-PM4 dispatches + in-place PWS fences). kernelNames != nullptr
+  // marks the graph-replay path. Falls back to AQL replay if any packet is
+  // unsupported (non-dispatch, scratch, or non-trivial kernarg ABI).
+  if (pm4GraphActive() && kernelNames != nullptr) {
+    if (tryReplayPm4Graph(reinterpret_cast<void* const*>(packets.data()), packets.size(), blocking,
+                          attach_signal)) {
+      return true;
+    }
+  }
+
   const uint32_t queueSize = gpu_queue_->size;
   const uint32_t queueMask = queueSize - 1;
   const uint32_t sw_queue_size = queueMask;
@@ -1318,13 +1329,21 @@ bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& pa
       AqlPacket* packet = packets[packetIndex];
       uint16_t header = packet->header;
 
+      // Recorded PWS vendor PM4-IB packets must stay signal-free (completion_signal
+      // = 0) so the CP does not block on them inline -- the overlap depends on it.
+      // Skip the per-packet active-signal/profiling bookkeeping for them.
+      const bool isVendorPkt =
+          extractAqlBits(header, HSA_PACKET_HEADER_TYPE, HSA_PACKET_HEADER_WIDTH_TYPE) ==
+          HSA_PACKET_TYPE_VENDOR_SPECIFIC;
 
       bool attachSignal = timestamp_ != nullptr || attach_signal;
 
-      packet->completion_signal =
-          Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);
+      if (!isVendorPkt) {
+        packet->completion_signal =
+            Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);
+      }
 
-      if (std::is_same<decltype(packet), hsa_kernel_dispatch_packet_t*>::value &&
+      if (!isVendorPkt && std::is_same<decltype(packet), hsa_kernel_dispatch_packet_t*>::value &&
           timestamp_ != nullptr) {
         // If profiling is enabled, store the correlation ID in the dispatch packet
         if (amd::activity_prof::IsEnabled(OP_ID_DISPATCH)) {
@@ -1577,6 +1596,363 @@ void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,
 }
 
 // ================================================================================================
+// EXPERIMENTAL PWS inter-kernel fence (HIP_PWS_FENCE=1, gfx11 only).
+//
+// Replicates RADV's GFX11 overlap mechanism on the HIP AQL queue: instead of the
+// firmware doing a blocking ACQUIRE_MEM from the dispatch packet's acquire/release
+// scope, we strip that scope (see submitKernelInternal) and inject an inline
+// vendor PM4-IB packet whose IB is CS_PARTIAL_FLUSH + RELEASE_MEM(PWS) +
+// ACQUIRE_MEM(PWS). RELEASE_MEM issues the GCR cache flush async and bumps the PWS
+// counter; the PWS ACQUIRE_MEM waits the counter without stalling the CP inline,
+// so the flush overlaps the next dispatch. Validated standalone in
+// vk_gap_test/pm4_gap/hsa_pws_spike.cpp (bit-exact vs the scope fence, no hang).
+// Plain ASCII only.
+bool VirtualGPU::pwsFenceActive() {
+  if (pwsFenceState_ < 0) {
+    pwsFenceState_ = (getenv("HIP_PWS_FENCE") != nullptr) ? 1 : 0;
+  }
+  return pwsFenceState_ == 1;
+}
+
+bool VirtualGPU::ensurePwsIb() {
+  if (pwsIbBuf_ != nullptr) {
+    return true;
+  }
+  // PM4 IB dwords lifted verbatim from pm4_layer.cpp (GCR_AGENT_LIKE = 0x380:
+  // GL1_INV | GLV_INV | GLK_INV). shaderType=1 on the inner packets (MEC).
+  // HIP_PWS_NODRAIN=1 drops the leading CS_PARTIAL_FLUSH: in the AQL path the
+  // next dispatch's BARRIER bit already drains the prior dispatch, so the
+  // explicit wave drain may be redundant (must be verified bit-exact).
+  static const uint32_t kPwsIbFull[] = {
+      0xC0004602u, 0x00000407u,                                  // CS_PARTIAL_FLUSH
+      0xC0064902u, 0xC000C528u, 0, 0, 0, 0, 0, 0,                // RELEASE_MEM(PWS, GCR=0x380)
+      0xC0065802u, 0x00022800u, 0xFFFFFFFFu, 0x01FFFFFFu, 0, 0, 0x80000000u, 0,  // ACQUIRE_MEM(PWS)
+  };
+  const bool noDrain = getenv("HIP_PWS_NODRAIN") != nullptr;
+  const uint32_t* kPwsIb = noDrain ? (kPwsIbFull + 2) : kPwsIbFull;  // skip CS_PARTIAL_FLUSH
+  pwsIbDw_ = noDrain ? 16u : 18u;
+  // The CP indirect-buffer fetcher needs EXECUTABLE GPU memory.
+  void* dev = nullptr;
+  if (Hsa::memory_pool_allocate(roc_device_.getGpuvmSegment(), 0x1000,
+                                HSA_AMD_MEMORY_POOL_EXECUTABLE_FLAG, &dev) != HSA_STATUS_SUCCESS) {
+    LogError("PWS: executable IB allocation failed");
+    return false;
+  }
+  hsa_agent_t gpu = roc_device_.getBackendDevice();
+  Hsa::agents_allow_access(1, &gpu, nullptr, dev);
+  // Executable device memory is not CPU-writable, so stage via a host buffer.
+  void* host = nullptr;
+  if (Hsa::memory_pool_allocate(roc_device_.getCpuFineGrainPool(), 0x1000, 0, &host) !=
+      HSA_STATUS_SUCCESS) {
+    Hsa::memory_pool_free(dev);
+    LogError("PWS: host staging allocation failed");
+    return false;
+  }
+  hsa_agent_t agents[2] = {gpu, roc_device_.getCpuAgent()};
+  Hsa::agents_allow_access(2, agents, nullptr, host);
+  memset(host, 0, 0x1000);
+  memcpy(host, kPwsIb, pwsIbDw_ * sizeof(uint32_t));
+  hsa_signal_t s;
+  Hsa::signal_create(1, 0, nullptr, &s);
+  Hsa::memory_async_copy(dev, gpu, host, roc_device_.getCpuAgent(), 0x1000, 0, nullptr, s);
+  while (Hsa::signal_wait_scacquire(s, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX,
+                                    HSA_WAIT_STATE_BLOCKED) >= 1) {}
+  Hsa::signal_destroy(s);
+  Hsa::memory_pool_free(host);
+  pwsIbBuf_ = dev;
+  ClPrint(amd::LOG_INFO, amd::LOG_AQL, "PWS: inter-kernel fence IB ready @%p", pwsIbBuf_);
+  return true;
+}
+
+// Vendor AMD_AQL_FORMAT_PM4_IB packet (same 64-byte layout ROCr
+// AqlQueue::ExecutePM4 uses). completion_signal = 0 so the CP does not block on
+// it inline -- the PWS RELEASE/ACQUIRE inside the IB provide the ordering, and
+// the cache flush overlaps the next dispatch.
+struct PwsVendorPkt {
+  uint16_t header;
+  uint16_t ven_hdr;
+  uint32_t ib_jump_cmd[4];
+  uint32_t dw_cnt_remain;
+  uint32_t reserved[8];
+  hsa_signal_t completion_signal;
+};
+static void buildPwsVendorPkt(PwsVendorPkt* pkt, void* ibBuf, uint32_t kPwsIbDw) {
+  const uint64_t base = reinterpret_cast<uint64_t>(ibBuf);
+  memset(pkt, 0, sizeof(*pkt));
+  pkt->header = HSA_PACKET_TYPE_VENDOR_SPECIFIC << HSA_PACKET_HEADER_TYPE;  // = 0
+  pkt->ven_hdr = 0x1;                                                       // AMD_AQL_FORMAT_PM4_IB
+  pkt->ib_jump_cmd[0] = (3u << 30) | ((4u - 2u) << 16) | (0x3Fu << 8);     // INDIRECT_BUFFER, shaderType 0
+  pkt->ib_jump_cmd[1] = static_cast<uint32_t>(((base >> 2) & 0x3FFFFFFFull) << 2);
+  pkt->ib_jump_cmd[2] = static_cast<uint32_t>((base >> 32) & 0xFFFFull);
+  pkt->ib_jump_cmd[3] = (kPwsIbDw & 0xFFFFFu) | (1u << 23);                // IB_SIZE | IB_VALID
+  pkt->dw_cnt_remain = 0xA;
+  pkt->completion_signal = hsa_signal_t{0};
+}
+
+// Eager path: append the PWS vendor packet directly to the live HW queue.
+void VirtualGPU::injectPwsFence() {
+  if (!ensurePwsIb()) {
+    return;
+  }
+  PwsVendorPkt pkt;
+  buildPwsVendorPkt(&pkt, pwsIbBuf_, pwsIbDw_);
+
+  const uint32_t queueMask = gpu_queue_->size - 1;
+  uint64_t index = Hsa::queue_add_write_index_screlease(gpu_queue_, 1);
+  while ((index - Hsa::queue_load_read_index_scacquire(gpu_queue_)) >= queueMask) {
+    amd::Os::yield();
+  }
+  PwsVendorPkt* slot =
+      &(reinterpret_cast<PwsVendorPkt*>(gpu_queue_->base_address))[index & queueMask];
+  // Write the body first, then the header dword with release so the CP does not
+  // read the slot until it is fully written.
+  memcpy(reinterpret_cast<uint8_t*>(slot) + sizeof(uint32_t),
+         reinterpret_cast<uint8_t*>(&pkt) + sizeof(uint32_t), sizeof(pkt) - sizeof(uint32_t));
+  packet_store_release(reinterpret_cast<uint32_t*>(slot), pkt.header, pkt.ven_hdr);
+  Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, index);
+  hasPendingDispatch_ = true;
+}
+
+// Graph-capture path: write the PWS vendor packet into a recorded 64-byte slot.
+// CaptureAndFormPacket pushes one kernel-name per gpuPackets_ entry, so the
+// extra recorded packet stays aligned with the batch's kernelNames vector.
+void VirtualGPU::capturePwsFence(uint8_t* dst) {
+  if (dst == nullptr || !ensurePwsIb()) {
+    return;
+  }
+  PwsVendorPkt pkt;
+  buildPwsVendorPkt(&pkt, pwsIbBuf_, pwsIbDw_);
+  memcpy(dst, &pkt, sizeof(pkt));
+}
+
+// ================================================================================================
+// PM4 graph replay (HIP_PM4_GRAPH=1): compile a captured all-dispatch hipGraph into
+// one PM4 indirect buffer and replay it via a single vendor PM4-IB packet.
+
+namespace {
+// AMD kernel descriptor (first 64 bytes), AMDHSA ABI. Mirrors pm4_layer.cpp.
+struct AmdKernelDescriptor {
+  uint32_t group_segment_fixed_size, private_segment_fixed_size, kernarg_size;
+  uint8_t  reserved0[4];
+  int64_t  kernel_code_entry_byte_offset;
+  uint8_t  reserved1[20];
+  uint32_t compute_pgm_rsrc3, compute_pgm_rsrc1, compute_pgm_rsrc2;
+  uint16_t kernel_code_properties, kernarg_preload;
+  uint8_t  reserved2[4];
+};
+// kernel_code_properties enable bits (AMDHSA).
+enum {
+  KCP_PRIVATE_SEGMENT_BUFFER = 1u << 0,
+  KCP_DISPATCH_PTR           = 1u << 1,
+  KCP_QUEUE_PTR              = 1u << 2,
+  KCP_KERNARG_SEGMENT_PTR    = 1u << 3,
+  KCP_FLAT_SCRATCH_INIT      = 1u << 5,
+};
+// gfx11 SH compute register addresses (kfdtest asic_reg/gfx_7_2_d.h) and SET_SH base.
+enum {
+  kShBase     = 0x2c00,   // PERSISTENT_SPACE_START
+  kRegStartX  = 0x2e04,   // COMPUTE_START_X..NUM_THREAD_Z span (8 regs)
+  kRegPgmLo   = 0x2e0c,   // COMPUTE_PGM_LO/HI
+  kRegRsrc1   = 0x2e12,   // COMPUTE_PGM_RSRC1/2
+  kRegResLim  = 0x2e15,   // COMPUTE_RESOURCE_LIMITS
+  kRegTmpring = 0x2e18,   // COMPUTE_TMPRING_SIZE
+  kRegUserD0  = 0x2e40,   // COMPUTE_USER_DATA_0
+};
+// PM4 type-3 opcodes.
+enum { kOpSetShReg = 0x76, kOpDispatchDirect = 0x15, kOpEventWrite = 0x46,
+       kOpReleaseMem = 0x49, kOpAcquireMem = 0x58 };
+// GCR_CNTL bits: GLK_INV(7) GLV_INV(8) GL1_INV(9) GL2_INV(14) GL2_WB(15) GLM_WB(4)
+// GLM_INV(5) GLI_INV(0). AGENT-like (no L2 flush) vs RADV-like (full L2).
+constexpr uint32_t kGcrAgent = (1u<<7)|(1u<<8)|(1u<<9);                       // 0x380
+constexpr uint32_t kGcrFull  = (1u<<15)|(1u<<14)|(1u<<4)|(1u<<5)|(1u<<9)|(1u<<8)|(1u<<7)|(1u<<0); // 0xC3B1
+// DISPATCH_INITIATOR: CS_EN | USE_THREAD_DIMS | CS_W32 (matches pm4_layer).
+constexpr uint32_t kDispatchInit = 0x21u | 0x8000u;
+
+inline uint32_t pm4Hdr(uint32_t opcode, uint32_t dw) {
+  // type3 (3<<30), count=(dw-2)<<16, opcode<<8, shaderType=1 (bit1).
+  return 0xC0000000u | ((dw - 2u) << 16) | (opcode << 8) | 0x2u;
+}
+}  // namespace
+
+bool VirtualGPU::pm4GraphActive() {
+  if (pm4GraphState_ < 0) {
+    pm4GraphState_ = (getenv("HIP_PM4_GRAPH") != nullptr) ? 1 : 0;
+  }
+  return pm4GraphState_ == 1;
+}
+
+void* VirtualGPU::allocExecIbFromData(const uint32_t* data, uint32_t dw) {
+  size_t bytes = (static_cast<size_t>(dw) * 4 + 0xFFF) & ~static_cast<size_t>(0xFFF);
+  void* dev = nullptr;
+  if (Hsa::memory_pool_allocate(roc_device_.getGpuvmSegment(), bytes,
+                                HSA_AMD_MEMORY_POOL_EXECUTABLE_FLAG, &dev) != HSA_STATUS_SUCCESS) {
+    return nullptr;
+  }
+  hsa_agent_t gpu = roc_device_.getBackendDevice();
+  Hsa::agents_allow_access(1, &gpu, nullptr, dev);
+  void* host = nullptr;
+  if (Hsa::memory_pool_allocate(roc_device_.getCpuFineGrainPool(), bytes, 0, &host) !=
+      HSA_STATUS_SUCCESS) {
+    Hsa::memory_pool_free(dev);
+    return nullptr;
+  }
+  hsa_agent_t agents[2] = {gpu, roc_device_.getCpuAgent()};
+  Hsa::agents_allow_access(2, agents, nullptr, host);
+  memcpy(host, data, static_cast<size_t>(dw) * 4);
+  hsa_signal_t s;
+  Hsa::signal_create(1, 0, nullptr, &s);
+  Hsa::memory_async_copy(dev, gpu, host, roc_device_.getCpuAgent(), static_cast<size_t>(dw) * 4, 0,
+                         nullptr, s);
+  while (Hsa::signal_wait_scacquire(s, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX,
+                                    HSA_WAIT_STATE_BLOCKED) >= 1) {}
+  Hsa::signal_destroy(s);
+  Hsa::memory_pool_free(host);
+  return dev;
+}
+
+VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t numPackets) {
+  Pm4GraphIb out;
+  std::vector<uint32_t> ib;
+  ib.reserve(numPackets * 56 + 16);
+
+  auto setsh = [&](uint32_t reg, const uint32_t* v, uint32_t cnt) {
+    ib.push_back(pm4Hdr(kOpSetShReg, 2 + cnt));
+    ib.push_back(reg - kShBase);
+    for (uint32_t i = 0; i < cnt; ++i) ib.push_back(v[i]);
+  };
+  auto partialFlush = [&]() {
+    ib.push_back(pm4Hdr(kOpEventWrite, 2));
+    ib.push_back(0x00000407u);  // EVENT_INDEX=4 (CS_VS_PS_PARTIAL_FLUSH), CS_PARTIAL_FLUSH
+  };
+  auto releaseMemPws = [&](uint32_t gcr) {
+    uint32_t op = 40u | (5u << 8);          // EVENT_TYPE=BOTTOM_OF_PIPE_TS, EVENT_INDEX=5
+    if (gcr & (1u << 7)) op |= (1u << 30);  // GLK_INV
+    if (gcr & (1u << 8)) op |= (1u << 14);  // GLV_INV
+    if (gcr & (1u << 9)) op |= (1u << 15);  // GL1_INV
+    op |= (1u << 31);                       // PWS_ENABLE
+    ib.push_back(pm4Hdr(kOpReleaseMem, 8));
+    ib.push_back(op);
+    for (int i = 0; i < 6; ++i) ib.push_back(0);
+  };
+  auto acquirePws = [&]() {
+    ib.push_back(pm4Hdr(kOpAcquireMem, 8));
+    ib.push_back((5u << 11) | (1u << 17));  // PWS_STAGE_SEL=CP_ME, PWS_ENA2=1, COUNT=0
+    ib.push_back(0xFFFFFFFFu);
+    ib.push_back(0x01FFFFFFu);
+    ib.push_back(0);
+    ib.push_back(0);
+    ib.push_back(1u << 31);                 // PWS_ENA
+    ib.push_back(0);                        // GCR_CNTL (flush carried by RELEASE_MEM)
+  };
+  auto acquireFull = [&](uint32_t gcr) {
+    ib.push_back(pm4Hdr(kOpAcquireMem, 8));
+    ib.push_back(0);            // CP_COHER_CNTL
+    ib.push_back(0xFFFFFFFFu);  // CP_COHER_SIZE
+    ib.push_back(0x00FFFFFFu);  // CP_COHER_SIZE_HI
+    ib.push_back(0);            // CP_COHER_BASE
+    ib.push_back(0);            // CP_COHER_BASE_HI
+    ib.push_back(0x0Au);        // POLL_INTERVAL
+    ib.push_back(gcr);          // GCR_CNTL
+  };
+
+  for (size_t i = 0; i < numPackets; ++i) {
+    auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
+    uint8_t type = extractAqlBits(p->header, HSA_PACKET_HEADER_TYPE, HSA_PACKET_HEADER_WIDTH_TYPE);
+    if (type != HSA_PACKET_TYPE_KERNEL_DISPATCH) {
+      return out;  // unsupported packet -> caller falls back to AQL replay
+    }
+    if (p->kernel_object == 0) return out;
+    auto* kd = reinterpret_cast<const AmdKernelDescriptor*>(p->kernel_object);
+    // Only the simple kernarg-pointer ABI is supported (no scratch, no dispatch/queue ptr).
+    if (kd->private_segment_fixed_size != 0 || p->private_segment_size != 0) return out;
+    if (kd->kernel_code_properties &
+        (KCP_PRIVATE_SEGMENT_BUFFER | KCP_DISPATCH_PTR | KCP_QUEUE_PTR | KCP_FLAT_SCRATCH_INIT)) {
+      return out;
+    }
+
+    const uint32_t dims[8] = {0, 0, 0, p->workgroup_size_x, p->workgroup_size_y,
+                              p->workgroup_size_z, 0, 0};
+    setsh(kRegStartX, dims, 8);
+    uint64_t entry = (p->kernel_object + kd->kernel_code_entry_byte_offset) >> 8;
+    const uint32_t pgm[2] = {static_cast<uint32_t>(entry), static_cast<uint32_t>(entry >> 32)};
+    setsh(kRegPgmLo, pgm, 2);
+    uint32_t rsrc2 = kd->compute_pgm_rsrc2;
+    uint32_t groupSeg = std::max<uint32_t>(kd->group_segment_fixed_size, p->group_segment_size);
+    uint32_t ldsUnits = (groupSeg + 127) / 128;  // gfx11 LDS_SIZE = rsrc2[23:15], 128B granule
+    rsrc2 |= (ldsUnits << 15) & 0x00FF8000u;
+    const uint32_t rsrc[2] = {kd->compute_pgm_rsrc1, rsrc2};
+    setsh(kRegRsrc1, rsrc, 2);
+    const uint32_t zero = 0;
+    setsh(kRegResLim, &zero, 1);
+    setsh(kRegTmpring, &zero, 1);
+    uint32_t udata[2] = {static_cast<uint32_t>(reinterpret_cast<uint64_t>(p->kernarg_address)),
+                         static_cast<uint32_t>(reinterpret_cast<uint64_t>(p->kernarg_address) >> 32)};
+    setsh(kRegUserD0, udata, 2);
+    // DISPATCH_DIRECT: USE_THREAD_DIMS -> dim_x is total work-items (AQL grid_size).
+    ib.push_back(pm4Hdr(kOpDispatchDirect, 5));
+    ib.push_back(p->grid_size_x);
+    ib.push_back(p->grid_size_y ? p->grid_size_y : 1);
+    ib.push_back(p->grid_size_z ? p->grid_size_z : 1);
+    ib.push_back(kDispatchInit);
+    // In-place PWS fence (overlap the AGENT cache flush with the next dispatch).
+    partialFlush();
+    releaseMemPws(kGcrAgent);
+    acquirePws();
+  }
+  // Final full-L2 writeback so the graph's results are system-visible (matches the
+  // SYSTEM-scope release the normal AQL batch forces on its last packet).
+  partialFlush();
+  acquireFull(kGcrFull);
+
+  void* dev = allocExecIbFromData(ib.data(), static_cast<uint32_t>(ib.size()));
+  if (dev == nullptr) return out;
+  out.ib = dev;
+  out.dw = static_cast<uint32_t>(ib.size());
+  out.supported = true;
+  ClPrint(amd::LOG_INFO, amd::LOG_AQL,
+          "PM4 graph: compiled %zu dispatches -> IB %u dwords @%p", numPackets, out.dw, out.ib);
+  return out;
+}
+
+bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking,
+                                   bool attach_signal) {
+  if (numPackets == 0) return false;
+  const void* key = packets[0];
+  auto it = pm4Graphs_.find(key);
+  if (it == pm4Graphs_.end()) {
+    it = pm4Graphs_.emplace(key, buildPm4GraphIb(packets, numPackets)).first;
+  }
+  Pm4GraphIb& g = it->second;
+  if (!g.supported) return false;
+
+  bool attachSignal = timestamp_ != nullptr || attach_signal;
+  hsa_signal_t sig = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);
+
+  PwsVendorPkt pkt;
+  buildPwsVendorPkt(&pkt, g.ib, g.dw);
+  pkt.completion_signal = sig;  // CP signals it after the whole IB completes
+
+  const uint32_t queueMask = gpu_queue_->size - 1;
+  uint64_t index = Hsa::queue_add_write_index_screlease(gpu_queue_, 1);
+  while ((index - Hsa::queue_load_read_index_scacquire(gpu_queue_)) >= queueMask) {
+    amd::Os::yield();
+  }
+  PwsVendorPkt* slot =
+      &(reinterpret_cast<PwsVendorPkt*>(gpu_queue_->base_address))[index & queueMask];
+  memcpy(reinterpret_cast<uint8_t*>(slot) + sizeof(uint32_t),
+         reinterpret_cast<uint8_t*>(&pkt) + sizeof(uint32_t), sizeof(pkt) - sizeof(uint32_t));
+  packet_store_release(reinterpret_cast<uint32_t*>(slot), pkt.header, pkt.ven_hdr);
+  Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, index);
+  hasPendingDispatch_ = true;
+  TrackQueueProgress(pkt, index);
+
+  if (blocking) {
+    Barriers().WaitCurrent();
+  }
+  return true;
+}
+
+// ================================================================================================
 void VirtualGPU::dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveDepSignal,
                                             hsa_signal_t signal, hsa_signal_value_t value,
                                             hsa_signal_value_t mask, hsa_signal_condition32_t cond,
@@ -1756,6 +2132,29 @@ VirtualGPU::VirtualGPU(Device& device, bool profiling, bool cooperative,
   }
 
   aqlHeader_ = dispatchPacketHeader_;
+
+  // ISOLATION TEST (inter-kernel gap study): env-gated overrides of the kernel
+  // dispatch packet header, to separate per-dispatch cache-fence cost from the
+  // command-processor AQL packet processing cost. Plain ASCII only.
+  //   GAP_NOSCOPE=1   strip acquire/release fence scope (NONE) -- no per-dispatch
+  //                   cache acquire/release at all.
+  //   GAP_NOBARRIER=1 clear the AQL barrier bit -- CP need not wait for the prior
+  //                   packet to complete before processing the next.
+  {
+    constexpr uint16_t kScopeMask =
+        static_cast<uint16_t>(~((3u << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) |
+                                (3u << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE)));
+    constexpr uint16_t kBarrierMask =
+        static_cast<uint16_t>(~(1u << HSA_PACKET_HEADER_BARRIER));
+    if (getenv("GAP_NOSCOPE") != nullptr) {
+      dispatchPacketHeader_ &= kScopeMask;
+      dispatchPacketHeaderNoSync_ &= kScopeMask;
+    }
+    if (getenv("GAP_NOBARRIER") != nullptr) {
+      dispatchPacketHeader_ &= kBarrierMask;
+    }
+    aqlHeader_ = dispatchPacketHeader_;
+  }
 
   // Note: Virtual GPU device creation must be a thread safe operation
   roc_device_.vgpus_.resize(roc_device_.numOfVgpus_);
@@ -3863,6 +4262,20 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const 
     }
   }
 
+  // EXPERIMENTAL PWS inter-kernel fence: strip the dispatch packet's acquire/
+  // release cache scope (the appended PWS PM4-IB carries the cache flush instead).
+  // Applies to both eager and graph-capture paths; skipped for system-scope
+  // dispatches (host-visible boundary needs the real flush). The win is in the
+  // graph path where the recorded stream replays under a single doorbell, so the
+  // overlapped flush hides instead of paying an extra eager launch+doorbell.
+  const bool pwsFence = pwsFenceActive() && !addSystemScope_;
+  if (pwsFence) {
+    constexpr uint16_t kScopeMask =
+        static_cast<uint16_t>(~((3u << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) |
+                                (3u << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE)));
+    aqlHeaderWithOrder &= kScopeMask;
+  }
+
   // Copy scheduler's AQL packet for possible relaunch from the scheduler itself
   if (aql_packet != nullptr) {
     *aql_packet = dispatchPacket;
@@ -3874,6 +4287,14 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const 
   }
 
   if (isGraphCapture) {
+    // Record the overlapped PWS cache fence as an extra captured packet BEFORE
+    // this dispatch, so the recorded stream is [..., PWS, dispatch] and the last
+    // graph packet stays a real dispatch (clean completion-signal semantics in
+    // the single-doorbell batch replay). The leading fence (before the very
+    // first kernel) is a harmless cache acquire at graph entry.
+    if (pwsFence) {
+      capturePwsFence(const_cast<uint8_t*>(command_->getAqlPacket()));
+    }
     // Dispatch the packet
     if (!dispatchAqlPacket(&dispatchPacket, aqlHeaderWithOrder,
                            (sizes.dimensions() << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS),
@@ -3886,6 +4307,10 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const 
                            (sizes.dimensions() << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS),
                            GPU_FLUSH_ON_EXECUTION, false, nullptr, attach_signal)) {
       return false;
+    }
+    // Append the overlapped PWS cache fence right after the dispatch.
+    if (pwsFence) {
+      injectPwsFence();
     }
   }
 
