@@ -1418,9 +1418,44 @@ RESULT (pinned profile_peak, serial LAYERS=8 N=20, us/dispatch):
 
 PWS 0x380 is FLAT (residual growth is only bandwidth, like VK/HIP), bit-exact
 with full GLK_INV cache safety, ~2x faster than the blocking acquire, and FASTER
-than both VK and HIP at every M. End-to-end per decode token (300 kernels,
-LAYERS=60) dropped from ~1630-1720 us (blocking) to ~725-1110 us. Verified on the
-reverse-read mix chain too (deterministic x3 at M=262144).
+than both VK and HIP at every M.
+
+END-TO-END per decode TOKEN (us), 300 kernels/token (LAYERS=60), N=20, pinned
+profile_peak (sclk 970 / mclk 1124 MHz). All five columns are bit-identical
+(same checksum) at each M, on BOTH chains:
+
+  CHAIN=serial (realistic decode)
+  M       PM4 PWS 0x380  PM4 block 0x380  PM4 block 0x300  VK(RADV)  HIP eager  HIP graph
+  16384      742.9          1628.2            338.5         1359.7    1182.8     1077.2
+  65536      812.5          1739.6            409.3         1384.7    1222.4     1119.2
+  262144    1106.8          1700.2            702.8         1746.8    1651.7     1441.2
+
+  CHAIN=mix (reverse-read cache-coherence stress)
+  M       PM4 PWS 0x380  PM4 block 0x380  PM4 block 0x300  VK(RADV)  HIP eager  HIP graph
+  16384      741.2          1566.3            337.9         1361.4    1183.9     1071.7
+  65536      812.0          1710.7            409.4         1379.9    1219.7     1150.4
+  262144    1100.8          1643.9            700.7         1770.3    1657.4     1441.9
+
+  (HIP graph column added later, same pinned profile_peak; session consistency
+  verified by re-running HIP eager 1177.7 ~= 1182.8 and PM4 PWS 737.8 ~= 742.9 at
+  M=16384 serial. HIP graph = median of 5, hip_layer_graph.cpp, layer_gfx1100.co.)
+
+PM4 PWS 0x380 (the cache-safe default) is ~1.6-1.9x faster than VK and ~1.5-1.6x
+faster than HIP eager; the PWS overlap roughly halves the blocking-0x380 path by
+hiding the per-CU GLK_INV ack instead of stalling on it. PM4 block 0x300 (drops
+GLK_INV) is fastest but compiler-specific/unsafe (6m.2), kept as a diagnostic.
+Verified deterministic on the reverse-read mix chain too.
+
+HIP graph (the FAIR comparand for a pre-recorded PM4 stream -- single launch, no
+per-dispatch CPU cost) is faster than HIP eager (1077 vs 1183 at M=16384) because
+it drops the launch loop, but PM4 PWS still beats it by ~1.3-1.45x (742.9 vs
+1077.2, 812.5 vs 1119.2, 1106.8 vs 1441.2). So PM4 PWS is the fastest of ALL the
+safe paths at every M, on both chains. NOTE: this advantage combines two things
+-- PM4's leaner per-dispatch front-end AND the in-place PWS fence swap. It does
+NOT transfer to the HIP runtime by INJECTING a PWS vendor packet: HIP graph
+already emits a lean overlapped AGENT-scope fence (acquire=1/release=1), so an
+added vendor PM4-IB packet is net overhead (neutral at large M, ~2x regression at
+small M). See section 5.x / the CLR PWS experiment.
 
 CONCLUSION: the PM4 0x380 M-growth was the per-CU scalar-cache invalidate ack
 EXPOSED by a blocking in-order ACQUIRE_MEM. RADV hides it by overlapping the
@@ -1431,6 +1466,73 @@ three, with no loss of correctness. New default in pm4_layer.cpp.
 Artifacts: pm4_gap/pm4_layer.cpp (Emit::release_mem_pws/acquire_pws; PWS=1
 default, PWS=0 blocking; CUMASK=N CU-count knob). Encodings: mesa
 src/amd/registers/pkt3.json. RADV PWS refs: radv_cs.c:259-280, radv_queue.c:632-650.
+
+### 6n.4 TRANSFER TO HIP: the whole chain in ONE indirect buffer is free
+
+To get the PM4 PWS win into the HIP runtime we cannot INJECT a per-dispatch PWS
+vendor packet (that doubles packet count -> the extra CP packet + IB-jump cost
+cancels the overlap, measured neutral at large M / ~2x regression at small M --
+see the CLR injection experiment). The fix is to route the WHOLE captured stream
+through a SINGLE PM4 indirect buffer launched with ONE INDIRECT_BUFFER (one CP
+jump for the entire graph), so the per-dispatch path inside the IB is the lean
+raw PM4 + in-place PWS fence -- exactly what pm4_layer does inline.
+
+De-risk (pm4_layer IB=1: emit whole chain into an executable IB, launch with a
+single IT_INDIRECT_BUFFER from the ring), pinned profile_peak, serial LAYERS=60
+N=20, us/token, bit-exact (same checksum as inline):
+
+  M        inline ring   single IB    HIP graph (AQL)
+  16384       740.8         732.0         1077.2
+  65536       813.5         803.2         1119.2
+  262144     1103.3        1095.9         1441.2
+
+The IB jump is FREE when amortized over the whole chain (single IB == inline ring
+within noise), and ~1.45x faster than HIP graph. So the viable HIP integration is
+"compile the captured hipGraph to one PM4 IB and replay it via a single vendor
+PM4-IB AQL packet" -- NOT per-dispatch fence injection. Artifact: pm4_layer.cpp
+env IB=1.
+
+### 6n.5 IMPLEMENTED IN CLR: HIP_PM4_GRAPH=1 -- the speedup transferred, bit-exact
+
+The single-IB design above is implemented in the HIP runtime (rocclr). At graph
+replay (dispatchGenericAqlPacketBatch, kernelNames != nullptr) the captured
+all-dispatch graph is compiled ONCE into one executable PM4 IB -- per dispatch:
+SET_SH_REG (PGM/RSRC/dims, USER_DATA = the captured kernarg_address) +
+DISPATCH_DIRECT + in-place PWS fence (CS_PARTIAL_FLUSH + RELEASE_MEM PWS +
+ACQUIRE_MEM PWS), then one final full-L2 acquire -- and replayed via a SINGLE
+vendor PM4-IB AQL packet whose completion_signal the CP raises after the whole IB.
+Gated by HIP_PM4_GRAPH=1; falls back to normal AQL replay if any packet is not a
+simple kernarg-ptr-ABI dispatch (non-dispatch packet, scratch, or dispatch/queue
+ptr enable bits). Files: rocclr/device/rocm/rocvirtual.cpp
+(buildPm4GraphIb / tryReplayPm4Graph / allocExecIbFromData), rocvirtual.hpp.
+
+MEASURED in the real HIP runtime (hip_pws_test, graph mode, pinned profile_peak,
+median of 5, us/dispatch), BIT-EXACT vs baseline on forward AND reverse-read
+chains:
+
+  config              baseline   HIP_PM4_GRAPH=1   speedup   checksum
+  M=16384  L=8  FWD     3.776        2.935          1.29x     exact
+  M=16384  L=8  REV     3.779        2.946          1.28x     exact
+  M=16384  L=60 FWD     3.596        2.608          1.38x     exact
+  M=16384  L=60 REV     3.600        2.610          1.38x     exact
+  M=65536  L=60 FWD     3.739        2.735          1.37x     exact
+  M=65536  L=60 REV     3.743        2.729          1.37x     exact
+
+END-TO-END per graph replay (us/chain = host hipGraphLaunch loop total / ITERS,
+includes host launch + GPU + sync), SAME binary + SAME patched libamdhip64.so,
+only HIP_PM4_GRAPH toggled, pinned profile_peak, ITERS=500:
+
+  graph (M=16384)              baseline AQL   HIP_PM4_GRAPH=1   speedup   checksum
+  L=60 (300 disp ~= 1 token)    1078.44 us       784.54 us       1.37x    517635.581366 (identical)
+  L=8  (40 disp)                 151.20 us        117.84 us       1.28x     68169.317397 (identical)
+
+At L=60 / M=16384 that is ~784 us/token vs stock HIP graph 1078 -- matching the
+standalone PM4 PWS (742.9) and far ahead of HIP graph. The raw-PM4 PWS win is
+reproduced inside the HIP runtime: one CP jump per graph (free), lean raw-PM4
+dispatch front-end, and the in-place PWS fence that overlaps the AGENT cache
+flush. Limitation: simple kernarg-ptr ABI only (no scratch / extra user SGPRs);
+real decode kernels need ABI extension (see Appendix B), but the safe fallback
+keeps all other graphs correct. FULL reconstruction reference: Appendix B.
 
 --------------------------------------------------------------------------------
 
@@ -1914,4 +2016,190 @@ Reference encodings: mesa `src/amd/registers/pkt3.json` (ACQUIRE_MEM,
 RELEASE_MEM_OP_gfx11, ACQUIRE_MEM_PWS_*). RADV refs: `radv_cs.c`
 (gfx10_cs_emit_cache_flush, PWS at ~:259-280), `radv_cmd_buffer.c`
 (CS_PARTIAL_FLUSH for compute barriers), `radv_queue.c:632-650`.
+
+
+================================================================================
+## 9. Appendix B: CLR PM4-graph integration (HIP_PM4_GRAPH) -- full reconstruction
+================================================================================
+
+This appendix records the initial integration that transfers the raw-PM4 PWS
+speedup into the HIP runtime, in enough detail to rebuild it from scratch if the
+CLR tree is reset. It is the companion of section 6n.5 (results).
+
+### 9.1 Idea in one paragraph
+
+A captured hipGraph replays a fixed list of AQL kernel-dispatch packets via
+`VirtualGPU::dispatchGenericAqlPacketBatch`. Instead of letting the firmware
+process those AQL packets (heavier front-end + a per-dispatch scope fence), we
+compile the WHOLE list ONCE into a single executable PM4 indirect buffer -- raw
+`SET_SH_REG` + `DISPATCH_DIRECT` per kernel, with the in-place PWS fence
+(`CS_PARTIAL_FLUSH` + `RELEASE_MEM` PWS + `ACQUIRE_MEM` PWS) between dispatches --
+and replay it with ONE vendor PM4-IB AQL packet. One CP jump for the entire graph
+(the IB-jump cost amortizes to ~0; proven in 6n.4 with pm4_layer IB=1), the lean
+raw-PM4 dispatch front-end, and the overlapped AGENT cache fence -- exactly the
+pm4_layer recipe, now driven by the HIP graph API. Per-dispatch injection does NOT
+work (one vendor packet per dispatch = N CP jumps, overhead cancels the win).
+
+### 9.2 Files changed (ROCm clr tree, rocm-7.2.1)
+
+Repo: `/home/sshliapn/code/rocm-systems/projects/clr`
+Build dir: `clr/build-gap` -> `build-gap/hipamd/lib/libamdhip64.so.7` (HIP 7.2.53211)
+
+1. `rocclr/device/rocm/rocvirtual.hpp`
+   - `#include <unordered_map>` near the other includes.
+   - In `class VirtualGPU` (private), after the PWS members:
+     ```
+     struct Pm4GraphIb { void* ib = nullptr; uint32_t dw = 0; bool supported = false; };
+     std::unordered_map<const void*, Pm4GraphIb> pm4Graphs_;   // keyed by packets[0]
+     int pm4GraphState_ = -1;                                   // HIP_PM4_GRAPH gate
+     bool pm4GraphActive();
+     void* allocExecIbFromData(const uint32_t* data, uint32_t dw);
+     Pm4GraphIb buildPm4GraphIb(void* const* packets, size_t numPackets);
+     bool tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking,
+                            bool attach_signal);
+     ```
+
+2. `rocclr/device/rocm/rocvirtual.cpp`
+   - Hook at the TOP of `dispatchGenericAqlPacketBatch` (right after the
+     `packets.empty()` check). `kernelNames != nullptr` marks the graph-replay
+     path; fall through to AQL on any unsupported packet:
+     ```
+     if (pm4GraphActive() && kernelNames != nullptr) {
+       if (tryReplayPm4Graph(reinterpret_cast<void* const*>(packets.data()),
+                             packets.size(), blocking, attach_signal)) {
+         return true;
+       }
+     }
+     ```
+   - New code after `capturePwsFence(...)` (reuses the existing `PwsVendorPkt`
+     struct + `buildPwsVendorPkt()` already added for the PWS work):
+     * anon-namespace `AmdKernelDescriptor` (first 64 bytes of the AMDHSA kernel
+       descriptor: group/private/kernarg sizes, `kernel_code_entry_byte_offset`,
+       `compute_pgm_rsrc1/2/3`, `kernel_code_properties`), `KCP_*` enable bits,
+       gfx11 SH register addresses, PM4 opcodes, GCR constants, `pm4Hdr()`.
+     * `pm4GraphActive()` -- caches `getenv("HIP_PM4_GRAPH")`.
+     * `allocExecIbFromData()` -- copy of the ensurePwsIb allocation pattern:
+       allocate `HSA_AMD_MEMORY_POOL_EXECUTABLE_FLAG` device mem from
+       `roc_device_.getGpuvmSegment()`, stage via a CPU fine-grain buffer, async
+       copy, free stage.
+     * `buildPm4GraphIb()` -- the compiler (see 9.3).
+     * `tryReplayPm4Graph()` -- cache lookup/compile, then emit ONE vendor PM4-IB
+       packet (see 9.4).
+
+No other files. PWS pieces it reuses (`PwsVendorPkt`, `buildPwsVendorPkt`,
+`ensurePwsIb`/`pwsIbDw_`) were added earlier for HIP_PWS_FENCE.
+
+### 9.3 buildPm4GraphIb -- the per-dispatch PM4 (gfx11 / Navi31), byte-exact
+
+Constants (from kfdtest `asic_reg/gfx_7_2_d.h`, PERSISTENT_SPACE_START=0x2c00):
+```
+SET base   0x2c00          opcodes  SET_SH_REG=0x76  DISPATCH_DIRECT=0x15
+START_X    0x2e04 (8 regs) EVENT_WRITE=0x46  RELEASE_MEM=0x49  ACQUIRE_MEM=0x58
+PGM_LO     0x2e0c (2)      DISPATCH_INIT = 0x21|0x8000 (CS_EN|USE_THREAD_DIMS|CS_W32)
+RSRC1      0x2e12 (2)      GCR AGENT = 0x380 (GL1_INV|GLV_INV|GLK_INV)
+RESLIM     0x2e15 (1)      GCR full  = 0xC3B1 (GL2_WB|GL2_INV|GLM_WB|GLM_INV|GL1|GLV|GLK|GLI)
+TMPRING    0x2e18 (1)      pm4Hdr(op,dw) = 0xC0000000 | ((dw-2)<<16) | (op<<8) | 0x2
+USER_DATA0 0x2e40 (2)        (type3, shaderType=1)
+```
+type-3 header low byte 0x02 = shaderType=1 (compute/MEC). SET_SH_REG ordinal2 =
+reg - 0x2c00. The PWS RELEASE_MEM/ACQUIRE_MEM dword layout is identical to
+pm4_layer Emit::release_mem_pws / acquire_pws (RELEASE_MEM op = 40|(5<<8)|PWS bits;
+GLK_INV->bit30, GLV_INV->bit14, GL1_INV->bit15, PWS_ENABLE bit31; ACQUIRE_MEM PWS
+ordinal2 = (5<<11)|(1<<17), GCR_SIZE 0xFFFFFFFF/0x01FFFFFF, PWS_ENA bit31).
+
+Per captured `hsa_kernel_dispatch_packet_t* p` (read straight from the packet):
+```
+type != KERNEL_DISPATCH        -> return unsupported (fallback)
+p->kernel_object == 0          -> unsupported
+kd = (AmdKernelDescriptor*)p->kernel_object
+kd->private_segment_fixed_size != 0 || p->private_segment_size != 0   -> unsupported (no scratch)
+kd->kernel_code_properties & (PRIVATE_SEGMENT_BUFFER|DISPATCH_PTR|QUEUE_PTR|FLAT_SCRATCH_INIT)
+                               -> unsupported (only KERNARG_SEGMENT_PTR ABI)
+SET_SH_REG START_X = {0,0,0, p->workgroup_size_{x,y,z}, 0,0}
+SET_SH_REG PGM_LO  = (p->kernel_object + kd->kernel_code_entry_byte_offset) >> 8  (lo,hi)
+rsrc2 = kd->compute_pgm_rsrc2; lds=ceil(max(kd->group_segment_fixed_size,
+        p->group_segment_size)/128); rsrc2 |= (lds<<15)&0x00FF8000
+SET_SH_REG RSRC1   = {kd->compute_pgm_rsrc1, rsrc2}
+SET_SH_REG RESLIM  = 0 ;  SET_SH_REG TMPRING = 0
+SET_SH_REG USER_DATA0 = p->kernarg_address (lo,hi)   // reuse the runtime's kernarg buffer
+DISPATCH_DIRECT(dim_x=p->grid_size_x, dim_y, dim_z, DISPATCH_INIT)   // USE_THREAD_DIMS => grid = total work-items
+CS_PARTIAL_FLUSH ; RELEASE_MEM(PWS, 0x380) ; ACQUIRE_MEM(PWS)
+```
+After the loop: one `CS_PARTIAL_FLUSH` + full-L2 `ACQUIRE_MEM(0xC3B1)` so the
+graph's results are system-visible (matches the SYSTEM-scope release the normal
+AQL batch forces on its last packet). Then `allocExecIbFromData(ib)`; cache
+{ib, dw, supported=true}. ~51 dwords/dispatch.
+
+KEY correctness choices:
+- USER_DATA0 = the CAPTURED `kernarg_address`: the runtime already populated it
+  (incl. COV5 hidden args), and graph replay reuses the same buffer every launch,
+  so baking the pointer into the IB is safe.
+- The mandatory `CS_PARTIAL_FLUSH` before the PWS pair (RAW correctness, see 6n.3).
+- Final full-L2 acquire = system visibility for the subsequent D2H / next op.
+
+### 9.4 tryReplayPm4Graph -- one vendor packet, normal signal path
+
+```
+key = packets[0]; compile-or-lookup in pm4Graphs_; if !supported return false (fallback)
+sig = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attach)   // same as normal batch
+buildPwsVendorPkt(&pkt, g.ib, g.dw); pkt.completion_signal = sig          // CP raises it after the IB
+reserve 1 queue slot; write body then header (packet_store_release); ring doorbell
+hasPendingDispatch_ = true; TrackQueueProgress(pkt, index)
+if (blocking) Barriers().WaitCurrent()
+```
+The vendor PM4-IB packet is the same 64-byte AMD_AQL_FORMAT_PM4_IB layout used by
+the PWS work and ROCr's AqlQueue::ExecutePM4; its INDIRECT_BUFFER jumps to the IB,
+the CP runs the whole graph, then signals completion_signal -> the existing host
+sync (Barriers) works unchanged. The IB is compiled once and cached; replays just
+re-emit the single vendor packet.
+
+### 9.5 Build & run (restore-from-scratch)
+
+```bash
+# rebuild the patched runtime
+docker exec hipvk-isolated-sshliapn bash -lc \
+  'cd /home/sshliapn/code/rocm-systems/projects/clr/build-gap && \
+   cmake --build . --target amdhip64 --parallel'
+
+# build the test app (HIP program with a dependent-kernel hipGraph)
+docker exec hipvk-isolated-sshliapn bash -lc \
+  'cd /home/sshliapn/code/llama.cpp/vk_gap_test/pm4_gap && \
+   /opt/rocm/bin/hipcc -O2 -std=c++17 hip_pws_test.cpp -o hip_pws_test'
+
+# pin clocks on the HOST (deterministic), check GPU free first
+sudo -n /usr/local/sbin/gpu_pin_freq.sh profile_peak     # restore: gpu_restore_freq.sh
+
+# A/B in the SAME binary + SAME patched lib, only the env toggles
+docker exec hipvk-isolated-sshliapn bash -lc '
+  cd /home/sshliapn/code/llama.cpp/vk_gap_test/pm4_gap
+  export LD_LIBRARY_PATH=/home/sshliapn/code/rocm-systems/projects/clr/build-gap/hipamd/lib:$LD_LIBRARY_PATH
+  export HIP_VISIBLE_DEVICES=0
+  ./hip_pws_test 16384 60 500 graph                 # baseline AQL graph
+  HIP_PM4_GRAPH=1 ./hip_pws_test 16384 60 500 graph # PM4 graph'
+```
+Expected (pinned profile_peak): L=60 baseline ~1078 us/chain -> PM4 ~785 us/chain
+(1.37x), identical checksum. REV=1 for the reverse-read coherence-stress chain.
+
+### 9.6 Status, limitations, how to extend to the real model
+
+WORKS: env-gated (HIP_PM4_GRAPH=1, off by default = zero impact), bit-exact on
+forward + reverse chains, 1.28-1.38x in real hipGraph replay (6n.5). Safe fallback
+to AQL for any unsupported packet, so non-target graphs stay correct.
+
+LIMITATIONS (all guarded by the fallback):
+- Only the simple kernarg-ptr ABI: NO scratch (`private_segment_fixed_size`), and
+  only `KCP_KERNARG_SEGMENT_PTR` may be enabled. Real decode kernels usually need
+  more (scratch, `dispatch_ptr`/`queue_ptr` user SGPRs, COV5 implicit kernarg).
+- Only all-KERNEL_DISPATCH graphs: a captured barrier/marker packet -> fallback.
+- gfx11 register/encoding only (Navi31). Other ASICs would need their reg map.
+
+TO RUN ON FLYWHEEL DECODE (next step):
+1. Honor the full AMDHSA ABI in buildPm4GraphIb: set scratch (`COMPUTE_TMPRING_SIZE`
+   + the scratch V# in user SGPRs / FLAT_SCRATCH), and lay out user SGPRs in the
+   enable-bit order (private_seg_buf, dispatch_ptr, queue_ptr, kernarg_ptr, ...).
+   `pm4_real.cpp` is the reference for a real hipcc-kernel ABI replication.
+2. Handle non-dispatch packets in the captured stream (emit equivalent PM4, or
+   split the IB around them).
+3. Wire to the decode graph (manifold.py captures it) and measure TPOT with the
+   model-offline-benchmarking skill; compare HIP_PM4_GRAPH on/off.
 

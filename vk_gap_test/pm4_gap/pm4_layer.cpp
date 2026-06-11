@@ -396,7 +396,13 @@ int main(int argc,char** argv){
     if(getenv("GCR_RAW")) GCR = (uint32_t)strtoul(getenv("GCR_RAW"),nullptr,0);  // diagnostic override
     printf("fence GCR=0x%x (%s)\n", GCR, gcrMode ? "AGENT-like (no L2 flush)" : "RADV-like (full L2)");
 
-    Emit e((uint32_t*)ring);
+    // IB=1: emit the entire stream into a separate executable indirect buffer and
+    // launch it from the ring with a SINGLE INDIRECT_BUFFER packet (one CP jump for
+    // the whole chain). This isolates the IB-jump cost and mirrors how the HIP
+    // runtime would replay a captured graph as one PM4 IB via a vendor packet.
+    bool useIB = getenv("IB") != nullptr;
+    void* ibBuf = useIB ? alloc_gpu(node,ringBytes,true,true) : nullptr;
+    Emit e((uint32_t*)(useIB ? ibBuf : ring));
 
     // SEMASK=1: enable ALL CUs on ALL shader engines for this queue. gfx11
     // (Navi31) has 6 SEs; COMPUTE_STATIC_THREAD_MGMT_SE0..SE5 are the per-SE CU
@@ -516,13 +522,23 @@ int main(int argc,char** argv){
     e.write_data((uint64_t)sentinel,0xC0FFEE);
     uint32_t total=e.idx;
     if((uint64_t)total*4 > ringBytes){ fprintf(stderr,"ring overflow %u dw\n",total); return 1; }
-    printf("stream=%u dwords ring=%lluKB\n",total,(unsigned long long)(ringBytes>>10));
+    uint32_t ringTotal=total;
+    if(useIB){
+        uint64_t ibVA=(uint64_t)ibBuf;
+        uint32_t* r=(uint32_t*)ring;
+        r[0]=(3u<<30)|((4u-2u)<<16)|(0x3Fu<<8);   // IT_INDIRECT_BUFFER (MEC), 4 dwords
+        r[1]=(uint32_t)(ibVA & 0xFFFFFFFCu);       // IB_BASE_LO (4-aligned)
+        r[2]=(uint32_t)((ibVA>>32)&0xFFFFu);       // IB_BASE_HI
+        r[3]=(total & 0xFFFFFu) | (1u<<23);        // IB_SIZE (dwords) | IB_VALID
+        ringTotal=4;
+    }
+    printf("stream=%u dwords (IB=%d) ring=%lluKB\n",total,(int)useIB,(unsigned long long)(ringBytes>>10));
 
     asm volatile("":::"memory");
     double t0=now_s();
-    *res.Queue_write_ptr_aql=total;
+    *res.Queue_write_ptr_aql=ringTotal;
     asm volatile("":::"memory");
-    *res.Queue_DoorBell_aql=total;
+    *res.Queue_DoorBell_aql=ringTotal;
     const double timeout=120.0;
     while(sentinel[0]!=0xC0FFEE){
         if(now_s()-t0>timeout){ fprintf(stderr,"TIMEOUT rptr=%u/%u\n",*res.Queue_read_ptr,total);
