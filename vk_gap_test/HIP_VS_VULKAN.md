@@ -2203,3 +2203,90 @@ TO RUN ON FLYWHEEL DECODE (next step):
 3. Wire to the decode graph (manifold.py captures it) and measure TPOT with the
    model-offline-benchmarking skill; compare HIP_PM4_GRAPH on/off.
 
+
+================================================================================
+## 9.7 Appendix B addendum: e2e coverage (RDNA3 + RDNA4), gaps closed
+================================================================================
+
+The 9.6 limitations were closed so a real Llama-3.1-8B decode hipGraph compiles
+to ONE PM4 IB and replays bit-exactly. All changes are in `buildPm4GraphIb` /
+`tryReplayPm4Graph` (rocvirtual.cpp), still gated by HIP_PM4_GRAPH, still with a
+safe AQL fallback for anything unproven.
+
+GAPS CLOSED (gap id -> what changed):
+- G1 scratch: read the queue scratch state from `amd_queue_t` (`compute_tmpring_size`,
+  `scratch_resource_descriptor[4]`, `scratch_backing_memory_location`) and emit
+  COMPUTE_TMPRING_SIZE + COMPUTE_DISPATCH_SCRATCH_BASE_LO/HI + the scratch V# in
+  the private_segment_buffer user SGPRs. Opt-in (HIP_PM4_GRAPH_SCRATCH). If the
+  queue has not sized scratch yet (compute_tmpring_size==0), the build returns
+  kPm4DeferredScratch: that launch falls back to AQL (which sizes the queue
+  scratch), and the next launch rebuilds with scratch wired. FLAT_SCRATCH_INIT
+  kernels still fall back.
+- G2 user-SGPR ABI: user SGPRs laid out in kernel_code_properties enable-bit
+  order (private_seg_buf=4, queue_ptr=2, kernarg=2). Supported subset =
+  {PRIVATE_SEGMENT_BUFFER, QUEUE_PTR, KERNARG_SEGMENT_PTR}; dispatch_ptr /
+  dispatch_id / private_segment_size -> fallback.
+- G3 wave size: CS_W32_EN in DISPATCH_INITIATOR derived per kernel from the
+  WAVEFRONT_SIZE32 bit (wave32 sets 0x8000, wave64 clears it).
+- G4 gfx12 (RDNA4): arch-parameterized emitter (Pm4Arch). gfx11 path byte-
+  identical to the validated build; gfx12 drops GLM_WB/GLM_INV from the full-L2
+  GCR (no metadata cache; mesa radv_cs.c gfx10_cs_emit_cache_flush). COMPUTE_*
+  register addresses and PWS RELEASE_MEM/ACQUIRE_MEM encoding are identical
+  across gfx11/gfx12 (verified vs mesa ac_shadowed_regs.c).
+- G5 non-dispatch packets: still whole-graph AQL fallback (the decode AQL batch
+  is all-dispatch), plus kernarg-preload (G9) detection -> fallback.
+- G6 leading acquire: emit a leading full-L2 ACQUIRE_MEM so the first kernel sees
+  prior-op (H2D / previous graph) writes.
+- G7 lifetime: cache keyed by an FNV-1a content hash over each packet's
+  kernel_object/grid/workgroup/kernarg (a destroyed+reused host packet address
+  can no longer alias a stale IB); executable IBs freed in ~VirtualGPU.
+
+CRITICAL FIX found via the coverage test (and why the first model run hung):
+the gfx11 LDS_SIZE field in COMPUTE_PGM_RSRC2 is encoded in the LDS ENCODE
+granule = 128 dwords = 512 bytes (mesa ac_gpu_info.c lds_encode_granularity),
+and COV5 leaves the field 0 (the runtime programs it from the dispatch packet's
+group_segment_size). The original code recomputed it with a 128-BYTE granule
+(4x too large) and OR-ed it in; the 0-LDS microbench never exercised it, but a
+real large-LDS GEMM over-allocated past the per-workgroup LDS limit and hung the
+queue. Fixed: set LDS_SIZE = ceil(group_segment_size / 512), capped at 0x1FF.
+
+HIP COVERAGE TEST (hip_pm4_coverage.cpp + wave64_kernel.hip + run_pm4_coverage.sh):
+runs each scenario under baseline (HIP_PM4_GRAPH unset) and PM4, diffs the
+result checksum. gfx1100 (W7900) -- ALL BIT-EXACT:
+
+  scenario     gap   baseline        pm4             result
+  multi        G2    2142.686584     2142.686584     OK
+  nonmult      G8    2129.860009     2129.860009     OK   (grid % block != 0)
+  coherence    G6    2129.860009     2129.860009     OK   (H2D right before launch)
+  recreate     G7    18546.625891    18546.625891    OK   (destroy + different graph)
+  lds          LDS   2306.333241     2306.333241     OK   (static __shared__)
+  wave64       G3    10870.707956    10870.707956    OK   (wave64 mixed w/ wave32)
+  barriernode  G5    2129.860009     2129.860009     OK   (event node -> fallback)
+  scratch      G1    2129.859873     2129.859873     OK   (spill kernel, opt-in)
+
+gfx1201 (RDNA4): build-verified (no RDNA4 hardware in this environment to run).
+
+E2E -- Llama-3.1-8B-Instruct-q0 decode, real flywheel hipGraph, W7900 gfx1100,
+patched libamdhip64 via LD_LIBRARY_PATH (PyTorch loads /opt/rocm libamdhip64.so.7,
+overridden):
+- The whole decode token (embedding + all 32 decoder layers) compiles to ONE PM4
+  IB (AMD_LOG "PM4 graph: compiled" fires exactly once per token, no fallback).
+- Correctness: greedy decode is BIT-IDENTICAL, HIP_PM4_GRAPH on vs off and with
+  HIP_PM4_GRAPH_SCRATCH on -- same 48 token ids, same text, sha 9f8c459f8f4c3445
+  (utils/bench/pm4_e2e_check.py).
+- TPOT (pinned profile_peak, -i128 -o128 -n3 greedy):
+    baseline      9.56 ms   199.0 tok/s
+    PM4 graph     9.50 ms   200.2 tok/s
+    PM4+scratch   9.52 ms   199.6 tok/s
+  => flat (within noise). At 8B the decode is memory-bound GEMV (weight streaming);
+  the inter-kernel gap that PWS overlaps is a negligible fraction of TPOT, so the
+  microbench's 1.37x (tiny kernels, all gap) does NOT transfer to large-model
+  decode. The value is correctness-complete coverage + the technique standing by
+  for gap-dominated regimes (very small models / large batch of tiny kernels /
+  speculative-decode draft models).
+
+REMAINING (still fallback, not faults):
+- FLAT_SCRATCH_INIT kernels, dispatch_ptr/dispatch_id user SGPRs, non-dispatch
+  packets inside the AQL batch, and any non-gfx11/gfx12 ASIC.
+- gfx1201 runtime validation pending RDNA4 hardware.
+
