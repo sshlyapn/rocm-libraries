@@ -503,11 +503,22 @@ class VirtualGPU : public device::VirtualDevice {
   // PWS fence between every dispatch) launched by a single vendor PM4-IB packet.
   // This transfers the raw-PM4 PWS speedup into the HIP runtime: one CP jump for the
   // whole graph (the IB-jump cost amortizes to ~0), unlike per-dispatch injection.
-  struct Pm4GraphIb { void* ib = nullptr; uint32_t dw = 0; bool supported = false; };
-  std::unordered_map<const void*, Pm4GraphIb> pm4Graphs_;  //!< compiled IB cache, keyed by packet[0]
-  int pm4GraphState_ = -1;       //!< HIP_PM4_GRAPH env gate: -1 unknown, 0 off, 1 on
+  //!< Compiled PM4 IB for one captured graph. kDeferredScratch means the graph
+  //!< needs scratch the queue has not sized yet: replay via AQL (which sizes it),
+  //!< then rebuild on the next launch.
+  enum Pm4GraphStatus { kPm4Unbuilt, kPm4Ready, kPm4UnsupportedPermanent, kPm4DeferredScratch };
+  struct Pm4GraphIb {
+    void* ib = nullptr;
+    uint32_t dw = 0;
+    Pm4GraphStatus status = kPm4Unbuilt;
+  };
+  std::unordered_map<uint64_t, Pm4GraphIb> pm4Graphs_;  //!< compiled IB cache, keyed by content hash
+  int pm4GraphState_ = -1;          //!< HIP_PM4_GRAPH env gate: -1 unknown, 0 off, 1 on
+  int pm4GraphScratchState_ = -1;   //!< HIP_PM4_GRAPH_SCRATCH env gate (scratch kernels)
   bool pm4GraphActive();
+  bool pm4GraphScratchEnabled();
   void* allocExecIbFromData(const uint32_t* data, uint32_t dw);  //!< stage data into an executable IB
+  static uint64_t pm4GraphKey(void* const* packets, size_t numPackets);  //!< content hash
   Pm4GraphIb buildPm4GraphIb(void* const* packets, size_t numPackets);
   bool tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking, bool attach_signal);
   void dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveDepSignal = false,

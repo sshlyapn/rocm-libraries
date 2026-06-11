@@ -1740,33 +1740,52 @@ struct AmdKernelDescriptor {
   uint16_t kernel_code_properties, kernarg_preload;
   uint8_t  reserved2[4];
 };
-// kernel_code_properties enable bits (AMDHSA).
+// kernel_code_properties enable bits (AMDHSA), in user-SGPR layout order.
 enum {
-  KCP_PRIVATE_SEGMENT_BUFFER = 1u << 0,
-  KCP_DISPATCH_PTR           = 1u << 1,
-  KCP_QUEUE_PTR              = 1u << 2,
-  KCP_KERNARG_SEGMENT_PTR    = 1u << 3,
-  KCP_FLAT_SCRATCH_INIT      = 1u << 5,
+  KCP_PRIVATE_SEGMENT_BUFFER = 1u << 0,   // 4 SGPRs (scratch V#)
+  KCP_DISPATCH_PTR           = 1u << 1,   // 2 SGPRs
+  KCP_QUEUE_PTR              = 1u << 2,   // 2 SGPRs
+  KCP_KERNARG_SEGMENT_PTR    = 1u << 3,   // 2 SGPRs
+  KCP_DISPATCH_ID            = 1u << 4,   // 2 SGPRs
+  KCP_FLAT_SCRATCH_INIT      = 1u << 5,   // 2 SGPRs
+  KCP_PRIVATE_SEGMENT_SIZE   = 1u << 6,   // 1 SGPR
+  KCP_WAVEFRONT_SIZE32       = 1u << 10,  // 1 = wave32, 0 = wave64
 };
-// gfx11 SH compute register addresses (kfdtest asic_reg/gfx_7_2_d.h) and SET_SH base.
+// SH compute register addresses (dword). Identical across gfx11 and gfx12: the
+// COMPUTE_* block is at the same offsets in every RDNA shadow-reg table (mesa
+// ac_shadowed_regs.c R_00B810/30/40/48/54/60/900). SET_SH ordinal = reg - base.
 enum {
-  kShBase     = 0x2c00,   // PERSISTENT_SPACE_START
-  kRegStartX  = 0x2e04,   // COMPUTE_START_X..NUM_THREAD_Z span (8 regs)
-  kRegPgmLo   = 0x2e0c,   // COMPUTE_PGM_LO/HI
-  kRegRsrc1   = 0x2e12,   // COMPUTE_PGM_RSRC1/2
-  kRegResLim  = 0x2e15,   // COMPUTE_RESOURCE_LIMITS
-  kRegTmpring = 0x2e18,   // COMPUTE_TMPRING_SIZE
-  kRegUserD0  = 0x2e40,   // COMPUTE_USER_DATA_0
+  kShBase        = 0x2c00,   // PERSISTENT_SPACE_START
+  kRegStartX     = 0x2e04,   // COMPUTE_START_X..NUM_THREAD_Z span (8 regs)
+  kRegPgmLo      = 0x2e0c,   // COMPUTE_PGM_LO/HI
+  kRegScratchLo  = 0x2e10,   // COMPUTE_DISPATCH_SCRATCH_BASE_LO/HI (R_00B840/44)
+  kRegRsrc1      = 0x2e12,   // COMPUTE_PGM_RSRC1/2
+  kRegResLim     = 0x2e15,   // COMPUTE_RESOURCE_LIMITS
+  kRegTmpring    = 0x2e18,   // COMPUTE_TMPRING_SIZE
+  kRegUserD0     = 0x2e40,   // COMPUTE_USER_DATA_0
 };
 // PM4 type-3 opcodes.
 enum { kOpSetShReg = 0x76, kOpDispatchDirect = 0x15, kOpEventWrite = 0x46,
        kOpReleaseMem = 0x49, kOpAcquireMem = 0x58 };
-// GCR_CNTL bits: GLK_INV(7) GLV_INV(8) GL1_INV(9) GL2_INV(14) GL2_WB(15) GLM_WB(4)
-// GLM_INV(5) GLI_INV(0). AGENT-like (no L2 flush) vs RADV-like (full L2).
-constexpr uint32_t kGcrAgent = (1u<<7)|(1u<<8)|(1u<<9);                       // 0x380
-constexpr uint32_t kGcrFull  = (1u<<15)|(1u<<14)|(1u<<4)|(1u<<5)|(1u<<9)|(1u<<8)|(1u<<7)|(1u<<0); // 0xC3B1
-// DISPATCH_INITIATOR: CS_EN | USE_THREAD_DIMS | CS_W32 (matches pm4_layer).
-constexpr uint32_t kDispatchInit = 0x21u | 0x8000u;
+// ACQUIRE_MEM GCR_CNTL bits: GLI_INV(0) GLM_WB(4) GLM_INV(5) GLK_INV(7) GLV_INV(8)
+// GL1_INV(9) GL2_INV(14) GL2_WB(15). AGENT-like (no L2 flush) vs full L2.
+constexpr uint32_t kGcrAgent  = (1u<<7)|(1u<<8)|(1u<<9);                       // 0x380
+constexpr uint32_t kGcrGlmBits = (1u<<4)|(1u<<5);                              // metadata cache
+constexpr uint32_t kGcrFullGfx11 = (1u<<15)|(1u<<14)|(1u<<9)|(1u<<8)|(1u<<7)|(1u<<0) | kGcrGlmBits; // 0xC3B1
+// gfx12 has no metadata (GLM) cache: radv drops GLM_WB/GLM_INV from the L2 flush
+// (radv_cs.c gfx10_cs_emit_cache_flush, "gfx_level < GFX12 ? GLM... : 0").
+constexpr uint32_t kGcrFullGfx12 = kGcrFullGfx11 & ~kGcrGlmBits;              // 0xC381
+// DISPATCH_INITIATOR: CS_EN(0) | USE_THREAD_DIMS(5). CS_W32_EN(15) added per wave.
+constexpr uint32_t kDispatchBase  = 0x21u;       // CS_EN | USE_THREAD_DIMS
+constexpr uint32_t kDispatchW32   = 0x8000u;     // CS_W32_EN (wave32 only)
+
+// Per-arch PM4 emission parameters. gfx11 (RDNA3) and gfx12 (RDNA4) share the
+// PWS RELEASE_MEM/ACQUIRE_MEM encoding and the COMPUTE_* register map; only the
+// full-L2 GCR mask differs (no GLM cache on gfx12).
+struct Pm4Arch {
+  uint32_t gcrFull;   // GCR for the trailing/leading full-L2 acquire
+  bool     isGfx12;
+};
 
 inline uint32_t pm4Hdr(uint32_t opcode, uint32_t dw) {
   // type3 (3<<30), count=(dw-2)<<16, opcode<<8, shaderType=1 (bit1).
@@ -1779,6 +1798,42 @@ bool VirtualGPU::pm4GraphActive() {
     pm4GraphState_ = (getenv("HIP_PM4_GRAPH") != nullptr) ? 1 : 0;
   }
   return pm4GraphState_ == 1;
+}
+
+// Scratch-kernel support is opt-in: replicating the CP scratch setup (TMPRING,
+// scratch base, scratch V#) is correct only after ROCr has sized the queue
+// scratch, and a mistake faults the GPU. Default off keeps scratch kernels on
+// the safe AQL fallback.
+bool VirtualGPU::pm4GraphScratchEnabled() {
+  if (pm4GraphScratchState_ < 0) {
+    pm4GraphScratchState_ = (getenv("HIP_PM4_GRAPH_SCRATCH") != nullptr) ? 1 : 0;
+  }
+  return pm4GraphScratchState_ == 1;
+}
+
+// Content hash over the fields that define the compiled IB, so a destroyed and
+// reallocated graph that happens to reuse the same host packet address does not
+// replay a stale IB (the old packet[0]-pointer key could alias). FNV-1a.
+uint64_t VirtualGPU::pm4GraphKey(void* const* packets, size_t numPackets) {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&](uint64_t v) {
+    for (int b = 0; b < 8; ++b) {
+      h ^= (v & 0xff);
+      h *= 1099511628211ull;
+      v >>= 8;
+    }
+  };
+  mix(numPackets);
+  for (size_t i = 0; i < numPackets; ++i) {
+    auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
+    mix(p->header | (static_cast<uint64_t>(p->setup) << 16));
+    mix(p->kernel_object);
+    mix(reinterpret_cast<uint64_t>(p->kernarg_address));
+    mix(static_cast<uint64_t>(p->grid_size_x) | (static_cast<uint64_t>(p->grid_size_y) << 32));
+    mix(static_cast<uint64_t>(p->grid_size_z) | (static_cast<uint64_t>(p->workgroup_size_x) << 32));
+    mix(static_cast<uint64_t>(p->workgroup_size_y) | (static_cast<uint64_t>(p->workgroup_size_z) << 32));
+  }
+  return h;
 }
 
 void* VirtualGPU::allocExecIbFromData(const uint32_t* data, uint32_t dw) {
@@ -1812,8 +1867,27 @@ void* VirtualGPU::allocExecIbFromData(const uint32_t* data, uint32_t dw) {
 
 VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t numPackets) {
   Pm4GraphIb out;
+  out.status = kPm4UnsupportedPermanent;  // pessimistic; promoted on success
+
+  // Select arch (gfx11 RDNA3 vs gfx12 RDNA4). Anything else is unsupported.
+  const auto& isa = roc_device_.isa();
+  Pm4Arch arch;
+  if (isa.versionMajor() == 11) {
+    arch = Pm4Arch{kGcrFullGfx11, false};
+  } else if (isa.versionMajor() == 12) {
+    arch = Pm4Arch{kGcrFullGfx12, true};
+  } else {
+    return out;  // only RDNA3/RDNA4 carry this PWS encoding
+  }
+
+  // Queue scratch state (filled by ROCr after a scratch dispatch runs via AQL).
+  auto* aq = reinterpret_cast<amd_queue_t*>(gpu_queue_);
+  const uint64_t queueScratchBase = aq->scratch_backing_memory_location;
+  const uint32_t queueTmpring = aq->compute_tmpring_size;
+  const bool queueScratchReady = (queueTmpring != 0) && (queueScratchBase != 0);
+
   std::vector<uint32_t> ib;
-  ib.reserve(numPackets * 56 + 16);
+  ib.reserve(numPackets * 64 + 24);
 
   auto setsh = [&](uint32_t reg, const uint32_t* v, uint32_t cnt) {
     ib.push_back(pm4Hdr(kOpSetShReg, 2 + cnt));
@@ -1855,20 +1929,48 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
     ib.push_back(gcr);          // GCR_CNTL
   };
 
+  // G6: leading full acquire so the first kernel sees writes from prior ops
+  // (H2D copy, a previous graph) -- the normal AQL batch carries this on the
+  // first packet's acquire scope; the self-contained microbench hid the need.
+  acquireFull(arch.gcrFull);
+
   for (size_t i = 0; i < numPackets; ++i) {
     auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
     uint8_t type = extractAqlBits(p->header, HSA_PACKET_HEADER_TYPE, HSA_PACKET_HEADER_WIDTH_TYPE);
     if (type != HSA_PACKET_TYPE_KERNEL_DISPATCH) {
-      return out;  // unsupported packet -> caller falls back to AQL replay
+      return out;  // non-dispatch packet -> caller falls back to AQL replay
     }
     if (p->kernel_object == 0) return out;
     auto* kd = reinterpret_cast<const AmdKernelDescriptor*>(p->kernel_object);
-    // Only the simple kernarg-pointer ABI is supported (no scratch, no dispatch/queue ptr).
-    if (kd->private_segment_fixed_size != 0 || p->private_segment_size != 0) return out;
-    if (kd->kernel_code_properties &
-        (KCP_PRIVATE_SEGMENT_BUFFER | KCP_DISPATCH_PTR | KCP_QUEUE_PTR | KCP_FLAT_SCRATCH_INIT)) {
-      return out;
+    const uint16_t props = kd->kernel_code_properties;
+
+    // Kernarg preload (gfx11/gfx12) changes the entry/SGPR contract; not handled.
+    if (kd->kernarg_preload != 0) return out;
+
+    // G1: scratch. Wire from the queue scratch state when ready, else defer
+    // (replay via AQL once so ROCr sizes scratch, then rebuild next launch).
+    const bool needsScratch = (kd->private_segment_fixed_size != 0) ||
+                              (p->private_segment_size != 0) ||
+                              (props & (KCP_PRIVATE_SEGMENT_BUFFER | KCP_FLAT_SCRATCH_INIT));
+    if (needsScratch) {
+      if (!pm4GraphScratchEnabled()) return out;            // opt-in only
+      if (props & KCP_FLAT_SCRATCH_INIT) return out;        // flat-scratch-init not replicated
+      if (!queueScratchReady) { out.status = kPm4DeferredScratch; return out; }
     }
+
+    // Only user SGPRs we can source correctly: private_segment_buffer (scratch
+    // V# from the queue), queue_ptr (the amd_queue_t), kernarg_segment_ptr.
+    // dispatch_ptr / dispatch_id / private_segment_size are not replicated.
+    constexpr uint16_t kSupportedUserSgpr =
+        KCP_PRIVATE_SEGMENT_BUFFER | KCP_QUEUE_PTR | KCP_KERNARG_SEGMENT_PTR;
+    constexpr uint16_t kUserSgprMask =
+        KCP_PRIVATE_SEGMENT_BUFFER | KCP_DISPATCH_PTR | KCP_QUEUE_PTR | KCP_KERNARG_SEGMENT_PTR |
+        KCP_DISPATCH_ID | KCP_FLAT_SCRATCH_INIT | KCP_PRIVATE_SEGMENT_SIZE;
+    if ((props & kUserSgprMask) & ~kSupportedUserSgpr) return out;
+
+    // G3: wave size from WAVEFRONT_SIZE32; gate CS_W32_EN accordingly.
+    const bool wave32 = (props & KCP_WAVEFRONT_SIZE32) != 0;
+    const uint32_t dispatchInit = kDispatchBase | (wave32 ? kDispatchW32 : 0u);
 
     const uint32_t dims[8] = {0, 0, 0, p->workgroup_size_x, p->workgroup_size_y,
                               p->workgroup_size_z, 0, 0};
@@ -1876,24 +1978,61 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
     uint64_t entry = (p->kernel_object + kd->kernel_code_entry_byte_offset) >> 8;
     const uint32_t pgm[2] = {static_cast<uint32_t>(entry), static_cast<uint32_t>(entry >> 32)};
     setsh(kRegPgmLo, pgm, 2);
-    uint32_t rsrc2 = kd->compute_pgm_rsrc2;
-    uint32_t groupSeg = std::max<uint32_t>(kd->group_segment_fixed_size, p->group_segment_size);
-    uint32_t ldsUnits = (groupSeg + 127) / 128;  // gfx11 LDS_SIZE = rsrc2[23:15], 128B granule
-    rsrc2 |= (ldsUnits << 15) & 0x00FF8000u;
+
+    // Scratch base + TMPRING (only when scratch needed; copied from the queue).
+    if (needsScratch) {
+      const uint64_t sbase = queueScratchBase >> 8;
+      const uint32_t scratch[2] = {static_cast<uint32_t>(sbase), static_cast<uint32_t>(sbase >> 32)};
+      setsh(kRegScratchLo, scratch, 2);
+    }
+
+    // RSRC1 verbatim from the KD (exactly what the CP loads). RSRC2 too, EXCEPT
+    // LDS_SIZE (bits[23:15]): COV5 leaves it 0 and the runtime/CP programs it from
+    // the dispatch packet's group_segment_size. The LDS_SIZE field is encoded in
+    // the gfx11 LDS encode granule = 128 dwords = 512 bytes (mesa ac_gpu_info.c
+    // lds_encode_granularity). The original /128 (128-byte) recompute over-
+    // allocated LDS 4x, which exceeds the per-workgroup limit on large-LDS GEMM
+    // kernels and hangs the queue (the 0-LDS microbench never exercised it).
+    constexpr uint32_t kLdsEncodeGranuleBytes = 512;
+    constexpr uint32_t kLdsSizeMask = 0x00FF8000u;  // COMPUTE_PGM_RSRC2[23:15]
+    const uint32_t groupSeg = std::max<uint32_t>(kd->group_segment_fixed_size,
+                                                 p->group_segment_size);
+    const uint32_t ldsUnits = std::min<uint32_t>(
+        (groupSeg + kLdsEncodeGranuleBytes - 1) / kLdsEncodeGranuleBytes, 0x1FFu);
+    uint32_t rsrc2 = (kd->compute_pgm_rsrc2 & ~kLdsSizeMask) | ((ldsUnits << 15) & kLdsSizeMask);
     const uint32_t rsrc[2] = {kd->compute_pgm_rsrc1, rsrc2};
     setsh(kRegRsrc1, rsrc, 2);
     const uint32_t zero = 0;
     setsh(kRegResLim, &zero, 1);
-    setsh(kRegTmpring, &zero, 1);
-    uint32_t udata[2] = {static_cast<uint32_t>(reinterpret_cast<uint64_t>(p->kernarg_address)),
-                         static_cast<uint32_t>(reinterpret_cast<uint64_t>(p->kernarg_address) >> 32)};
-    setsh(kRegUserD0, udata, 2);
+    setsh(kRegTmpring, needsScratch ? &queueTmpring : &zero, 1);
+
+    // G2: user SGPRs in kernel_code_properties enable-bit order.
+    uint32_t udata[8] = {0};
+    uint32_t u = 0;
+    if (props & KCP_PRIVATE_SEGMENT_BUFFER) {
+      for (int w = 0; w < 4; ++w) udata[u + w] = aq->scratch_resource_descriptor[w];
+      u += 4;
+    }
+    if (props & KCP_QUEUE_PTR) {
+      const uint64_t q = reinterpret_cast<uint64_t>(gpu_queue_);
+      udata[u + 0] = static_cast<uint32_t>(q);
+      udata[u + 1] = static_cast<uint32_t>(q >> 32);
+      u += 2;
+    }
+    if (props & KCP_KERNARG_SEGMENT_PTR) {
+      const uint64_t ka = reinterpret_cast<uint64_t>(p->kernarg_address);
+      udata[u + 0] = static_cast<uint32_t>(ka);
+      udata[u + 1] = static_cast<uint32_t>(ka >> 32);
+      u += 2;
+    }
+    if (u > 0) setsh(kRegUserD0, udata, u);
+
     // DISPATCH_DIRECT: USE_THREAD_DIMS -> dim_x is total work-items (AQL grid_size).
     ib.push_back(pm4Hdr(kOpDispatchDirect, 5));
     ib.push_back(p->grid_size_x);
     ib.push_back(p->grid_size_y ? p->grid_size_y : 1);
     ib.push_back(p->grid_size_z ? p->grid_size_z : 1);
-    ib.push_back(kDispatchInit);
+    ib.push_back(dispatchInit);
     // In-place PWS fence (overlap the AGENT cache flush with the next dispatch).
     partialFlush();
     releaseMemPws(kGcrAgent);
@@ -1902,28 +2041,34 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
   // Final full-L2 writeback so the graph's results are system-visible (matches the
   // SYSTEM-scope release the normal AQL batch forces on its last packet).
   partialFlush();
-  acquireFull(kGcrFull);
+  acquireFull(arch.gcrFull);
 
   void* dev = allocExecIbFromData(ib.data(), static_cast<uint32_t>(ib.size()));
   if (dev == nullptr) return out;
   out.ib = dev;
   out.dw = static_cast<uint32_t>(ib.size());
-  out.supported = true;
+  out.status = kPm4Ready;
   ClPrint(amd::LOG_INFO, amd::LOG_AQL,
-          "PM4 graph: compiled %zu dispatches -> IB %u dwords @%p", numPackets, out.dw, out.ib);
+          "PM4 graph: compiled %zu dispatches -> IB %u dwords @%p (gfx%u)", numPackets, out.dw,
+          out.ib, isa.versionMajor());
   return out;
 }
 
 bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking,
                                    bool attach_signal) {
   if (numPackets == 0) return false;
-  const void* key = packets[0];
+  const uint64_t key = pm4GraphKey(packets, numPackets);
   auto it = pm4Graphs_.find(key);
   if (it == pm4Graphs_.end()) {
     it = pm4Graphs_.emplace(key, buildPm4GraphIb(packets, numPackets)).first;
   }
   Pm4GraphIb& g = it->second;
-  if (!g.supported) return false;
+  // Deferred scratch: this launch falls back to AQL (which sizes the queue
+  // scratch); rebuild on the next launch now that scratch may be ready.
+  if (g.status == kPm4DeferredScratch) {
+    g = buildPm4GraphIb(packets, numPackets);
+  }
+  if (g.status != kPm4Ready) return false;
 
   bool attachSignal = timestamp_ != nullptr || attach_signal;
   hsa_signal_t sig = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);
@@ -2163,6 +2308,18 @@ VirtualGPU::VirtualGPU(Device& device, bool profiling, bool cooperative,
 
 // ================================================================================================
 VirtualGPU::~VirtualGPU() {
+  // Free the executable PM4 IBs (PWS fence + compiled graphs).
+  for (auto& kv : pm4Graphs_) {
+    if (kv.second.ib != nullptr) {
+      Hsa::memory_pool_free(kv.second.ib);
+    }
+  }
+  pm4Graphs_.clear();
+  if (pwsIbBuf_ != nullptr) {
+    Hsa::memory_pool_free(pwsIbBuf_);
+    pwsIbBuf_ = nullptr;
+  }
+
   delete blitMgr_;
 
   if (tracking_created_) {
