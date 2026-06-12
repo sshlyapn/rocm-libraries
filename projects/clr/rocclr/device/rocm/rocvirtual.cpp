@@ -1922,6 +1922,18 @@ bool VirtualGPU::pm4GraphBuildAfterEnabled() {
   return pm4GraphBuildAfterState_ == 1;
 }
 
+// GraphExec-owned shared IB: a queue-INDEPENDENT graph (no scratch, no queue_ptr)
+// compiles to one device-scoped IB built once at instantiate and referenced by every
+// stream that replays it (no per-stream specialize/upload, one VRAM copy). Default
+// on; HIP_PM4_GRAPH_SHARED_IB=0 disables (each stream specializes its own IB).
+bool VirtualGPU::pm4GraphSharedIbEnabled() {
+  if (pm4GraphSharedIbState_ < 0) {
+    const char* e = getenv("HIP_PM4_GRAPH_SHARED_IB");
+    pm4GraphSharedIbState_ = (e != nullptr && e[0] == '0') ? 0 : 1;
+  }
+  return pm4GraphSharedIbState_ == 1;
+}
+
 // Reserve the executable IB arena once. The single allocation pays the one-time
 // executable-pool first-touch cost here (at init / first PM4 use) instead of on
 // the first replay. Idempotent.
@@ -2019,6 +2031,12 @@ void VirtualGPU::freePm4GraphIb(Pm4GraphIb& g) {
   if (g.ib == nullptr) {
     return;
   }
+  // Non-owning entry: only a reference to a GraphExec-owned shared IB. Drop the
+  // reference; the GraphExec frees the storage in freePm4GraphTemplate.
+  if (!g.owned) {
+    g.ib = nullptr;
+    return;
+  }
   if (pm4ArenaOwns(g.ib)) {
     size_t bytes = (static_cast<size_t>(g.dw) * 4 + 0xFFF) & ~static_cast<size_t>(0xFFF);
     pm4ArenaFreeBytes(g.ib, bytes);
@@ -2079,12 +2097,13 @@ void VirtualGPU::evictPm4GraphsIfNeeded(const Pm4GraphIb* protect) {
   }
 }
 
-void* VirtualGPU::allocExecIbFromData(const uint32_t* data, uint32_t dw) {
+void* VirtualGPU::allocExecIbFromData(const uint32_t* data, uint32_t dw, bool deviceScoped) {
   size_t bytes = (static_cast<size_t>(dw) * 4 + 0xFFF) & ~static_cast<size_t>(0xFFF);
   hsa_agent_t gpu = roc_device_.getBackendDevice();
   // Prefer a slice from the pre-reserved arena (already GPU-accessible); fall back
   // to a direct executable-pool allocation if the arena is off / full / too small.
-  void* dev = pm4ArenaAlloc(bytes);
+  // deviceScoped skips the per-vdev arena so the IB outlives any single stream.
+  void* dev = deviceScoped ? nullptr : pm4ArenaAlloc(bytes);
   if (dev == nullptr) {
     if (Hsa::memory_pool_allocate(roc_device_.getGpuvmSegment(), bytes,
                                   HSA_AMD_MEMORY_POOL_EXECUTABLE_FLAG, &dev) != HSA_STATUS_SUCCESS) {
@@ -2446,7 +2465,8 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
 // queue, then alloc + DMA-upload the IB. No CPU re-encode. Returns kPm4DeferredScratch
 // when the graph needs scratch the queue has not sized yet (replay via AQL once,
 // which sizes it, then a later specialize succeeds).
-VirtualGPU::Pm4GraphIb VirtualGPU::specializeFromTemplate(const Pm4GraphTemplate& t) {
+VirtualGPU::Pm4GraphIb VirtualGPU::specializeFromTemplate(const Pm4GraphTemplate& t,
+                                                          bool deviceScoped) {
   Pm4GraphIb out;
   out.status = kPm4UnsupportedPermanent;
   if (t.status != kPm4Ready) { out.status = t.status; return out; }
@@ -2483,7 +2503,7 @@ VirtualGPU::Pm4GraphIb VirtualGPU::specializeFromTemplate(const Pm4GraphTemplate
     ib[ph.offset] = v;
   }
 
-  void* dev = allocExecIbFromData(ib.data(), static_cast<uint32_t>(ib.size()));
+  void* dev = allocExecIbFromData(ib.data(), static_cast<uint32_t>(ib.size()), deviceScoped);
   if (dev == nullptr) return out;
   out.ib = dev;
   out.dw = static_cast<uint32_t>(ib.size());
@@ -2546,11 +2566,35 @@ void* VirtualGPU::buildPm4GraphTemplate(void* const* packets, size_t numPackets)
             "[pm4-timing] capture-time encode %zu dispatches -> %zu dw: encode=%.1f us",
             numPackets, t->dwords.size(), (amd::Os::timeNanos() - t0) / 1000.0);
   }
+  // GraphExec-owned shared IB: a queue-independent graph (no placeholders) builds its
+  // device-scoped IB ONCE here, at instantiate, so every stream that replays it just
+  // references this single copy (no per-stream specialize/upload). Queue-dependent
+  // graphs (scratch / queue_ptr) keep per-stream IBs -- they encode per-queue values.
+  if (t->shareable() && pm4GraphSharedIbEnabled()) {
+    Pm4GraphIb shared = specializeFromTemplate(*t, /*deviceScoped=*/true);
+    if (shared.status == kPm4Ready) {
+      t->sharedIb = shared.ib;
+      t->sharedDw = shared.dw;
+      ClPrint(amd::LOG_INFO, amd::LOG_AQL,
+              "PM4 graph: shared IB %u dwords @%p (device-scoped, %zu dispatches)", t->sharedDw,
+              t->sharedIb, numPackets);
+    }
+  }
   return t;
 }
 
 void VirtualGPU::freePm4GraphTemplate(void* tmpl) {
-  delete static_cast<Pm4GraphTemplate*>(tmpl);
+  auto* t = static_cast<Pm4GraphTemplate*>(tmpl);
+  if (t == nullptr) {
+    return;
+  }
+  // The shared IB is device-scoped (allocated from the device pool, not the per-vdev
+  // arena), so it is released directly here regardless of which vdev built it.
+  if (t->sharedIb != nullptr) {
+    Hsa::memory_pool_free(t->sharedIb);
+    t->sharedIb = nullptr;
+  }
+  delete t;
 }
 
 bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking,
@@ -2575,6 +2619,28 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
     }
   }
 
+  // GraphExec-owned shared IB fast path (#5): a queue-independent graph already has
+  // its device-scoped IB built (at instantiate, shared across every stream). This
+  // stream just submits it -- no per-stream specialize/upload, no entry in the
+  // content-key cache (the shared IB's lifetime is the GraphExec, not this vdev, so
+  // it is never inserted into pm4Graphs_ where it could outlive its owner). The key
+  // match guards against a mutated/stale template; the O(N) hash is paid only when
+  // the keycache misses (first launch + after a mutation), then armed for O(1) reuse.
+  if (tmpl != nullptr && tmpl->sharedIb != nullptr && pm4GraphSharedIbEnabled() &&
+      tmpl->key == pm4GraphKey(packets, numPackets)) {
+    pm4SharedRef_.ib = tmpl->sharedIb;
+    pm4SharedRef_.dw = tmpl->sharedDw;
+    pm4SharedRef_.status = kPm4Ready;
+    pm4SharedRef_.owned = false;  // referenced only; the GraphExec frees the storage
+    if (keyCache && recordedPacketVersion != 0) {
+      pm4IbCacheValid_ = true;
+      pm4IbCacheVersion_ = recordedPacketVersion;
+      pm4IbCacheEntry_ = &pm4SharedRef_;
+    }
+    submitPm4Ib(pm4SharedRef_, blocking, attach_signal);
+    return true;
+  }
+
   Pm4GraphIb* g = findOrBuildPm4Graph(packets, numPackets, recordedPacketVersion, allowBuild, tmpl);
   if (g == nullptr) {
     return false;  // cache miss with allowBuild=false, or unsupported/deferred build
@@ -2597,6 +2663,10 @@ VirtualGPU::Pm4GraphIb* VirtualGPU::findOrBuildPm4Graph(void* const* packets, si
   // Only use the template if it was encoded from THESE exact packets: a stale
   // template (graph mutated after instantiate -> different bytes) or a disabled-
   // node filtered subset has a different key and must fall back to a full build.
+  // Per-stream path: specialize a per-stream IB from the template (queue-dependent
+  // graphs: scratch / queue_ptr), or full-build when there is no template. The
+  // GraphExec-owned SHARED IB (queue-independent graphs) is handled earlier in
+  // tryReplayPm4Graph and never reaches here.
   const bool useTmpl = (tmpl != nullptr) && (tmpl->status == kPm4Ready) && (tmpl->key == key);
   auto it = pm4Graphs_.find(key);
   if (it == pm4Graphs_.end()) {
