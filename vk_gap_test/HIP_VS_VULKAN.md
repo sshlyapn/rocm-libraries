@@ -3426,3 +3426,72 @@ DOES IT HELP TPOT? Honestly measured both with and without the per-token sync:
   O(1) host issue regardless of graph size, and (b) lower time-to-first-kernel -- which
   would only matter for workloads with very small per-token GPU time or very large N.
   It is correct, reliable, and free to leave OFF for decode. Kept opt-in.
+
+RE-MEASURED host issue with the TOKEN-driven cache (replacing the heuristic; identical
+behavior, confirming the rewrite did not regress the fast path), gfx1100 M=256 R=8000:
+  N=1   2.595 us | N=64  3.576 us | N=256 2.521 us | N=512 2.493 us   (avg)
+  => still flat ~2.5 us; the small N=64 bump is run noise (min was 1.99 us).
+
+DEFAULT POLICY: kept OFF. Rationale: zero measured TPOT benefit for decode, and
+flipping a runtime default to ON is a correctness bet on the COMPLETENESS of the
+mutation-site list (the three bump sites). The mechanism is reliable for those sites;
+leaving it opt-in keeps the always-rehash path as the conservative default and makes
+the flat-host-issue / TTFT property available to anyone who wants it via
+HIP_PM4_GRAPH_KEYCACHE=1.
+
+### D.18-impl Code changes, file by file (what + why)
+
+The change adds a RELIABLE "did the recorded packets change?" signal and threads it
+to the rocm PM4 key cache. Two halves: (A) the signal in the HIP graph layer, (B) the
+consumer + plumbing in the rocm backend.
+
+(A) HIP graph layer -- hip_graph_internal.hpp / .cpp (the SIGNAL):
+  1. #include <atomic> -- for the unique-id generator.
+  2. GraphExec gains two members:
+       uint64_t pm4ReplayId_ = NextPm4ReplayId();  // unique per instantiation
+       uint64_t pm4Epoch_ = 0;                       // bumped on any packet change
+     pm4ReplayId_ uses an in-class initializer calling a static atomic counter, so
+     EVERY GraphExec constructor (including ChildGraphNode's) gets a fresh, globally
+     unique id -- this is what makes ABA impossible (a freed+reallocated GraphExec can
+     never collide with a live one's token).
+  3. Two small methods:
+       Pm4ReplayToken(batchIndex) = fold(pm4ReplayId_, pm4Epoch_, batchIndex), nonzero.
+         Folds the batch index so each batch in a multi-batch graph gets a distinct
+         token (a single-slot last-token cache would otherwise thrash across batches).
+       BumpPm4Epoch() = ++pm4Epoch_.
+  4. BumpPm4Epoch() is called at the THREE -- and only three -- places that change the
+     set of packets that will be dispatched:
+       - CaptureAndFormPacketsForGraph(): (re)builds packetBatches_ at instantiate /
+         re-capture.
+       - UpdateAQLPacket(node): rewrites a node's recorded AQL packet on a param update
+         (hipGraphExecKernelNodeSetParams / hipGraphExecUpdate).
+       - UpdatePacketBatchesForNodeEnableDisable(node, enabled): changes which packets
+         are dispatched when a node is enabled/disabled.
+     NOTE on what is deliberately NOT bumped: changing kernarg CONTENTS behind a stable
+     pointer (the normal decode pattern) does NOT change the packets and correctly does
+     NOT bump the epoch -- the IB references the kernarg by pointer and reads fresh data
+     at replay. This is exactly why the cache is safe to reuse across decode tokens.
+  5. The two single-list dispatch call sites pass Pm4ReplayToken(batchIndex); the
+     multi-device linear path is left at the default 0 (see D.18 Q1: PM4 does not
+     target multi-GPU graphs, so 0 = always-slow-path is correct there).
+
+(B) rocm backend -- device.hpp / palvirtual.hpp / rocvirtual.hpp / rocvirtual.cpp:
+  6. dispatchAqlPacketBatch gains an optional trailing "uint64_t graphReplayToken = 0"
+     on the device virtual (device.hpp), the pal override (ignores it), and the rocm
+     override; rocm passes it into dispatchGenericAqlPacketBatch, which passes it into
+     tryReplayPm4Graph. The default 0 keeps every non-graph caller on the slow path.
+  7. pm4GraphKeyCacheEnabled() -- new env gate HIP_PM4_GRAPH_KEYCACHE (default off).
+  8. Per-VirtualGPU fast-path state: {bool pm4KeyCacheValid_, uint64_t pm4KeyCacheToken_,
+     Pm4GraphIb* pm4KeyCacheIb_}. The cached pointer is into the node-based
+     pm4Graphs_ unordered_map, whose element pointers stay valid across inserts.
+  9. tryReplayPm4Graph: if keycache on and token != 0 and token == pm4KeyCacheToken_ and
+     the cached IB is still kPm4Ready, submit it directly (build vendor packet, ring
+     write, doorbell) -- skipping BOTH pm4GraphKey (the O(N) hash) and the map find.
+     Otherwise take the slow path (hash, find/build) and, if the result is a ready IB
+     and token != 0, arm {token, &entry} for next time. The earlier heuristic identity
+     (first/last packet pointers + content fold) was removed entirely.
+
+WHY a token instead of re-hashing or a pointer: re-hashing is the O(N) cost we are
+removing; a raw pointer identity is unsafe (ABA + interior in-place updates). The
+token is both cheap (O(1) to compare) and exact (changes on every mutation, unique per
+instantiation), so it is the only option that is simultaneously fast AND correct.
