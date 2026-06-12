@@ -1811,6 +1811,47 @@ bool VirtualGPU::pm4GraphScratchEnabled() {
   return pm4GraphScratchState_ == 1;
 }
 
+// Register delta-encoding: emit a SET_SH_REG only for the minimal contiguous
+// sub-range whose value changed vs the previous dispatch in the same IB. SH
+// registers are sticky and the drain/PWS packets do not touch them, so skipping
+// an unchanged write leaves the latched state at the consuming DISPATCH
+// bit-identical to the always-emit path. Opt-in; default off keeps the IB
+// byte-identical to the baseline emitter. See HIP_VS_VULKAN.md Appendix D-impl.
+bool VirtualGPU::pm4GraphDeltaEnabled() {
+  if (pm4GraphDeltaState_ < 0) {
+    pm4GraphDeltaState_ = (getenv("HIP_PM4_GRAPH_DELTA") != nullptr) ? 1 : 0;
+  }
+  return pm4GraphDeltaState_ == 1;
+}
+
+// IB-reorder: emit kernel N+1's register programming BETWEEN N's RELEASE_MEM and
+// ACQUIRE_MEM, so the CP programs the next kernel while N's waves drain and the
+// AGENT cache flush is in flight (CP otherwise idle). The drain stays first and
+// the acquire stays before the consuming DISPATCH, so coherence is unchanged.
+//
+// WARNING: this lever does NOT improve performance on measured RDNA3 (gfx1100)
+// hardware -- it is a validated NULL RESULT, kept only for experimentation. The
+// CP micro-engine (ME) is a single in-order processor that handles BOTH the
+// SET_SH_REG writes AND the ACQUIRE_MEM wait, so moving the register burst ahead
+// of the acquire merely reorders serial ME work; there is no second engine to run
+// it concurrently with the PWS wait. Across kernel sizes the inter-kernel gap was
+// unchanged within noise (HIP_VS_VULKAN.md Appendix D-impl D.13). Use
+// HIP_PM4_GRAPH_DELTA instead, which REDUCES the ME work and is a real win. This
+// path is correct (bit-exact) and harmless, but pointless on this hardware.
+bool VirtualGPU::pm4GraphReorderEnabled() {
+  if (pm4GraphReorderState_ < 0) {
+    pm4GraphReorderState_ = (getenv("HIP_PM4_GRAPH_REORDER") != nullptr) ? 1 : 0;
+    if (pm4GraphReorderState_ == 1) {
+      ClPrint(amd::LOG_WARNING, amd::LOG_AQL,
+              "HIP_PM4_GRAPH_REORDER is enabled but is a NO-OP for performance on "
+              "RDNA3 (CP micro-engine is in-order: register programming cannot "
+              "overlap the PWS wait). It is bit-exact and harmless. Use "
+              "HIP_PM4_GRAPH_DELTA instead, which actually reduces the gap.");
+    }
+  }
+  return pm4GraphReorderState_ == 1;
+}
+
 // Content hash over the fields that define the compiled IB, so a destroyed and
 // reallocated graph that happens to reuse the same host packet address does not
 // replay a stale IB (the old packet[0]-pointer key could alias). FNV-1a.
@@ -1929,23 +1970,51 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
     ib.push_back(gcr);          // GCR_CNTL
   };
 
-  // G6: leading full acquire so the first kernel sees writes from prior ops
-  // (H2D copy, a previous graph) -- the normal AQL batch carries this on the
-  // first packet's acquire scope; the self-contained microbench hid the need.
-  acquireFull(arch.gcrFull);
+  // Register delta-encoding (HIP_PM4_GRAPH_DELTA). SH registers are sticky and the
+  // drain/PWS packets do not touch them, so a SET_SH_REG whose value already
+  // matches what is latched can be skipped: the state at the consuming DISPATCH
+  // is identical to the always-emit path. We keep a per-group shadow of the last
+  // value emitted in THIS IB and emit only the minimal contiguous changed
+  // sub-range. The shadow starts invalid, so dispatch 0 emits every group (state
+  // is re-established on every replay regardless of pre-IB register contents).
+  // 'sig' guards layout-sensitive groups (USER_DATA): a different enabled-SGPR
+  // set means the same offset holds a different register, so we force a full
+  // re-emit. Plain ASCII only.
+  const bool delta = pm4GraphDeltaEnabled();
+  const bool reorder = pm4GraphReorderEnabled();
+  struct ShadowReg { bool valid = false; uint32_t cnt = 0; uint32_t sig = 0; uint32_t v[8] = {0}; };
+  ShadowReg shStartX, shPgm, shScratch, shRsrc, shResLim, shTmpring, shUserD;
+  auto setshDelta = [&](ShadowReg& sh, uint32_t reg, const uint32_t* v, uint32_t cnt,
+                        uint32_t sig) {
+    if (!delta || !sh.valid || sh.cnt != cnt || sh.sig != sig) {
+      setsh(reg, v, cnt);
+      sh.valid = true; sh.cnt = cnt; sh.sig = sig;
+      for (uint32_t i = 0; i < cnt; ++i) sh.v[i] = v[i];
+      return;
+    }
+    uint32_t lo = 0;
+    while (lo < cnt && v[lo] == sh.v[lo]) ++lo;
+    if (lo == cnt) return;  // nothing changed -> emit nothing
+    uint32_t hi = cnt;
+    while (hi > lo && v[hi - 1] == sh.v[hi - 1]) --hi;
+    setsh(reg + lo, v + lo, hi - lo);
+    for (uint32_t i = lo; i < hi; ++i) sh.v[i] = v[i];
+  };
 
-  for (size_t i = 0; i < numPackets; ++i) {
-    auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
+  // Emit the SET_SH_REG programming for one dispatch (delta-aware). Returns
+  // kPm4Ready, or a fallback status (kPm4UnsupportedPermanent / kPm4DeferredScratch)
+  // BEFORE emitting anything for this dispatch, so the caller can bail to AQL.
+  auto emitRegs = [&](hsa_kernel_dispatch_packet_t* p) -> int {
     uint8_t type = extractAqlBits(p->header, HSA_PACKET_HEADER_TYPE, HSA_PACKET_HEADER_WIDTH_TYPE);
     if (type != HSA_PACKET_TYPE_KERNEL_DISPATCH) {
-      return out;  // non-dispatch packet -> caller falls back to AQL replay
+      return kPm4UnsupportedPermanent;  // non-dispatch packet -> AQL fallback
     }
-    if (p->kernel_object == 0) return out;
+    if (p->kernel_object == 0) return kPm4UnsupportedPermanent;
     auto* kd = reinterpret_cast<const AmdKernelDescriptor*>(p->kernel_object);
     const uint16_t props = kd->kernel_code_properties;
 
     // Kernarg preload (gfx11/gfx12) changes the entry/SGPR contract; not handled.
-    if (kd->kernarg_preload != 0) return out;
+    if (kd->kernarg_preload != 0) return kPm4UnsupportedPermanent;
 
     // G1: scratch. Wire from the queue scratch state when ready, else defer
     // (replay via AQL once so ROCr sizes scratch, then rebuild next launch).
@@ -1953,9 +2022,9 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
                               (p->private_segment_size != 0) ||
                               (props & (KCP_PRIVATE_SEGMENT_BUFFER | KCP_FLAT_SCRATCH_INIT));
     if (needsScratch) {
-      if (!pm4GraphScratchEnabled()) return out;            // opt-in only
-      if (props & KCP_FLAT_SCRATCH_INIT) return out;        // flat-scratch-init not replicated
-      if (!queueScratchReady) { out.status = kPm4DeferredScratch; return out; }
+      if (!pm4GraphScratchEnabled()) return kPm4UnsupportedPermanent;   // opt-in only
+      if (props & KCP_FLAT_SCRATCH_INIT) return kPm4UnsupportedPermanent;  // not replicated
+      if (!queueScratchReady) return kPm4DeferredScratch;
     }
 
     // Only user SGPRs we can source correctly: private_segment_buffer (scratch
@@ -1966,24 +2035,20 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
     constexpr uint16_t kUserSgprMask =
         KCP_PRIVATE_SEGMENT_BUFFER | KCP_DISPATCH_PTR | KCP_QUEUE_PTR | KCP_KERNARG_SEGMENT_PTR |
         KCP_DISPATCH_ID | KCP_FLAT_SCRATCH_INIT | KCP_PRIVATE_SEGMENT_SIZE;
-    if ((props & kUserSgprMask) & ~kSupportedUserSgpr) return out;
-
-    // G3: wave size from WAVEFRONT_SIZE32; gate CS_W32_EN accordingly.
-    const bool wave32 = (props & KCP_WAVEFRONT_SIZE32) != 0;
-    const uint32_t dispatchInit = kDispatchBase | (wave32 ? kDispatchW32 : 0u);
+    if ((props & kUserSgprMask) & ~kSupportedUserSgpr) return kPm4UnsupportedPermanent;
 
     const uint32_t dims[8] = {0, 0, 0, p->workgroup_size_x, p->workgroup_size_y,
                               p->workgroup_size_z, 0, 0};
-    setsh(kRegStartX, dims, 8);
+    setshDelta(shStartX, kRegStartX, dims, 8, 0);
     uint64_t entry = (p->kernel_object + kd->kernel_code_entry_byte_offset) >> 8;
     const uint32_t pgm[2] = {static_cast<uint32_t>(entry), static_cast<uint32_t>(entry >> 32)};
-    setsh(kRegPgmLo, pgm, 2);
+    setshDelta(shPgm, kRegPgmLo, pgm, 2, 0);
 
     // Scratch base + TMPRING (only when scratch needed; copied from the queue).
     if (needsScratch) {
       const uint64_t sbase = queueScratchBase >> 8;
       const uint32_t scratch[2] = {static_cast<uint32_t>(sbase), static_cast<uint32_t>(sbase >> 32)};
-      setsh(kRegScratchLo, scratch, 2);
+      setshDelta(shScratch, kRegScratchLo, scratch, 2, 0);
     }
 
     // RSRC1 verbatim from the KD (exactly what the CP loads). RSRC2 too, EXCEPT
@@ -2001,12 +2066,16 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
         (groupSeg + kLdsEncodeGranuleBytes - 1) / kLdsEncodeGranuleBytes, 0x1FFu);
     uint32_t rsrc2 = (kd->compute_pgm_rsrc2 & ~kLdsSizeMask) | ((ldsUnits << 15) & kLdsSizeMask);
     const uint32_t rsrc[2] = {kd->compute_pgm_rsrc1, rsrc2};
-    setsh(kRegRsrc1, rsrc, 2);
+    setshDelta(shRsrc, kRegRsrc1, rsrc, 2, 0);
     const uint32_t zero = 0;
-    setsh(kRegResLim, &zero, 1);
-    setsh(kRegTmpring, needsScratch ? &queueTmpring : &zero, 1);
+    setshDelta(shResLim, kRegResLim, &zero, 1, 0);
+    const uint32_t tmpring = needsScratch ? queueTmpring : 0u;
+    setshDelta(shTmpring, kRegTmpring, &tmpring, 1, 0);
 
-    // G2: user SGPRs in kernel_code_properties enable-bit order.
+    // G2: user SGPRs in kernel_code_properties enable-bit order. The enabled set
+    // is the layout signature; a change forces a full re-emit (same offset would
+    // otherwise alias a different register). Within a stable layout only the
+    // changed sub-range (typically the kernarg pointer) is re-sent.
     uint32_t udata[8] = {0};
     uint32_t u = 0;
     if (props & KCP_PRIVATE_SEGMENT_BUFFER) {
@@ -2025,18 +2094,67 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
       udata[u + 1] = static_cast<uint32_t>(ka >> 32);
       u += 2;
     }
-    if (u > 0) setsh(kRegUserD0, udata, u);
+    if (u > 0) setshDelta(shUserD, kRegUserD0, udata, u, props & kSupportedUserSgpr);
+    return kPm4Ready;
+  };
 
+  // Emit the DISPATCH_DIRECT packet that launches the kernel. Kept separate from
+  // emitRegs so the reorder path can place the register programming BEFORE the
+  // acquire while the launch stays AFTER it (coherence preserved).
+  auto emitDispatchPacket = [&](hsa_kernel_dispatch_packet_t* p) {
+    auto* kd = reinterpret_cast<const AmdKernelDescriptor*>(p->kernel_object);
+    const bool wave32 = (kd->kernel_code_properties & KCP_WAVEFRONT_SIZE32) != 0;
+    const uint32_t dispatchInit = kDispatchBase | (wave32 ? kDispatchW32 : 0u);
     // DISPATCH_DIRECT: USE_THREAD_DIMS -> dim_x is total work-items (AQL grid_size).
     ib.push_back(pm4Hdr(kOpDispatchDirect, 5));
     ib.push_back(p->grid_size_x);
     ib.push_back(p->grid_size_y ? p->grid_size_y : 1);
     ib.push_back(p->grid_size_z ? p->grid_size_z : 1);
     ib.push_back(dispatchInit);
-    // In-place PWS fence (overlap the AGENT cache flush with the next dispatch).
-    partialFlush();
-    releaseMemPws(kGcrAgent);
-    acquirePws();
+  };
+
+  // G6: leading full acquire so the first kernel sees writes from prior ops
+  // (H2D copy, a previous graph) -- the normal AQL batch carries this on the
+  // first packet's acquire scope; the self-contained microbench hid the need.
+  acquireFull(arch.gcrFull);
+
+  if (!reorder) {
+    // Baseline order (byte-identical to the pre-delta emitter when delta is off):
+    // [regs i][dispatch i][drain][release][acquire] per dispatch.
+    for (size_t i = 0; i < numPackets; ++i) {
+      auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
+      int st = emitRegs(p);
+      if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return out; }
+      emitDispatchPacket(p);
+      // In-place PWS fence (overlap the AGENT cache flush with the next dispatch).
+      partialFlush();
+      releaseMemPws(kGcrAgent);
+      acquirePws();
+    }
+  } else {
+    // Reorder: program kernel i's registers BETWEEN the drain/release of kernel
+    // i-1 and its acquire, so the CP front-end overlaps i-1's wave drain and the
+    // in-flight AGENT cache flush. The drain stays first (i-1 retired -> its
+    // registers are reusable) and the acquire stays before dispatch i (kernel i
+    // observes coherent memory). The trailing AGENT fence after the last dispatch
+    // is subsumed by the final full-L2 acquire, so it is naturally elided.
+    //
+    // WARNING: measured NO-OP for performance on RDNA3 (the CP ME is in-order, so
+    // this overlap does not exist in practice). Kept for experimentation only;
+    // prefer HIP_PM4_GRAPH_DELTA. See pm4GraphReorderEnabled() and D.13.
+    auto* p0 = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[0]);
+    int st = emitRegs(p0);
+    if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return out; }
+    emitDispatchPacket(p0);
+    for (size_t i = 1; i < numPackets; ++i) {
+      partialFlush();              // drain kernel i-1 (its waves retire)
+      releaseMemPws(kGcrAgent);    // async AGENT flush of kernel i-1 (PWS armed)
+      auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
+      st = emitRegs(p);            // program kernel i during the flush / drain
+      if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return out; }
+      acquirePws();                // wait kernel i-1's flush counter
+      emitDispatchPacket(p);       // launch kernel i (coherent + registers latched)
+    }
   }
   // Final full-L2 writeback so the graph's results are system-visible (matches the
   // SYSTEM-scope release the normal AQL batch forces on its last packet).

@@ -515,8 +515,12 @@ class VirtualGPU : public device::VirtualDevice {
   std::unordered_map<uint64_t, Pm4GraphIb> pm4Graphs_;  //!< compiled IB cache, keyed by content hash
   int pm4GraphState_ = -1;          //!< HIP_PM4_GRAPH env gate: -1 unknown, 0 off, 1 on
   int pm4GraphScratchState_ = -1;   //!< HIP_PM4_GRAPH_SCRATCH env gate (scratch kernels)
+  int pm4GraphDeltaState_ = -1;     //!< HIP_PM4_GRAPH_DELTA env gate (register delta-encode)
+  int pm4GraphReorderState_ = -1;   //!< HIP_PM4_GRAPH_REORDER env gate (front-end reorder)
   bool pm4GraphActive();
   bool pm4GraphScratchEnabled();
+  bool pm4GraphDeltaEnabled();      //!< skip SET_SH_REG writes whose value is unchanged
+  bool pm4GraphReorderEnabled();    //!< hoist next kernel's regs between release and acquire
   void* allocExecIbFromData(const uint32_t* data, uint32_t dw);  //!< stage data into an executable IB
   static uint64_t pm4GraphKey(void* const* packets, size_t numPackets);  //!< content hash
   Pm4GraphIb buildPm4GraphIb(void* const* packets, size_t numPackets);
