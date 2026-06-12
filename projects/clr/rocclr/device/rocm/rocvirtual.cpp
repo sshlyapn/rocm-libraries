@@ -1259,7 +1259,7 @@ template <typename AqlPacket>
 bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& packets,
                                                bool blocking, bool attach_signal,
                                                const std::vector<std::string>* kernelNames,
-                                               uint64_t graphReplayToken) {
+                                               uint64_t recordedPacketVersion) {
   if (packets.empty()) {
     return false;
   }
@@ -1270,7 +1270,7 @@ bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& pa
   // unsupported (non-dispatch, scratch, or non-trivial kernarg ABI).
   if (pm4GraphActive() && kernelNames != nullptr) {
     if (tryReplayPm4Graph(reinterpret_cast<void* const*>(packets.data()), packets.size(), blocking,
-                          attach_signal, graphReplayToken)) {
+                          attach_signal, recordedPacketVersion)) {
       return true;
     }
   }
@@ -1477,7 +1477,7 @@ bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& pa
 bool VirtualGPU::dispatchAqlPacketBatch(const std::vector<uint8_t*>& packets,
                                         const std::vector<std::string>& kernelNames,
                                         amd::AccumulateCommand* vcmd,
-                                        uint64_t graphReplayToken) {
+                                        uint64_t recordedPacketVersion) {
   if (vcmd == nullptr || packets.empty() || packets.size() != kernelNames.size()) {
     return false;
   }
@@ -1495,7 +1495,7 @@ bool VirtualGPU::dispatchAqlPacketBatch(const std::vector<uint8_t*>& packets,
   const auto& aqlPackets =
       reinterpret_cast<const std::vector<hsa_kernel_dispatch_packet_t*>&>(packets);
   bool result = dispatchGenericAqlPacketBatch(aqlPackets, false, false, &kernelNames,
-                                              graphReplayToken);
+                                              recordedPacketVersion);
 
   profilingEnd();
 
@@ -1855,21 +1855,25 @@ bool VirtualGPU::pm4GraphReorderEnabled() {
   return pm4GraphReorderState_ == 1;
 }
 
-// Last-lookup key cache (HIP_PM4_GRAPH_KEYCACHE): the per-launch pm4GraphKey hash
+// Last-lookup IB cache (HIP_PM4_GRAPH_KEYCACHE): the per-launch pm4GraphKey hash
 // is O(N) over every packet, and in the steady-state decode loop the SAME packet
 // array is replayed every token (nothing the hash covers changes -- only kernarg
 // CONTENTS change, which the hash ignores). So the hash returns the same key every
 // launch: pure overhead that also sits BEFORE the submit doorbell, delaying GPU
-// start. This fast path remembers the last (count, first/last packet pointers,
-// folded first/last content) and, on an exact match, reuses the cached IB pointer
-// without rehashing -> O(1) host issue, GPU starts sooner. Opt-in; default keeps
-// the always-rehash path. LIMITATION: an in-place param update (e.g.
-// hipGraphExecKernelNodeSetParams) to a STRICTLY-INTERIOR node that changes
-// neither endpoint would be missed; safe for replay-only and endpoint-touching
-// updates, which covers the decode workloads.
+// start. This fast path keys the cached IB by the graph-supplied recorded packet
+// set version (see GraphExec::RecordedPacketVersion) and, on a version match,
+// reuses the cached IB pointer without rehashing -> O(1) host issue, GPU starts
+// sooner. The version is bumped on EVERY recorded-packet mutation site (initial
+// capture, per-node param update, node enable/disable -- all routed through
+// CaptureAndFormPacketsForGraph / UpdateAQLPacket / UpdatePacketBatchesForNodeEnable
+// Disable), so invalidation is RELIABLE and EXACT, not a heuristic: there is no
+// interior-node blind spot. Default ON because it is correct for any caller that
+// supplies a version; set HIP_PM4_GRAPH_KEYCACHE=0 to force the always-rehash path.
+// version 0 (non-graph caller) always takes the slow rehash path regardless.
 bool VirtualGPU::pm4GraphKeyCacheEnabled() {
   if (pm4GraphKeyCacheState_ < 0) {
-    pm4GraphKeyCacheState_ = (getenv("HIP_PM4_GRAPH_KEYCACHE") != nullptr) ? 1 : 0;
+    const char* env = getenv("HIP_PM4_GRAPH_KEYCACHE");
+    pm4GraphKeyCacheState_ = (env != nullptr && env[0] == '0') ? 0 : 1;
   }
   return pm4GraphKeyCacheState_ == 1;
 }
@@ -1897,6 +1901,34 @@ uint64_t VirtualGPU::pm4GraphKey(void* const* packets, size_t numPackets) {
     mix(static_cast<uint64_t>(p->workgroup_size_y) | (static_cast<uint64_t>(p->workgroup_size_z) << 32));
   }
   return h;
+}
+
+void VirtualGPU::evictPm4GraphsIfNeeded(const Pm4GraphIb* protect) {
+  // Free oldest-inserted entries until under the cap. Skip the armed entry (its
+  // pointer is cached for the fast path) and the entry just built this launch.
+  // The guard counter bounds the loop: each iteration either erases one entry
+  // (size shrinks) or re-queues a protected key (no progress on size but finite).
+  size_t guard = pm4GraphKeyOrder_.size();
+  while (pm4Graphs_.size() > kPm4MaxCachedIbs && guard-- > 0) {
+    uint64_t k = pm4GraphKeyOrder_.front();
+    pm4GraphKeyOrder_.pop_front();
+    auto it = pm4Graphs_.find(k);
+    if (it == pm4Graphs_.end()) {
+      continue;  // stale key (entry already erased) -- drop it
+    }
+    Pm4GraphIb* e = &it->second;
+    if (e == protect || e == pm4IbCacheEntry_) {
+      pm4GraphKeyOrder_.push_back(k);  // never free a live/armed IB; try the next
+      continue;
+    }
+    if (e->ib != nullptr) {
+      Hsa::memory_pool_free(e->ib);
+    }
+    pm4Graphs_.erase(it);
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[pm4-evict] freed stale IB; cache size now %zu (cap %zu)",
+            pm4Graphs_.size(), kPm4MaxCachedIbs);
+  }
 }
 
 void* VirtualGPU::allocExecIbFromData(const uint32_t* data, uint32_t dw) {
@@ -2229,21 +2261,22 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
 }
 
 bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking,
-                                   bool attach_signal, uint64_t graphReplayToken) {
+                                   bool attach_signal, uint64_t recordedPacketVersion) {
   if (numPackets == 0) return false;
 
   // Fast path: same recorded packet set as the previous launch -> reuse the cached
   // IB pointer without recomputing the O(N) content hash (HIP_PM4_GRAPH_KEYCACHE).
-  // Validated by the graph-supplied replay token: nonzero, unique per GraphExec
-  // instantiation+batch, and bumped on ANY packet mutation (param update,
-  // enable/disable, re-capture). This is a RELIABLE invalidation, not a heuristic.
-  // token 0 (non-graph caller) always takes the slow path. Deferred-scratch entries
-  // are never cached here (status flips), so the fast path only serves kPm4Ready.
+  // Validated by the graph-supplied recorded packet set version: nonzero, unique
+  // per GraphExec instantiation+batch, and bumped on ANY packet mutation (param
+  // update, enable/disable, re-capture). This is a RELIABLE invalidation, not a
+  // heuristic. version 0 (non-graph caller) always takes the slow path. Deferred-
+  // scratch entries are never cached here (status flips), so the fast path only
+  // serves kPm4Ready.
   const bool keyCache = pm4GraphKeyCacheEnabled();
-  if (keyCache && graphReplayToken != 0) {
-    if (pm4KeyCacheValid_ && pm4KeyCacheToken_ == graphReplayToken &&
-        pm4KeyCacheIb_ != nullptr && pm4KeyCacheIb_->status == kPm4Ready) {
-      Pm4GraphIb& gc = *pm4KeyCacheIb_;
+  if (keyCache && recordedPacketVersion != 0) {
+    if (pm4IbCacheValid_ && pm4IbCacheVersion_ == recordedPacketVersion &&
+        pm4IbCacheEntry_ != nullptr && pm4IbCacheEntry_->status == kPm4Ready) {
+      Pm4GraphIb& gc = *pm4IbCacheEntry_;
       bool attachSignalC = timestamp_ != nullptr || attach_signal;
       hsa_signal_t sigC = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignalC);
       PwsVendorPkt pktC;
@@ -2273,21 +2306,30 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
   auto it = pm4Graphs_.find(key);
   if (it == pm4Graphs_.end()) {
     it = pm4Graphs_.emplace(key, buildPm4GraphIb(packets, numPackets)).first;
+    pm4GraphKeyOrder_.push_back(key);
+    // A mutated graph lands here every time its packet content changes, leaving
+    // the previous content's IB unreferenced. Bound the VRAM held by dead IBs.
+    evictPm4GraphsIfNeeded(&it->second);
   }
   Pm4GraphIb& g = it->second;
   // Deferred scratch: this launch falls back to AQL (which sizes the queue
-  // scratch); rebuild on the next launch now that scratch may be ready.
+  // scratch); rebuild on the next launch now that scratch may be ready. Free the
+  // stale IB first so the rebuild does not orphan it in the executable pool.
   if (g.status == kPm4DeferredScratch) {
+    if (g.ib != nullptr) {
+      Hsa::memory_pool_free(g.ib);
+      g.ib = nullptr;
+    }
     g = buildPm4GraphIb(packets, numPackets);
   }
   if (g.status != kPm4Ready) return false;
 
   // Arm the fast path for the next launch (only for ready, non-scratch IBs and a
-  // valid graph token).
-  if (keyCache && graphReplayToken != 0) {
-    pm4KeyCacheValid_ = true;
-    pm4KeyCacheToken_ = graphReplayToken;
-    pm4KeyCacheIb_ = &g;
+  // valid recorded packet set version).
+  if (keyCache && recordedPacketVersion != 0) {
+    pm4IbCacheValid_ = true;
+    pm4IbCacheVersion_ = recordedPacketVersion;
+    pm4IbCacheEntry_ = &g;
   }
 
   bool attachSignal = timestamp_ != nullptr || attach_signal;

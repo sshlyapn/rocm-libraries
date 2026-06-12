@@ -30,6 +30,7 @@
 #include "device/device.hpp"
 #include "os/os.hpp"
 #include <stack>
+#include <deque>
 #include <unordered_map>
 
 namespace amd::roc {
@@ -476,7 +477,7 @@ class VirtualGPU : public device::VirtualDevice {
   bool dispatchAqlPacketBatch(const std::vector<uint8_t*>& packets,
                               const std::vector<std::string>& kernelNames,
                               amd::AccumulateCommand* vcmd = nullptr,
-                              uint64_t graphReplayToken = 0);
+                              uint64_t recordedPacketVersion = 0);
   template <typename AqlPacket> bool dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header,
                                                               uint16_t rest, bool blocking,
                                                               bool attach_signal = false);
@@ -484,7 +485,7 @@ class VirtualGPU : public device::VirtualDevice {
   template <typename AqlPacket> bool dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& packets,
                                                                    bool blocking, bool attach_signal = false,
                                                                    const std::vector<std::string>* kernelNames = nullptr,
-                                                                   uint64_t graphReplayToken = 0);
+                                                                   uint64_t recordedPacketVersion = 0);
 
   bool dispatchCounterAqlPacket(hsa_ext_amd_aql_pm4_packet_t* packet, const uint32_t gfxVersion,
                                 bool blocking, const hsa_ven_amd_aqlprofile_1_00_pfn_t* extApi);
@@ -515,6 +516,14 @@ class VirtualGPU : public device::VirtualDevice {
     Pm4GraphStatus status = kPm4Unbuilt;
   };
   std::unordered_map<uint64_t, Pm4GraphIb> pm4Graphs_;  //!< compiled IB cache, keyed by content hash
+  //! Insertion order of pm4Graphs_ keys, used to bound the VRAM held by compiled
+  //! IBs. A mutated graph re-captures to NEW packet content -> a NEW content hash
+  //! -> a NEW IB, leaving the pre-mutation IB unreferenced. Without a bound these
+  //! dead IBs would accumulate in the executable memory pool until the VirtualGPU
+  //! is destroyed. evictPm4GraphsIfNeeded() frees the oldest entries (never the
+  //! currently-armed one) once the cache exceeds kPm4MaxCachedIbs.
+  std::deque<uint64_t> pm4GraphKeyOrder_;
+  static constexpr size_t kPm4MaxCachedIbs = 16;
   int pm4GraphState_ = -1;          //!< HIP_PM4_GRAPH env gate: -1 unknown, 0 off, 1 on
   int pm4GraphScratchState_ = -1;   //!< HIP_PM4_GRAPH_SCRATCH env gate (scratch kernels)
   int pm4GraphDeltaState_ = -1;     //!< HIP_PM4_GRAPH_DELTA env gate (register delta-encode)
@@ -522,15 +531,15 @@ class VirtualGPU : public device::VirtualDevice {
   int pm4GraphKeyCacheState_ = -1;  //!< HIP_PM4_GRAPH_KEYCACHE env gate (skip per-launch rehash)
   // Last-lookup fast path: when the SAME recorded packet set is replayed back to
   // back (the steady-state decode loop), skip recomputing the O(N) content hash.
-  // Validated by the graph-supplied replay token, which is nonzero, unique per
-  // GraphExec instantiation+batch, and bumped on ANY packet mutation (param
-  // update / enable-disable / re-capture) -- so this is a RELIABLE invalidation,
-  // not a heuristic. token 0 (non-graph caller) always takes the slow path. The
-  // cached pointer is into the node-based pm4Graphs_ map, so it stays valid
-  // across map inserts.
-  bool pm4KeyCacheValid_ = false;
-  uint64_t pm4KeyCacheToken_ = 0;
-  Pm4GraphIb* pm4KeyCacheIb_ = nullptr;
+  // Validated by the graph-supplied recorded packet set version, which is nonzero,
+  // unique per GraphExec instantiation+batch, and bumped on ANY packet mutation
+  // (param update / enable-disable / re-capture) -- so this is a RELIABLE
+  // invalidation, not a heuristic. version 0 (non-graph caller) always takes the
+  // slow path. The cached pointer is into the node-based pm4Graphs_ map, so it
+  // stays valid across map inserts.
+  bool pm4IbCacheValid_ = false;
+  uint64_t pm4IbCacheVersion_ = 0;
+  Pm4GraphIb* pm4IbCacheEntry_ = nullptr;
   bool pm4GraphActive();
   bool pm4GraphScratchEnabled();
   bool pm4GraphDeltaEnabled();      //!< skip SET_SH_REG writes whose value is unchanged
@@ -539,8 +548,12 @@ class VirtualGPU : public device::VirtualDevice {
   void* allocExecIbFromData(const uint32_t* data, uint32_t dw);  //!< stage data into an executable IB
   static uint64_t pm4GraphKey(void* const* packets, size_t numPackets);  //!< content hash
   Pm4GraphIb buildPm4GraphIb(void* const* packets, size_t numPackets);
+  //! Free oldest cached IBs (by insertion order) while pm4Graphs_ exceeds
+  //! kPm4MaxCachedIbs. Never frees the armed entry (pm4IbCacheEntry_) or the
+  //! protected entry just built/selected this launch.
+  void evictPm4GraphsIfNeeded(const Pm4GraphIb* protect);
   bool tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking, bool attach_signal,
-                         uint64_t graphReplayToken);
+                         uint64_t recordedPacketVersion);
   void dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveDepSignal = false,
                                   hsa_signal_t signal = hsa_signal_t{0},
                                   hsa_signal_value_t value = 0, hsa_signal_value_t mask = 0,
