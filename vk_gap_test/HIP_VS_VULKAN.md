@@ -3724,3 +3724,77 @@ so the host call is still build-bound. The right metric is the end-to-end first 
 
 STATUS: both opt-in (default off) pending broader validation; correctness is bit-exact.
 Recommendation: PREWARM + BUILD_AFTER together for latency-sensitive first-token paths.
+
+### D.21 Template at capture, specialize on first run (the clean fix for first-launch encode)
+
+PREWARM (D.20) moves the ~3.5 ms one-time alloc/staging/SDMA warm-up off the launch
+path. Once it does, a split timer (HIP_PM4_GRAPH_TIMING, prints "[pm4-timing]" lines)
+shows what is LEFT on the first replay is dominated by the CPU ENCODE -- turning the
+captured AQL packets into PM4 dwords -- which scales O(dispatches):
+
+  N (dispatches)   encode (CPU)     specialize=patch+alloc+upload (PREWARM, arena)
+  --------------   -------------    ----------------------------------------------
+  64               ~0.45 ms         ~0.30 ms
+  128              ~0.86-1.4 ms     ~0.19 ms
+  256              ~2.77 ms         ~0.25 ms
+
+The encode is PURE CPU work and is QUEUE-INDEPENDENT: the only queue-runtime inputs are
+the scratch base/size, the scratch V#, and the amd_queue_t pointer. So it can run at
+hipGraphInstantiate (we already have the packets there from CaptureAQLPackets), leaving
+only a cheap patch+upload for the first launch.
+
+DESIGN (implemented, default ON; A/B toggle HIP_PM4_GRAPH_TEMPLATE=0).
+  - encodePm4GraphTemplate (rocvirtual.cpp): the front half of the old buildPm4GraphIb,
+    refactored to be queue-independent. Every queue-runtime dword is emitted as a
+    SENTINEL (0xFFFFFFFF) and its dword offset + kind recorded in a placeholder list.
+    The sentinel (not 0) is deliberate: it keeps delta-encoding making the SAME emit/skip
+    decisions it would with the real value -- e.g. a scratch kernel's TMPRING (sentinel)
+    still differs from a non-scratch kernel's real 0, so the non-scratch kernel re-emits
+    0. Result: the template's dword LAYOUT is identical to the old direct build; only the
+    placeholder VALUES are filled in later. Placeholder kinds: scratch base lo/hi, TMPRING,
+    scratch V# [0..3], queue_ptr lo/hi. kernarg base is graph-fixed (allocated at
+    instantiate) so it is baked in, not a placeholder.
+  - specializeFromTemplate (rocvirtual.cpp): copy the template dwords, patch every
+    placeholder from THIS launch stream's queue (scratch_backing_memory_location,
+    compute_tmpring_size, scratch_resource_descriptor, gpu_queue_), then arena-alloc +
+    DMA-upload. If the graph needs scratch the queue has not sized yet, return
+    kPm4DeferredScratch (replay via AQL once, which sizes it; a later specialize succeeds).
+    No CPU re-encode. buildPm4GraphIb is now just encode + specialize, kept for the
+    launch-path fallback (post-mutation rebuild, BUILD_AFTER).
+  - Storage / lifetime: GraphExec::EncodePm4Templates (hip_graph_internal.cpp) runs at
+    instantiate (right after CaptureAQLPackets) and stores one opaque template per
+    PacketBatch via the device's null-stream vdev (encode is queue-independent, so any
+    vdev of the graph's device produces an identical template). The template is host-only
+    memory owned by the batch and freed in ~GraphExec via the same vdev. It is passed back
+    in through dispatchAqlPacketBatch's new pm4Template arg (a base-class virtual, void* at
+    the boundary), threaded to tryReplayPm4Graph -> findOrBuildPm4Graph, where a cache miss
+    specializes from it instead of doing a full build.
+  - Correctness guard (key match): the template is stamped with the content hash of the
+    packets it was encoded from. findOrBuildPm4Graph uses it ONLY when tmpl->key ==
+    pm4GraphKey(launch packets). So a stale template (graph mutated after instantiate ->
+    different packet bytes) or the disabled-node filtered subset (different key) is ignored
+    and falls back to a full build -- never wrongly reused. Steady decode keeps the same
+    packet bytes (kernarg ADDRESS + grid/block stable; only kernarg CONTENTS change, which
+    the IB references by address), so the template stays valid across the decode loop.
+
+MEASURED (gfx1100 W7900, PREWARM on). First replay drops from a full build to
+specialize-only; the encode is fully hoisted to instantiate:
+
+  N     TEMPLATE=OFF first launch              TEMPLATE=ON first launch    moved to instantiate
+  ---   -----------------------------------    ------------------------    --------------------
+  128   build: encode 0.91 ms + 0.24 ms        specialize only: 0.19 ms    encode 0.86 ms
+  256   build: encode 1.85 ms + 0.23 ms        specialize only: 0.25 ms    encode 2.77 ms
+
+So with PREWARM + template-at-capture the first PM4 replay costs ~0.2 ms (patch + DMA)
+regardless of chain length -- the O(N) encode no longer sits on any launch. Frameworks
+get the instantiate cost for free (graphs are instantiated once, before the timed loop).
+
+VALIDATION (default ON): run_pm4_coverage ALL BIT-EXACT incl. scratch (placeholder patch
+path), hip_keycache_mutate PASS (AQL + PM4 + scratch; param-update and enable/disable),
+hip_pm4_evict_stress PASS (2000 distinct-IB mutations, cache cap 16). The split timer and
+A/B toggle (HIP_PM4_GRAPH_TIMING / HIP_PM4_GRAPH_TEMPLATE) are kept as diagnostics.
+
+NEXT (separate commit): a GraphExec-owned, device-scoped IB so the specialized IB is built
+ONCE and shared across every stream replaying the graph (today the host template is shared
+but the device IB is still per-stream). That makes capture-time build fully reusable and
+removes the per-stream first-replay specialize entirely.
