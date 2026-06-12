@@ -3253,3 +3253,77 @@ Determinism (pm4_e2e_check.py, greedy, fixed prompt, 96 tokens, token-id sha256)
      stock HIP output on both a dense and an MoE model. The blocking AGENT fence
      preserves the already-deterministic dense path and fixes the MoE path with no
      logit drift.
+
+### D.16 FAQ: what PM4 is, why the small CLR diff is so much faster, AQL vs PM4
+
+Q: The CLR diff is small (~740 lines, 3 files, no kernel code). What is the magic?
+  It is a SUBMISSION-PATH change, not a feature. The existing hipGraph capture already
+  knows every node's kernel descriptor, kernarg pointer, grid/block dims and scratch
+  needs. The patch intercepts that captured packet list and, instead of replaying it
+  as N separate AQL dispatches, compiles it ONCE into a single PM4 indirect buffer and
+  replays that with one submit. The 740 lines are almost entirely a self-contained PM4
+  encoder + the gfx11/gfx12 register-offset and GCR tables + delta logic + scratch/arch
+  guards + env flags. No new kernels, no math change, no scheduler change.
+
+Q: Why is the PM4 path so much faster, then?
+  It removes FIXED per-kernel-edge overhead, multiplied across hundreds of dependent
+  dispatches (MoE token = 267):
+   1. One submit, not N. The whole token is one IB the CP micro-engine streams back to
+      back: no per-dispatch doorbell ring, no per-dispatch AQL-packet-processor wake-up,
+      no host packet writes.
+   2. No AQL->PM4 translation. Register programming (SET_SH_REG) and DISPATCH_DIRECT are
+      pre-baked into the IB instead of being decoded by the AQP firmware per packet.
+   3. A lean per-edge fence (see D.16 fence note below).
+   4. Register delta-encoding (HIP_PM4_GRAPH_DELTA): consecutive dispatches share most
+      register state, so emit SET_SH_REG only for the contiguous sub-range that changed
+      -> 41% fewer IB dwords -> less CP front-end work per edge.
+
+Q: "The default AQL fence is heavier" -- but it is the SAME AGENT scope. Why heavier?
+  Correct: the cache SCOPE is identical (AGENT: invalidate L0/L1/K, no L2 flush) -- D.14
+  proved scope was never the difference. What differs is the MECHANISM + SERIALIZATION,
+  not which caches are touched:
+   - Stock HIP fence = a serialized CP round-trip. The AQL packet carries an
+     acquire_fence_scope AND a release_fence_scope; the AQP implements them as a release
+     sequence (drain + signal) followed by an acquire (wait), as separate CP ops per
+     packet. Measured ~5.8 us serialized AGENT fence per dispatch (D.5). Same caches, but
+     the CP fully stalls on it each edge.
+   - PM4 per-edge fence = one CS_PARTIAL_FLUSH (drain producer waves) + one ACQUIRE_MEM
+     with the AGENT mask (kGcrAgent = 0x380). No separate release/signal round-trip, no
+     counter; just inline dwords the CP streams. Same AGENT caches invalidated, far less
+     CP serialization. (PWS went further by overlapping the flush, but D.14 showed the
+     simple blocking AGENT acquire is both faster than PWS and correct.)
+
+Q: What is PM4 / what does it stand for?
+  PM4 is AMD's command-packet format for the GPU Command Processor (CP) -- the binary
+  "ISA" the CP micro-engines (ME/PFP/MEC) fetch and execute. The name is historical:
+  "Programming Model 4" (4th-generation packet model, R600 era); in practice everyone
+  says "PM4 packets". Two packet types are used here: type-0 (write a run of consecutive
+  registers) and type-3 (a command with an opcode -- SET_SH_REG 0x76, DISPATCH_DIRECT
+  0x15, RELEASE_MEM 0x49, ACQUIRE_MEM 0x58, INDIRECT_BUFFER). An IB (Indirect Buffer) is
+  a buffer of PM4 packets the CP jumps into; INDIRECT_BUFFER is effectively a "call" into
+  a PM4 stream. Our whole token is one such PM4 IB.
+
+Q: Does a PM4 IB have a length limit?
+  INDIRECT_BUFFER encodes IB_SIZE in a 20-bit field -> up to 2^20-1 ~= 1,048,575 dwords
+  (~4 MB) per IB, and IBs can chain into further IBs. The MoE token (267 dispatches, a
+  few thousand dwords) is far below this, so length is a non-issue.
+
+Q: Why is the default path AQL->PM4 translation instead of submitting PM4 directly?
+  AQL (Architected Queuing Language) is the HSA-standard USER-MODE submission interface,
+  and it exists for reasons raw PM4 IBs cannot give directly:
+   1. User-mode, no kernel transition. A process writes an AQL packet into a ring in its
+      own address space and rings a doorbell; a firmware packet processor (AQP) consumes
+      it. Raw PM4 IB submission is PRIVILEGED -- normally only the kernel-mode driver
+      builds/submits PM4 IBs, because arbitrary PM4 can program any register and hang or
+      compromise the GPU. AQL is a constrained, validated format the AQP can safely
+      accept from userspace.
+   2. Portability. AQL is a vendor-neutral HSA packet layout; PM4 is AMD-internal and
+      changes across CP generations. The AQP firmware is exactly the thing that
+      translates the portable AQL packet into gfx-specific PM4 register programming +
+      dispatch.
+   3. Multi-producer queue semantics: signals, barrier packets, multi-queue arbitration.
+  The cost of that safety/portability is the per-packet firmware translation + serialized
+  fence. Our trick threads the needle: we STILL submit through the normal validated queue,
+  but as a single AMD vendor PM4-IB packet that points the CP at our pre-built PM4 IB --
+  keeping the safe user-mode one-submit path while bypassing the per-dispatch AQL->PM4
+  translation and the per-packet serialized fence that made the default path slow.
