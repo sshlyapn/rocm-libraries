@@ -3362,8 +3362,49 @@ per decode token (gpt-oss-20b). That is ~0.3% of token time and it OVERLAPS GPU
 execution (hipGraphLaunch is async). The measured e2e speedup (D.15) is unaffected by
 this and is purely the GPU-side dispatch-gap reduction.
 
-FOLLOW-UP OPPORTUNITY (not yet implemented): the recorded packet set is stable for a
-given hipGraphExec, so pm4GraphKey could be computed ONCE (first launch) and cached on
-the graph/exec, removing PM4's per-launch O(N) hash and finally making PM4 host issue
-O(1) (one vendor packet + doorbell). It would only shave ~10-15 us/token (~0.3%), so
-it is low priority, but it would also make PM4 the cheapest host path at every N.
+FOLLOW-UP OPPORTUNITY: the recorded packet set is stable for a given hipGraphExec, so
+pm4GraphKey could be computed ONCE and cached, removing PM4's per-launch O(N) hash and
+making PM4 host issue O(1) (one vendor packet + doorbell). IMPLEMENTED + measured in
+D.18 below.
+
+### D.18 IMPLEMENTED: last-lookup key cache (HIP_PM4_GRAPH_KEYCACHE)
+
+WHY (ties to D.17 + the within-launch latency point): the per-launch pm4GraphKey hash
+is O(N) over every packet, and in the steady-state decode loop the same packet array
+is replayed every token -- nothing the hash covers changes (only kernarg CONTENTS
+change, which the hash ignores by design), so the hash returns the SAME key every
+launch. Worse, that O(N) hash sits BEFORE the submit doorbell: in PM4 the GPU cannot
+start until the doorbell, so the hash directly delays time-to-first-kernel (unlike AQL,
+where the AQP starts kernel 0 while the host is still copying later packets). Removing
+the hash both flattens host issue cost AND lets the GPU start sooner.
+
+IMPLEMENTATION (rocvirtual.cpp tryReplayPm4Graph, opt-in HIP_PM4_GRAPH_KEYCACHE):
+remember the last lookup's identity = (numPackets, first packet ptr, last packet ptr,
+and a fold of the first/last packet content: kernel_object, kernarg_address, dims,
+header/setup). On an exact match, reuse the cached Pm4GraphIb* directly (the map is
+node-based so element pointers stay valid) -- skip the hash AND the map find -> O(1)
+host issue. The strong identity guards against ABA (a freed+reallocated graph reusing
+an address) and endpoint param changes. LIMITATION: an in-place param update to a
+STRICTLY-INTERIOR node that changes neither endpoint would be missed; safe for
+replay-only and endpoint-touching updates, which covers the decode workloads. Default
+OFF keeps the always-rehash path (the safe, fully-general behavior).
+
+MEASURED host hipGraphLaunch issue cost (gfx1100, M=256, R=8000, avg us):
+  N      AQL graph    PM4 (no cache)   PM4 + KEYCACHE
+  1      2.46          2.59             3.02
+  16     3.36          2.81             2.91
+  64     3.94          4.38             2.54
+  256    5.11          9.82             2.48
+  512    7.03         17.02             2.52
+  => KEYCACHE makes PM4 host issue FLAT ~2.5 us at every N (O(1)), now the cheapest
+     path at every N -- 6.8x faster than PM4-no-cache and 2.8x faster than AQL at N=512.
+
+VALIDATION:
+  - hip_pm4_coverage: all scenarios bit-exact vs AQL baseline with
+    HIP_PM4_GRAPH=1 SCRATCH=1 DELTA=1 KEYCACHE=1 (gfx1100).
+  - gpt-oss-20b MoE e2e: deterministic (3/3) and identical to stock HIP
+    (sha c1db07d351fac8e2).
+  - gpt-oss-20b clean TPOT: 4.64-4.66 ms (~921 Tok/s), vs PM4+DELTA without keycache
+    4.68 ms (~913 Tok/s). A marginal ~1% e2e gain, as predicted: host issue is ~0.3%
+    of token time and overlaps GPU, so the real value of KEYCACHE is the reduced
+    time-to-first-kernel / launch latency, not steady-state TPOT.
