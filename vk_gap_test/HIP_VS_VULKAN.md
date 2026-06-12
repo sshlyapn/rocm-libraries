@@ -3797,4 +3797,68 @@ A/B toggle (HIP_PM4_GRAPH_TIMING / HIP_PM4_GRAPH_TEMPLATE) are kept as diagnosti
 NEXT (separate commit): a GraphExec-owned, device-scoped IB so the specialized IB is built
 ONCE and shared across every stream replaying the graph (today the host template is shared
 but the device IB is still per-stream). That makes capture-time build fully reusable and
-removes the per-stream first-replay specialize entirely.
+removes the per-stream first-replay specialize entirely. -> implemented in D.22.
+
+### D.22 GraphExec-owned, device-scoped shared IB (build once, share across streams)
+
+D.21 hoists the CPU encode to instantiate, but the DEVICE IB (the alloc + DMA upload of the
+patched dwords) is still produced PER STREAM: the host template is shared, yet the first
+replay on each stream calls specializeFromTemplate and gets its own VRAM copy. For a graph
+replayed on K streams that is K allocations, K uploads, and K copies of the same IB.
+
+KEY OBSERVATION (shareability). The specialized IB is queue-DEPENDENT only through the
+placeholders D.21 records: scratch base/size, scratch V#, and the amd_queue_t pointer. A
+graph with NO placeholders (patches.empty(): non-scratch AND no KCP_QUEUE_PTR kernel -- the
+common LLM-decode case) produces an IB whose bytes are IDENTICAL for every stream. That IB
+is freely shareable. A graph WITH placeholders encodes per-queue values, so it must stay
+per-stream (unchanged).
+
+DESIGN (implemented, default ON; A/B toggle HIP_PM4_GRAPH_SHARED_IB=0).
+  - Build once, at instantiate. buildPm4GraphTemplate, after encoding, checks shareable()
+    (status==Ready && patches.empty()). If so it calls specializeFromTemplate(deviceScoped=
+    true) ONCE and stores the result in the template (sharedIb / sharedDw). Because there are
+    no placeholders, "specialize" here is just alloc + DMA of the template dwords -- no queue
+    state is read, so the null-stream vdev that runs at instantiate produces the canonical IB.
+  - Device-scoped allocation. allocExecIbFromData(deviceScoped=true) skips the per-vdev
+    executable arena and allocates straight from the device gpuvm executable pool, so the IB
+    outlives any single stream. It is owned by the GraphExec and freed in freePm4GraphTemplate
+    via Hsa::memory_pool_free (device-agnostic), so the freeing vdev need not be the builder.
+  - Submit from any stream, no per-stream build. tryReplayPm4Graph gains a fast path: if the
+    template carries a sharedIb and tmpl->key == pm4GraphKey(launch packets), the stream
+    submits the shared IB directly from its own queue (ring write + doorbell; the IB VRAM
+    address is valid device-wide and the upload was synchronous, so concurrent reads from
+    multiple queues are safe). No specialize, no upload, no extra VRAM.
+  - Stays OUT of the per-stream content-key cache (pm4Graphs_). A non-owning entry left in
+    that map could outlive a freed GraphExec and then alias a NEW graph that happens to reuse
+    the same content key (freed+realloced kernarg) -> use-after-free. Instead the shared IB is
+    held in a dedicated per-vdev armed slot (pm4SharedRef_) referenced by the keycache. Reuse
+    is gated by the keycache VERSION (unique per GraphExec instantiation): a new GraphExec has
+    a new version, so a stale pm4SharedRef_ is never submitted -- it is re-armed (to the new,
+    valid IB) before the next submit. The O(N) key hash is paid only on a keycache miss (first
+    launch + after a mutation), then armed for O(1) reuse, same as the per-stream path.
+  - Mutation / non-shareable fallback. On a mutation the launch key no longer matches
+    tmpl->key, so the shared fast path is skipped and the launch falls through to the per-
+    stream findOrBuildPm4Graph (full build / per-stream specialize) -- correct, just not
+    shared. Scratch / queue_ptr graphs never populate sharedIb and always take the per-stream
+    path.
+
+MEASURED (gfx1100 W7900, HIP_PM4_GRAPH_TIMING, one exec replayed on 8 streams). The number
+of device-IB builds drops from one-per-stream to one-per-graph:
+
+  mode                         "specialize" device-IB builds for 8 streams
+  --------------------------   -------------------------------------------
+  SHARED_IB=0 (D.21 per-stream)  8   (one alloc+upload per stream)
+  SHARED_IB=1 (default, D.22)    1   (built once at instantiate; 8 streams reference it)
+
+So a stream replaying an already-instantiated shareable graph for the first time now does
+ZERO device work beyond the ring submit (the per-stream ~0.2 ms specialize of D.21 is gone),
+and total IB VRAM is one copy instead of K.
+
+VALIDATION (default ON): run_pm4_coverage ALL BIT-EXACT incl. scratch (per-stream path
+unaffected), hip_keycache_mutate PASS (AQL + PM4 + scratch), hip_pm4_evict_stress PASS (2000
+mutations). New hip_pm4_multistream replays one exec across 4-8 distinct streams: PASS for
+AQL, PM4 shared-on, and PM4 shared-off, with the "shared IB" build logged exactly once for 8
+streams. (Note: the multistream gate uses a device-wide sync between zero and readback; an
+earlier per-stream-sync variant exposed a stream-completion-tracking race that reproduces
+with SHARED_IB=0 too -- i.e. pre-existing and orthogonal to this change. Steady decode
+replays on a single stream, the validated path.)
