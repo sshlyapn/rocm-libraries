@@ -1,0 +1,46 @@
+#!/usr/bin/perl
+# Minimal `xxd -i FILE` emulation for the ROCr blit/trap header generators, which
+# only ever call `xxd -i <alphanumeric-filename>`. Emits a C array + _len var.
+# Trailing commas in the initializer are valid C/C++. Plain ASCII only.
+use strict;
+use warnings;
+
+my $mode_i = 0;
+my $file;
+foreach my $a (@ARGV) {
+    if ($a eq '-i') { $mode_i = 1; }
+    else { $file = $a; }
+}
+
+my $fh;
+my $name = "stdin";
+if (defined $file) {
+    open($fh, '<:raw', $file) or die "xxd: $file: $!\n";
+    $name = $file;
+    $name =~ s/[^A-Za-z0-9]/_/g;
+    $name =~ s/^(\d)/_$1/;
+} else {
+    $fh = \*STDIN;
+}
+
+local $/;
+my $data = <$fh>;
+$data = '' unless defined $data;
+my @bytes = unpack('C*', $data);
+
+if (!$mode_i) {
+    # Not needed by the ROCr scripts; fail loudly if ever used.
+    die "xxd shim: only 'xxd -i FILE' is supported\n";
+}
+
+print "unsigned char $name\[] = {\n";
+my $n = scalar(@bytes);
+for (my $i = 0; $i < $n; $i++) {
+    print "  " if ($i % 12) == 0;
+    printf "0x%02x", $bytes[$i];
+    print "," if $i != $n - 1;
+    if (($i % 12) == 11 || $i == $n - 1) { print "\n"; }
+    else { print " "; }
+}
+print "};\n";
+print "unsigned int ${name}_len = $n;\n";

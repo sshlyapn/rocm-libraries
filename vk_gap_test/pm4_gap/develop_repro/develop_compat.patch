@@ -1,0 +1,37 @@
+diff --git a/projects/clr/rocclr/device/blitcl.cpp b/projects/clr/rocclr/device/blitcl.cpp
+index a7d0d407376..cc09dcf86d7 100644
+--- a/projects/clr/rocclr/device/blitcl.cpp
++++ b/projects/clr/rocclr/device/blitcl.cpp
+@@ -27,9 +27,17 @@ const char* BlitLinearSourceCode = BLIT_KERNELS(
+ 
+     extern void __amd_streamOpsWrite(__global uint*, __global ulong*, ulong);
+ 
+-    extern void __amd_streamOpsIncrement(__global uint*, __global ulong*, ulong);
++    // Local fallback definitions: these builtins exist only in newer rocm-device-libs
++    // than the 7.2 hip.bc available on this box, so the blit program would otherwise
++    // fail to link. This benchmark build never dispatches the streamOps kernels, so a
++    // plain (non-atomic) impl is sufficient to satisfy the linker. Plain ASCII only.
++    void __amd_streamOpsIncrement(__global uint* pInt, __global ulong* pUlong, ulong value) {
++      if (pInt) { pInt[0] = pInt[0] + 1u; } else if (pUlong) { pUlong[0] = pUlong[0] + 1UL; }
++    }
+ 
+-    extern void __amd_streamOpsDecrement(__global uint*, __global ulong*, ulong);
++    void __amd_streamOpsDecrement(__global uint* pInt, __global ulong* pUlong, ulong value) {
++      if (pInt) { pInt[0] = pInt[0] - 1u; } else if (pUlong) { pUlong[0] = pUlong[0] - 1UL; }
++    }
+ 
+     extern void __amd_streamOpsWait(__global uint*, __global ulong*, ulong, ulong, ulong);
+ 
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/trap_handler/trap_handler_gfx12.s b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/trap_handler/trap_handler_gfx12.s
+index 6eb42df4e29..c1bca83c459 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/trap_handler/trap_handler_gfx12.s
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/trap_handler/trap_handler_gfx12.s
+@@ -1295,7 +1295,7 @@
+   s_bitset0_b32     ttmp6, TTMP6_SCC_SHIFT
+ 
+ .if .amdgcn.gfx_generation_minor == 0
+-  s_setreg_b32      hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), ttmp2
++  s_setreg_b32      hwreg(26, 0, 2), ttmp2  // HW_REG_WAVE_SCHED_MODE (id 26); numeric so the older toolchain assembler accepts it (same encoding)
+ .endif
+ 
+   // Return to original (possibly modified) PC.
