@@ -3378,16 +3378,24 @@ start until the doorbell, so the hash directly delays time-to-first-kernel (unli
 where the AQP starts kernel 0 while the host is still copying later packets). Removing
 the hash both flattens host issue cost AND lets the GPU start sooner.
 
-IMPLEMENTATION (rocvirtual.cpp tryReplayPm4Graph, opt-in HIP_PM4_GRAPH_KEYCACHE):
-remember the last lookup's identity = (numPackets, first packet ptr, last packet ptr,
-and a fold of the first/last packet content: kernel_object, kernarg_address, dims,
-header/setup). On an exact match, reuse the cached Pm4GraphIb* directly (the map is
-node-based so element pointers stay valid) -- skip the hash AND the map find -> O(1)
-host issue. The strong identity guards against ABA (a freed+reallocated graph reusing
-an address) and endpoint param changes. LIMITATION: an in-place param update to a
-STRICTLY-INTERIOR node that changes neither endpoint would be missed; safe for
-replay-only and endpoint-touching updates, which covers the decode workloads. Default
-OFF keeps the always-rehash path (the safe, fully-general behavior).
+IMPLEMENTATION (opt-in HIP_PM4_GRAPH_KEYCACHE; default OFF keeps the always-rehash,
+fully-general path). RELIABLE invalidation via a graph-supplied replay token (NOT a
+content heuristic):
+  - GraphExec carries pm4ReplayId_ (unique per instantiation, from a static atomic)
+    and pm4Epoch_ (bumped on EVERY recorded-packet mutation: CaptureAndFormPackets
+    ForGraph, UpdateAQLPacket, UpdatePacketBatchesForNodeEnableDisable). The token =
+    fold(pm4ReplayId_, pm4Epoch_, batchIndex) is nonzero, unique per (instantiation,
+    batch), and changes on ANY update.
+  - The token is threaded down dispatchAqlPacketBatch -> dispatchGenericAqlPacketBatch
+    -> tryReplayPm4Graph (one optional uint64 param on the device virtual; pal ignores
+    it). The rocm key cache stores {lastToken -> Pm4GraphIb*}; on a token match it
+    reuses the cached IB pointer (node-based map, pointer stays valid) WITHOUT the hash
+    or the map find -> O(1) host issue. token 0 (non-graph / multi-device path) always
+    takes the slow path.
+  - This is bulletproof, unlike the first attempt (a first/last packet content fold,
+    which could miss an interior-only in-place param update). Any update bumps the
+    epoch -> the token changes -> a stale IB can never be served. ABA is impossible
+    (a new GraphExec gets a fresh pm4ReplayId_).
 
 MEASURED host hipGraphLaunch issue cost (gfx1100, M=256, R=8000, avg us):
   N      AQL graph    PM4 (no cache)   PM4 + KEYCACHE
@@ -3403,8 +3411,18 @@ VALIDATION:
   - hip_pm4_coverage: all scenarios bit-exact vs AQL baseline with
     HIP_PM4_GRAPH=1 SCRATCH=1 DELTA=1 KEYCACHE=1 (gfx1100).
   - gpt-oss-20b MoE e2e: deterministic (3/3) and identical to stock HIP
-    (sha c1db07d351fac8e2).
-  - gpt-oss-20b clean TPOT: 4.64-4.66 ms (~921 Tok/s), vs PM4+DELTA without keycache
-    4.68 ms (~913 Tok/s). A marginal ~1% e2e gain, as predicted: host issue is ~0.3%
-    of token time and overlaps GPU, so the real value of KEYCACHE is the reduced
-    time-to-first-kernel / launch latency, not steady-state TPOT.
+    (sha c1db07d351fac8e2), token-driven cache.
+
+DOES IT HELP TPOT? Honestly measured both with and without the per-token sync:
+  - SKIP_SAMPLING (no per-token sync, host issue overlaps prior token's GPU):
+    keycache 4.64-4.66 ms vs no-keycache 4.68 ms -- ~1%, at the edge of noise.
+  - REAL decode (sampling ON -> hard per-token sync for EOS/sampling/autoregressive
+    dep, so the launch IS on the critical path after the sync):
+    no-keycache 4.90-4.92 ms vs keycache 4.92-4.93 ms -- NO improvement (within noise).
+  CONCLUSION: even with the per-token sync the launch host cost (~10 us at N=267) is
+  dwarfed by per-token kernel compute (~4900 us) AND by the sampling+d2h-sync overhead
+  (~230 us; real decode is ~0.23 ms/token slower than SKIP_SAMPLING), so removing the
+  ~7.5 us hash does not move TPOT. KEYCACHE's value is therefore limited to: (a) flat
+  O(1) host issue regardless of graph size, and (b) lower time-to-first-kernel -- which
+  would only matter for workloads with very small per-token GPU time or very large N.
+  It is correct, reliable, and free to leave OFF for decode. Kept opt-in.
