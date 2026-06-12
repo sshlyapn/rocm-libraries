@@ -1852,6 +1852,25 @@ bool VirtualGPU::pm4GraphReorderEnabled() {
   return pm4GraphReorderState_ == 1;
 }
 
+// Last-lookup key cache (HIP_PM4_GRAPH_KEYCACHE): the per-launch pm4GraphKey hash
+// is O(N) over every packet, and in the steady-state decode loop the SAME packet
+// array is replayed every token (nothing the hash covers changes -- only kernarg
+// CONTENTS change, which the hash ignores). So the hash returns the same key every
+// launch: pure overhead that also sits BEFORE the submit doorbell, delaying GPU
+// start. This fast path remembers the last (count, first/last packet pointers,
+// folded first/last content) and, on an exact match, reuses the cached IB pointer
+// without rehashing -> O(1) host issue, GPU starts sooner. Opt-in; default keeps
+// the always-rehash path. LIMITATION: an in-place param update (e.g.
+// hipGraphExecKernelNodeSetParams) to a STRICTLY-INTERIOR node that changes
+// neither endpoint would be missed; safe for replay-only and endpoint-touching
+// updates, which covers the decode workloads.
+bool VirtualGPU::pm4GraphKeyCacheEnabled() {
+  if (pm4GraphKeyCacheState_ < 0) {
+    pm4GraphKeyCacheState_ = (getenv("HIP_PM4_GRAPH_KEYCACHE") != nullptr) ? 1 : 0;
+  }
+  return pm4GraphKeyCacheState_ == 1;
+}
+
 // Content hash over the fields that define the compiled IB, so a destroyed and
 // reallocated graph that happens to reuse the same host packet address does not
 // replay a stale IB (the old packet[0]-pointer key could alias). FNV-1a.
@@ -2209,6 +2228,59 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
 bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking,
                                    bool attach_signal) {
   if (numPackets == 0) return false;
+
+  // Fast path: same packet array as the previous launch -> reuse the cached IB
+  // pointer without recomputing the O(N) content hash (HIP_PM4_GRAPH_KEYCACHE).
+  // Strong identity: count + first/last packet pointers + a fold of their content
+  // fields (kernel_object/kernarg_address/dims) so ABA reuse or an endpoint param
+  // change forces the slow path. Deferred-scratch entries are never cached here
+  // (their status flips), so the fast path only ever serves kPm4Ready IBs.
+  const bool keyCache = pm4GraphKeyCacheEnabled();
+  uint64_t fastSig = 0;
+  if (keyCache) {
+    auto foldPkt = [](uint64_t h, hsa_kernel_dispatch_packet_t* p) -> uint64_t {
+      auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+      mix(p->kernel_object);
+      mix(reinterpret_cast<uint64_t>(p->kernarg_address));
+      mix(static_cast<uint64_t>(p->grid_size_x) | (static_cast<uint64_t>(p->grid_size_y) << 21) |
+          (static_cast<uint64_t>(p->grid_size_z) << 42));
+      mix(p->header | (static_cast<uint64_t>(p->setup) << 16));
+      return h;
+    };
+    fastSig = foldPkt(1469598103934665603ull,
+                      reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[0]));
+    fastSig = foldPkt(fastSig,
+                      reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[numPackets - 1]));
+    if (pm4KeyCacheValid_ && pm4KeyCacheNum_ == numPackets &&
+        pm4KeyCacheFirst_ == packets[0] && pm4KeyCacheLast_ == packets[numPackets - 1] &&
+        pm4KeyCacheSig_ == fastSig && pm4KeyCacheIb_ != nullptr &&
+        pm4KeyCacheIb_->status == kPm4Ready) {
+      Pm4GraphIb& gc = *pm4KeyCacheIb_;
+      bool attachSignalC = timestamp_ != nullptr || attach_signal;
+      hsa_signal_t sigC = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignalC);
+      PwsVendorPkt pktC;
+      buildPwsVendorPkt(&pktC, gc.ib, gc.dw);
+      pktC.completion_signal = sigC;
+      const uint32_t queueMaskC = gpu_queue_->size - 1;
+      uint64_t indexC = Hsa::queue_add_write_index_screlease(gpu_queue_, 1);
+      while ((indexC - Hsa::queue_load_read_index_scacquire(gpu_queue_)) >= queueMaskC) {
+        amd::Os::yield();
+      }
+      PwsVendorPkt* slotC =
+          &(reinterpret_cast<PwsVendorPkt*>(gpu_queue_->base_address))[indexC & queueMaskC];
+      memcpy(reinterpret_cast<uint8_t*>(slotC) + sizeof(uint32_t),
+             reinterpret_cast<uint8_t*>(&pktC) + sizeof(uint32_t), sizeof(pktC) - sizeof(uint32_t));
+      packet_store_release(reinterpret_cast<uint32_t*>(slotC), pktC.header, pktC.ven_hdr);
+      Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, indexC);
+      hasPendingDispatch_ = true;
+      TrackQueueProgress(pktC, indexC);
+      if (blocking) {
+        Barriers().WaitCurrent();
+      }
+      return true;
+    }
+  }
+
   const uint64_t key = pm4GraphKey(packets, numPackets);
   auto it = pm4Graphs_.find(key);
   if (it == pm4Graphs_.end()) {
@@ -2221,6 +2293,16 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
     g = buildPm4GraphIb(packets, numPackets);
   }
   if (g.status != kPm4Ready) return false;
+
+  // Arm the fast path for the next launch (only for ready, non-scratch IBs).
+  if (keyCache) {
+    pm4KeyCacheValid_ = true;
+    pm4KeyCacheNum_ = numPackets;
+    pm4KeyCacheFirst_ = packets[0];
+    pm4KeyCacheLast_ = packets[numPackets - 1];
+    pm4KeyCacheSig_ = fastSig;
+    pm4KeyCacheIb_ = &g;
+  }
 
   bool attachSignal = timestamp_ != nullptr || attach_signal;
   hsa_signal_t sig = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);

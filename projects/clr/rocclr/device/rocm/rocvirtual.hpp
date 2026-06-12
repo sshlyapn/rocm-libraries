@@ -517,10 +517,23 @@ class VirtualGPU : public device::VirtualDevice {
   int pm4GraphScratchState_ = -1;   //!< HIP_PM4_GRAPH_SCRATCH env gate (scratch kernels)
   int pm4GraphDeltaState_ = -1;     //!< HIP_PM4_GRAPH_DELTA env gate (register delta-encode)
   int pm4GraphReorderState_ = -1;   //!< HIP_PM4_GRAPH_REORDER env gate (front-end reorder)
+  int pm4GraphKeyCacheState_ = -1;  //!< HIP_PM4_GRAPH_KEYCACHE env gate (skip per-launch rehash)
+  // Last-lookup fast path: when the same packet array is replayed back-to-back
+  // (the steady-state decode loop), skip recomputing the O(N) content hash. A
+  // strong identity (count + first/last packet pointers AND a fold of their
+  // content fields) guards against ABA reuse; the cached pointer is into the
+  // node-based pm4Graphs_ map so it stays valid across inserts.
+  bool pm4KeyCacheValid_ = false;
+  const void* pm4KeyCacheFirst_ = nullptr;
+  const void* pm4KeyCacheLast_ = nullptr;
+  size_t pm4KeyCacheNum_ = 0;
+  uint64_t pm4KeyCacheSig_ = 0;
+  Pm4GraphIb* pm4KeyCacheIb_ = nullptr;
   bool pm4GraphActive();
   bool pm4GraphScratchEnabled();
   bool pm4GraphDeltaEnabled();      //!< skip SET_SH_REG writes whose value is unchanged
   bool pm4GraphReorderEnabled();    //!< hoist next kernel's regs between release and acquire
+  bool pm4GraphKeyCacheEnabled();   //!< reuse last lookup when the packet array is unchanged
   void* allocExecIbFromData(const uint32_t* data, uint32_t dw);  //!< stage data into an executable IB
   static uint64_t pm4GraphKey(void* const* packets, size_t numPackets);  //!< content hash
   Pm4GraphIb buildPm4GraphIb(void* const* packets, size_t numPackets);
