@@ -1268,9 +1268,16 @@ bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& pa
   // jump, lean raw-PM4 dispatches + in-place PWS fences). kernelNames != nullptr
   // marks the graph-replay path. Falls back to AQL replay if any packet is
   // unsupported (non-dispatch, scratch, or non-trivial kernarg ABI).
-  if (pm4GraphActive() && kernelNames != nullptr) {
+  //
+  // HIP_PM4_GRAPH_BUILD_AFTER: on the FIRST replay (cache miss) do NOT build the IB
+  // before submit (allowBuild=false) -- replay via AQL below and build right after
+  // the submit (prebuildPm4Graph), so the build overlaps the GPU executing the
+  // graph just submitted, and the AQL submit sizes the scratch the build needs.
+  const bool pm4GraphReplay = pm4GraphActive() && kernelNames != nullptr;
+  const bool pm4BuildAfter = pm4GraphReplay && pm4GraphBuildAfterEnabled();
+  if (pm4GraphReplay) {
     if (tryReplayPm4Graph(reinterpret_cast<void* const*>(packets.data()), packets.size(), blocking,
-                          attach_signal, recordedPacketVersion)) {
+                          attach_signal, recordedPacketVersion, /*allowBuild=*/!pm4BuildAfter)) {
       return true;
     }
   }
@@ -1468,6 +1475,14 @@ bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& pa
                      packets.back()->completion_signal.handle);
       return false;
     }
+  }
+
+  // HIP_PM4_GRAPH_BUILD_AFTER: the graph just replayed via AQL (above). Build the
+  // PM4 IB now -- overlapped with the GPU executing that replay, and with scratch
+  // already sized by the submit -- so the NEXT replay uses the single-IB fast path.
+  if (pm4BuildAfter) {
+    prebuildPm4Graph(reinterpret_cast<void* const*>(packets.data()), packets.size(),
+                     recordedPacketVersion);
   }
 
   return true;
@@ -1878,6 +1893,137 @@ bool VirtualGPU::pm4GraphKeyCacheEnabled() {
   return pm4GraphKeyCacheState_ == 1;
 }
 
+// Executable IB arena prewarm (HIP_PM4_GRAPH_PREWARM): reserve one device-local
+// executable buffer once (warming the executable memory pool off the launch
+// critical path) and sub-allocate IBs from it. Opt-in for now; measured before
+// considering default-on. See HIP_VS_VULKAN.md Appendix D.
+bool VirtualGPU::pm4GraphPrewarmEnabled() {
+  if (pm4GraphPrewarmState_ < 0) {
+    pm4GraphPrewarmState_ = (getenv("HIP_PM4_GRAPH_PREWARM") != nullptr) ? 1 : 0;
+  }
+  return pm4GraphPrewarmState_ == 1;
+}
+
+// Build-after (HIP_PM4_GRAPH_BUILD_AFTER): on the FIRST replay of a graph (cache
+// miss), do NOT build the PM4 IB synchronously before submit. Instead replay this
+// launch via the AQL fallback (GPU starts in ~us, no build-induced idle) and build
+// the PM4 IB right after the submit, so the build (and, with PREWARM off, the
+// one-time pool warm-up) overlaps the GPU executing the graph just submitted. The
+// AQL submit also sizes the queue scratch, so the deferred build is never
+// scratch-deferred. The next replay reuses the cached IB. Opt-in.
+bool VirtualGPU::pm4GraphBuildAfterEnabled() {
+  if (pm4GraphBuildAfterState_ < 0) {
+    pm4GraphBuildAfterState_ = (getenv("HIP_PM4_GRAPH_BUILD_AFTER") != nullptr) ? 1 : 0;
+  }
+  return pm4GraphBuildAfterState_ == 1;
+}
+
+// Reserve the executable IB arena once. The single allocation pays the one-time
+// executable-pool first-touch cost here (at init / first PM4 use) instead of on
+// the first replay. Idempotent.
+void VirtualGPU::ensurePm4Arena() {
+  if (pm4Arena_ != nullptr || !pm4GraphActive() || !pm4GraphPrewarmEnabled()) {
+    return;
+  }
+  void* dev = nullptr;
+  if (Hsa::memory_pool_allocate(roc_device_.getGpuvmSegment(), kPm4ArenaBytes,
+                                HSA_AMD_MEMORY_POOL_EXECUTABLE_FLAG, &dev) != HSA_STATUS_SUCCESS) {
+    ClPrint(amd::LOG_WARNING, amd::LOG_CODE,
+            "[pm4-arena] reserve of %zu bytes failed; falling back to per-IB pool alloc",
+            kPm4ArenaBytes);
+    return;
+  }
+  hsa_agent_t gpu = roc_device_.getBackendDevice();
+  Hsa::agents_allow_access(1, &gpu, nullptr, dev);
+  pm4Arena_ = dev;
+  pm4ArenaBytes_ = kPm4ArenaBytes;
+  pm4ArenaFree_.clear();
+  pm4ArenaFree_.emplace_back(0, kPm4ArenaBytes);  // one big free span
+  ClPrint(amd::LOG_INFO, amd::LOG_CODE, "[pm4-arena] reserved %zu bytes at %p",
+          kPm4ArenaBytes, pm4Arena_);
+
+  // Warm the FULL upload path once, not just the executable pool: the one-time
+  // first-touch cost is dominated by the CPU fine-grain staging pool's first
+  // allocation and the first SDMA copy, which the arena reservation alone does
+  // not exercise. Do one throwaway allocExecIbFromData (arena slice + host
+  // staging + async copy + wait) and return the slice, so the first REAL build
+  // pays only the (now-warm) per-build cost.
+  uint32_t warmData[64] = {0};
+  void* warm = allocExecIbFromData(warmData, 64);
+  if (warm != nullptr) {
+    Pm4GraphIb tmp;
+    tmp.ib = warm;
+    tmp.dw = 64;
+    tmp.status = kPm4Ready;
+    freePm4GraphIb(tmp);
+  }
+}
+
+// First-fit allocation from the arena free list. bytes must be page-rounded by
+// the caller. Returns nullptr if no span fits (caller falls back to a pool alloc).
+void* VirtualGPU::pm4ArenaAlloc(size_t bytes) {
+  if (pm4Arena_ == nullptr || bytes == 0) {
+    return nullptr;
+  }
+  for (size_t i = 0; i < pm4ArenaFree_.size(); ++i) {
+    if (pm4ArenaFree_[i].second >= bytes) {
+      size_t off = pm4ArenaFree_[i].first;
+      if (pm4ArenaFree_[i].second == bytes) {
+        pm4ArenaFree_.erase(pm4ArenaFree_.begin() + i);
+      } else {
+        pm4ArenaFree_[i].first += bytes;
+        pm4ArenaFree_[i].second -= bytes;
+      }
+      return reinterpret_cast<uint8_t*>(pm4Arena_) + off;
+    }
+  }
+  return nullptr;  // fragmented / too big -> caller uses a direct pool alloc
+}
+
+bool VirtualGPU::pm4ArenaOwns(const void* p) const {
+  if (pm4Arena_ == nullptr || p == nullptr) {
+    return false;
+  }
+  auto base = reinterpret_cast<uintptr_t>(pm4Arena_);
+  auto q = reinterpret_cast<uintptr_t>(p);
+  return q >= base && q < base + pm4ArenaBytes_;
+}
+
+// Return a slice to the free list and coalesce with adjacent free spans.
+void VirtualGPU::pm4ArenaFreeBytes(void* p, size_t bytes) {
+  size_t off = reinterpret_cast<uint8_t*>(p) - reinterpret_cast<uint8_t*>(pm4Arena_);
+  // Insert sorted by offset.
+  size_t i = 0;
+  while (i < pm4ArenaFree_.size() && pm4ArenaFree_[i].first < off) {
+    ++i;
+  }
+  pm4ArenaFree_.insert(pm4ArenaFree_.begin() + i, std::make_pair(off, bytes));
+  // Coalesce right then left.
+  if (i + 1 < pm4ArenaFree_.size() &&
+      pm4ArenaFree_[i].first + pm4ArenaFree_[i].second == pm4ArenaFree_[i + 1].first) {
+    pm4ArenaFree_[i].second += pm4ArenaFree_[i + 1].second;
+    pm4ArenaFree_.erase(pm4ArenaFree_.begin() + i + 1);
+  }
+  if (i > 0 && pm4ArenaFree_[i - 1].first + pm4ArenaFree_[i - 1].second == pm4ArenaFree_[i].first) {
+    pm4ArenaFree_[i - 1].second += pm4ArenaFree_[i].second;
+    pm4ArenaFree_.erase(pm4ArenaFree_.begin() + i);
+  }
+}
+
+// Free an IB's storage, routing to the arena free list or the device pool.
+void VirtualGPU::freePm4GraphIb(Pm4GraphIb& g) {
+  if (g.ib == nullptr) {
+    return;
+  }
+  if (pm4ArenaOwns(g.ib)) {
+    size_t bytes = (static_cast<size_t>(g.dw) * 4 + 0xFFF) & ~static_cast<size_t>(0xFFF);
+    pm4ArenaFreeBytes(g.ib, bytes);
+  } else {
+    Hsa::memory_pool_free(g.ib);
+  }
+  g.ib = nullptr;
+}
+
 // Content hash over the fields that define the compiled IB, so a destroyed and
 // reallocated graph that happens to reuse the same host packet address does not
 // replay a stale IB (the old packet[0]-pointer key could alias). FNV-1a.
@@ -1921,9 +2067,7 @@ void VirtualGPU::evictPm4GraphsIfNeeded(const Pm4GraphIb* protect) {
       pm4GraphKeyOrder_.push_back(k);  // never free a live/armed IB; try the next
       continue;
     }
-    if (e->ib != nullptr) {
-      Hsa::memory_pool_free(e->ib);
-    }
+    freePm4GraphIb(*e);
     pm4Graphs_.erase(it);
     ClPrint(amd::LOG_INFO, amd::LOG_CODE,
             "[pm4-evict] freed stale IB; cache size now %zu (cap %zu)",
@@ -1933,17 +2077,25 @@ void VirtualGPU::evictPm4GraphsIfNeeded(const Pm4GraphIb* protect) {
 
 void* VirtualGPU::allocExecIbFromData(const uint32_t* data, uint32_t dw) {
   size_t bytes = (static_cast<size_t>(dw) * 4 + 0xFFF) & ~static_cast<size_t>(0xFFF);
-  void* dev = nullptr;
-  if (Hsa::memory_pool_allocate(roc_device_.getGpuvmSegment(), bytes,
-                                HSA_AMD_MEMORY_POOL_EXECUTABLE_FLAG, &dev) != HSA_STATUS_SUCCESS) {
-    return nullptr;
-  }
   hsa_agent_t gpu = roc_device_.getBackendDevice();
-  Hsa::agents_allow_access(1, &gpu, nullptr, dev);
+  // Prefer a slice from the pre-reserved arena (already GPU-accessible); fall back
+  // to a direct executable-pool allocation if the arena is off / full / too small.
+  void* dev = pm4ArenaAlloc(bytes);
+  if (dev == nullptr) {
+    if (Hsa::memory_pool_allocate(roc_device_.getGpuvmSegment(), bytes,
+                                  HSA_AMD_MEMORY_POOL_EXECUTABLE_FLAG, &dev) != HSA_STATUS_SUCCESS) {
+      return nullptr;
+    }
+    Hsa::agents_allow_access(1, &gpu, nullptr, dev);
+  }
   void* host = nullptr;
   if (Hsa::memory_pool_allocate(roc_device_.getCpuFineGrainPool(), bytes, 0, &host) !=
       HSA_STATUS_SUCCESS) {
-    Hsa::memory_pool_free(dev);
+    if (pm4ArenaOwns(dev)) {
+      pm4ArenaFreeBytes(dev, bytes);
+    } else {
+      Hsa::memory_pool_free(dev);
+    }
     return nullptr;
   }
   hsa_agent_t agents[2] = {gpu, roc_device_.getCpuAgent()};
@@ -2261,7 +2413,8 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
 }
 
 bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking,
-                                   bool attach_signal, uint64_t recordedPacketVersion) {
+                                   bool attach_signal, uint64_t recordedPacketVersion,
+                                   bool allowBuild) {
   if (numPackets == 0) return false;
 
   // Fast path: same recorded packet set as the previous launch -> reuse the cached
@@ -2276,35 +2429,29 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
   if (keyCache && recordedPacketVersion != 0) {
     if (pm4IbCacheValid_ && pm4IbCacheVersion_ == recordedPacketVersion &&
         pm4IbCacheEntry_ != nullptr && pm4IbCacheEntry_->status == kPm4Ready) {
-      Pm4GraphIb& gc = *pm4IbCacheEntry_;
-      bool attachSignalC = timestamp_ != nullptr || attach_signal;
-      hsa_signal_t sigC = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignalC);
-      PwsVendorPkt pktC;
-      buildPwsVendorPkt(&pktC, gc.ib, gc.dw);
-      pktC.completion_signal = sigC;
-      const uint32_t queueMaskC = gpu_queue_->size - 1;
-      uint64_t indexC = Hsa::queue_add_write_index_screlease(gpu_queue_, 1);
-      while ((indexC - Hsa::queue_load_read_index_scacquire(gpu_queue_)) >= queueMaskC) {
-        amd::Os::yield();
-      }
-      PwsVendorPkt* slotC =
-          &(reinterpret_cast<PwsVendorPkt*>(gpu_queue_->base_address))[indexC & queueMaskC];
-      memcpy(reinterpret_cast<uint8_t*>(slotC) + sizeof(uint32_t),
-             reinterpret_cast<uint8_t*>(&pktC) + sizeof(uint32_t), sizeof(pktC) - sizeof(uint32_t));
-      packet_store_release(reinterpret_cast<uint32_t*>(slotC), pktC.header, pktC.ven_hdr);
-      Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, indexC);
-      hasPendingDispatch_ = true;
-      TrackQueueProgress(pktC, indexC);
-      if (blocking) {
-        Barriers().WaitCurrent();
-      }
+      submitPm4Ib(*pm4IbCacheEntry_, blocking, attach_signal);
       return true;
     }
   }
 
+  Pm4GraphIb* g = findOrBuildPm4Graph(packets, numPackets, recordedPacketVersion, allowBuild);
+  if (g == nullptr) {
+    return false;  // cache miss with allowBuild=false, or unsupported/deferred build
+  }
+  submitPm4Ib(*g, blocking, attach_signal);
+  return true;
+}
+
+// ================================================================================================
+VirtualGPU::Pm4GraphIb* VirtualGPU::findOrBuildPm4Graph(void* const* packets, size_t numPackets,
+                                                        uint64_t recordedPacketVersion,
+                                                        bool allowBuild) {
   const uint64_t key = pm4GraphKey(packets, numPackets);
   auto it = pm4Graphs_.find(key);
   if (it == pm4Graphs_.end()) {
+    if (!allowBuild) {
+      return nullptr;  // build-after mode: this launch goes AQL; build happens post-submit
+    }
     it = pm4Graphs_.emplace(key, buildPm4GraphIb(packets, numPackets)).first;
     pm4GraphKeyOrder_.push_back(key);
     // A mutated graph lands here every time its packet content changes, leaving
@@ -2312,26 +2459,27 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
     evictPm4GraphsIfNeeded(&it->second);
   }
   Pm4GraphIb& g = it->second;
-  // Deferred scratch: this launch falls back to AQL (which sizes the queue
-  // scratch); rebuild on the next launch now that scratch may be ready. Free the
-  // stale IB first so the rebuild does not orphan it in the executable pool.
-  if (g.status == kPm4DeferredScratch) {
-    if (g.ib != nullptr) {
-      Hsa::memory_pool_free(g.ib);
-      g.ib = nullptr;
-    }
+  // Deferred scratch: a prior launch fell back to AQL (which sizes the queue
+  // scratch); rebuild now that scratch may be ready. Free the stale IB first so
+  // the rebuild does not orphan it.
+  if (g.status == kPm4DeferredScratch && allowBuild) {
+    freePm4GraphIb(g);
     g = buildPm4GraphIb(packets, numPackets);
   }
-  if (g.status != kPm4Ready) return false;
-
-  // Arm the fast path for the next launch (only for ready, non-scratch IBs and a
-  // valid recorded packet set version).
-  if (keyCache && recordedPacketVersion != 0) {
+  if (g.status != kPm4Ready) {
+    return nullptr;
+  }
+  // Arm the fast path for the next launch (ready IB + valid version).
+  if (pm4GraphKeyCacheEnabled() && recordedPacketVersion != 0) {
     pm4IbCacheValid_ = true;
     pm4IbCacheVersion_ = recordedPacketVersion;
     pm4IbCacheEntry_ = &g;
   }
+  return &g;
+}
 
+// ================================================================================================
+void VirtualGPU::submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_signal) {
   bool attachSignal = timestamp_ != nullptr || attach_signal;
   hsa_signal_t sig = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);
 
@@ -2356,7 +2504,15 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
   if (blocking) {
     Barriers().WaitCurrent();
   }
-  return true;
+}
+
+// ================================================================================================
+void VirtualGPU::prebuildPm4Graph(void* const* packets, size_t numPackets,
+                                  uint64_t recordedPacketVersion) {
+  // Build + insert + arm the IB without submitting. Called right after the AQL
+  // fallback submit (HIP_PM4_GRAPH_BUILD_AFTER), which has already sized scratch,
+  // so the build is never scratch-deferred. The next replay finds it armed.
+  (void)findOrBuildPm4Graph(packets, numPackets, recordedPacketVersion, /*allowBuild=*/true);
 }
 
 // ================================================================================================
@@ -2566,17 +2722,27 @@ VirtualGPU::VirtualGPU(Device& device, bool profiling, bool cooperative,
   // Note: Virtual GPU device creation must be a thread safe operation
   roc_device_.vgpus_.resize(roc_device_.numOfVgpus_);
   roc_device_.vgpus_[index()] = this;
+
+  // HIP_PM4_GRAPH_PREWARM: reserve the executable IB arena now (at stream/vgpu
+  // creation), so the one-time executable-pool first-touch cost is paid here --
+  // off the first-replay critical path -- rather than during the first launch.
+  ensurePm4Arena();
 }
 
 // ================================================================================================
 VirtualGPU::~VirtualGPU() {
-  // Free the executable PM4 IBs (PWS fence + compiled graphs).
+  // Free the executable PM4 IBs (PWS fence + compiled graphs). Arena-backed IBs
+  // are returned to the arena free list; the arena itself is freed below.
   for (auto& kv : pm4Graphs_) {
-    if (kv.second.ib != nullptr) {
-      Hsa::memory_pool_free(kv.second.ib);
-    }
+    freePm4GraphIb(kv.second);
   }
   pm4Graphs_.clear();
+  pm4GraphKeyOrder_.clear();
+  if (pm4Arena_ != nullptr) {
+    Hsa::memory_pool_free(pm4Arena_);
+    pm4Arena_ = nullptr;
+    pm4ArenaFree_.clear();
+  }
   if (pwsIbBuf_ != nullptr) {
     Hsa::memory_pool_free(pwsIbBuf_);
     pwsIbBuf_ = nullptr;

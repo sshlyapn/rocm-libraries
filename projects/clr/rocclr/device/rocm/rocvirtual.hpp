@@ -32,6 +32,8 @@
 #include <stack>
 #include <deque>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace amd::roc {
 class Device;
@@ -529,6 +531,8 @@ class VirtualGPU : public device::VirtualDevice {
   int pm4GraphDeltaState_ = -1;     //!< HIP_PM4_GRAPH_DELTA env gate (register delta-encode)
   int pm4GraphReorderState_ = -1;   //!< HIP_PM4_GRAPH_REORDER env gate (front-end reorder)
   int pm4GraphKeyCacheState_ = -1;  //!< HIP_PM4_GRAPH_KEYCACHE env gate (skip per-launch rehash)
+  int pm4GraphPrewarmState_ = -1;   //!< HIP_PM4_GRAPH_PREWARM env gate (reserve exec IB arena at init)
+  int pm4GraphBuildAfterState_ = -1;//!< HIP_PM4_GRAPH_BUILD_AFTER env gate (AQL first, build IB after)
   // Last-lookup fast path: when the SAME recorded packet set is replayed back to
   // back (the steady-state decode loop), skip recomputing the O(N) content hash.
   // Validated by the graph-supplied recorded packet set version, which is nonzero,
@@ -540,11 +544,30 @@ class VirtualGPU : public device::VirtualDevice {
   bool pm4IbCacheValid_ = false;
   uint64_t pm4IbCacheVersion_ = 0;
   Pm4GraphIb* pm4IbCacheEntry_ = nullptr;
+  // Executable IB arena (HIP_PM4_GRAPH_PREWARM): one device-local executable
+  // buffer reserved once, with IBs sub-allocated from it via a first-fit free
+  // list. This both (a) warms the executable memory pool off the launch critical
+  // path -- the ~ms one-time first-allocation cost is paid at reservation, not on
+  // the first replay -- and (b) avoids a memory_pool_allocate/free round-trip per
+  // build/rebuild. An IB that does not fit falls back to a direct per-IB pool
+  // allocation (freed via memory_pool_free); arena-owned IBs are returned to the
+  // free list. Ownership is decided by address range (pm4ArenaOwns).
+  void* pm4Arena_ = nullptr;
+  size_t pm4ArenaBytes_ = 0;
+  std::vector<std::pair<size_t, size_t>> pm4ArenaFree_;  //!< sorted free spans (offset,bytes)
+  static constexpr size_t kPm4ArenaBytes = 8u * 1024u * 1024u;  //!< reserved exec arena size
   bool pm4GraphActive();
   bool pm4GraphScratchEnabled();
   bool pm4GraphDeltaEnabled();      //!< skip SET_SH_REG writes whose value is unchanged
   bool pm4GraphReorderEnabled();    //!< hoist next kernel's regs between release and acquire
   bool pm4GraphKeyCacheEnabled();   //!< reuse last lookup when the packet array is unchanged
+  bool pm4GraphPrewarmEnabled();    //!< reserve the executable IB arena at init
+  bool pm4GraphBuildAfterEnabled(); //!< first replay goes AQL, PM4 IB built right after
+  void ensurePm4Arena();                          //!< reserve the executable IB arena (idempotent)
+  void* pm4ArenaAlloc(size_t bytes);              //!< slice from the arena, or nullptr if no fit
+  bool pm4ArenaOwns(const void* p) const;         //!< true if p lies within the arena
+  void pm4ArenaFreeBytes(void* p, size_t bytes);  //!< return a slice to the arena free list
+  void freePm4GraphIb(Pm4GraphIb& g);             //!< free g.ib (arena or pool) and null it
   void* allocExecIbFromData(const uint32_t* data, uint32_t dw);  //!< stage data into an executable IB
   static uint64_t pm4GraphKey(void* const* packets, size_t numPackets);  //!< content hash
   Pm4GraphIb buildPm4GraphIb(void* const* packets, size_t numPackets);
@@ -552,8 +575,18 @@ class VirtualGPU : public device::VirtualDevice {
   //! kPm4MaxCachedIbs. Never frees the armed entry (pm4IbCacheEntry_) or the
   //! protected entry just built/selected this launch.
   void evictPm4GraphsIfNeeded(const Pm4GraphIb* protect);
+  //! Find the cached ready IB for these packets, or (if allowBuild) build+insert+
+  //! arm it. Returns the ready entry, or nullptr (cache miss with allowBuild=false,
+  //! or an unsupported/deferred build). Handles eviction and deferred-scratch.
+  Pm4GraphIb* findOrBuildPm4Graph(void* const* packets, size_t numPackets,
+                                  uint64_t recordedPacketVersion, bool allowBuild);
+  //! Submit one compiled IB as a single vendor PM4-IB packet (ring write + doorbell).
+  void submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_signal);
+  //! Build + insert + arm the IB for these packets WITHOUT submitting. Used by
+  //! HIP_PM4_GRAPH_BUILD_AFTER after the AQL fallback submit has sized scratch.
+  void prebuildPm4Graph(void* const* packets, size_t numPackets, uint64_t recordedPacketVersion);
   bool tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking, bool attach_signal,
-                         uint64_t recordedPacketVersion);
+                         uint64_t recordedPacketVersion, bool allowBuild = true);
   void dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveDepSignal = false,
                                   hsa_signal_t signal = hsa_signal_t{0},
                                   hsa_signal_value_t value = 0, hsa_signal_value_t mask = 0,
