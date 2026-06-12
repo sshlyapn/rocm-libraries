@@ -92,6 +92,57 @@ Raw output: `replay_compare.txt`.
 
 ---
 
+# End-to-end model decode: gpt-oss-20b (the metric that actually matters)
+
+The host-launch microbench above measures one isolated cost. To see what it means
+for a real workload we ran the full gpt-oss-20b decode through flywheel (direct mode)
+on the same four stacks. Same client, libs swapped via `LD_LIBRARY_PATH` /
+`HIP_PM4_GRAPH`; each stack's `libamdhip64` was confirmed distinct with
+`hipRuntimeGetVersion` (ours 70253211, develop 71460850, stock 70226015).
+
+- Model: `/huggingface/hub/models--openai--gpt-oss-20b-q0-lmhead-s0t/` (24 decoder
+  layers, profile `q0`), 512 input / 128 output tokens, concurrency 1, `-n 5`.
+- `REDLINE_DEBUG_SKIP_SAMPLING=1` (feeds a host-selected random token, skips the
+  sampling chain -- isolates the model+runtime perf path; generated text is junk).
+- Single gfx1100 / Radeon PRO W7900, `HIP_VISIBLE_DEVICES=0`. Numbers below are the
+  median of 3 repeats; run-to-run spread was < 0.5%.
+
+| Stack         | Throughput req/s | e2e latency ms | TTFT ms | **TPOT ms** | Tok/s | Tok/s/User |
+|---------------|------------------|----------------|---------|-------------|-------|------------|
+| B ours + PM4  | **1.52**         | **656**        | ~100    | **4.37**    | **976** | **195**  |
+| C ours AQL    | 1.39             | 719            | ~101    | 4.87        | 890   | 178        |
+| D stock 7.2   | 1.39             | 720            | ~101    | 4.87        | 889   | 178        |
+| A develop     | 1.39             | 721            | ~102    | 4.87        | 887   | 178        |
+
+## Reading the model numbers
+
+1. **Our PM4 path is the only stack that speeds up decode**: TPOT 4.87 -> 4.37 ms
+   (**-10.3%**), Tok/s 890 -> 976 (**+9.7%**), e2e latency 719 -> 656 ms (-8.8%).
+   This is the real payoff of submitting the whole decode graph as one PM4 IB: it
+   removes per-dispatch overhead on the *device* path that accumulates over the
+   24-layer x several-kernels-per-layer decode graph, replayed once per token.
+
+2. **develop, ours-AQL and stock 7.2 are indistinguishable here (~4.87 ms TPOT)**.
+   develop won the host-launch microbench by ~1.2 us/launch, but a decode token costs
+   ~4870 us of GPU compute (GEMM / attention / MoE), so a few-microsecond host-launch
+   delta is in the noise at the model level. develop's graph work (HW-signal pooling,
+   doorbell de-dup) is host-side and does not shrink the GPU per-token cost.
+
+3. **TTFT is flat across all stacks (~100 ms)** -- prefill is one big compute-bound
+   pass, not graph-replay-bound, so none of the graph paths move it.
+
+Takeaway: the host-launch microbench rewards develop, but on the workload that ships
+(token-by-token decode) our PM4 single-IB replay is the only change that converts to
+a measurable user-visible speedup, because it attacks GPU-side per-dispatch cost, not
+just host enqueue latency.
+
+Raw output: `gptoss_e2e.txt`. GPU-side per-kernel gap profiling (rocprofv3) was
+deferred; note that PM4-IB dispatches are not visible to `rocprofv3 --kernel-trace`
+(it hooks the AQL dispatch path), so the AQL profiler cannot directly time the PM4
+replay -- a separate measurement method would be needed.
+
+---
+
 # Full reproduction: build and run upstream/develop on the 7.2 box
 
 Every step below was run inside the container. Nothing here touches our branch's
@@ -138,7 +189,10 @@ without re-deriving the helper files:
 | File (absolute path) | Purpose |
 |----------------------|---------|
 | `/home/sshliapn/code/llama.cpp/vk_gap_test/pm4_gap/DEVELOP_VS_OURS_REPLAY.md` | this report |
-| `/home/sshliapn/code/llama.cpp/vk_gap_test/pm4_gap/replay_compare.txt` | raw sweep output |
+| `/home/sshliapn/code/llama.cpp/vk_gap_test/pm4_gap/replay_compare.txt` | raw host-launch sweep output |
+| `/home/sshliapn/code/llama.cpp/vk_gap_test/pm4_gap/gptoss_e2e.txt` | raw gpt-oss-20b e2e decode output (all reps) |
+| `/home/sshliapn/code/llama.cpp/vk_gap_test/pm4_gap/hip_gpu_gap.cpp` | GPU-side gap companion bench (rocprofv3, deferred) |
+| `/home/sshliapn/code/llama.cpp/vk_gap_test/pm4_gap/parse_gpu_gap.py` | parser for the GPU-side gap CSV |
 | `/home/sshliapn/code/llama.cpp/vk_gap_test/pm4_gap/develop_repro/cmake-stubs/ClangConfig.cmake` | Clang find_package stub |
 | `/home/sshliapn/code/llama.cpp/vk_gap_test/pm4_gap/develop_repro/cmake-stubs/LLVMConfig.cmake` | LLVM find_package stub |
 | `/home/sshliapn/code/llama.cpp/vk_gap_test/pm4_gap/develop_repro/cmake-stubs/bin/xxd` | portable `xxd -i` shim |
@@ -400,6 +454,35 @@ docker exec $CT bash -lc "
 `hip_replay_timing <N> <M> <R>`: N = chain length (dispatch packets), M = elems per
 kernel (keep small so the GPU never lags), R = timed repeats. It prints instantiate,
 FIRST(cold), FIRST_e2e, 2nd(warm), and steady host launch avg/min/max + per-dispatch.
+
+## Step 9 -- end-to-end gpt-oss-20b decode on each stack
+
+Run the flywheel benchmark on the same box; only `LD_LIBRARY_PATH` / `HIP_PM4_GRAPH`
+change between stacks. flywheel/lib-rocket is built against ROCm 7.2, so our build-gap
+lib (same 7.2 base) is ABI-safe; develop binds its own newer `libamdhip64`+`libhsa`.
+
+```bash
+CT=test-framework-sshliapn-container-2nd
+MODEL=/huggingface/hub/models--openai--gpt-oss-20b-q0-lmhead-s0t/
+OURLIB=/home/sshliapn/code/rocm-systems/projects/clr/build-gap/hipamd/lib
+DEVLIB=/home/sshliapn/code/rocm-systems-develop/projects/clr/build-develop/hipamd/lib:/home/sshliapn/code/rocm-systems-develop/install/lib:/opt/rocm/lib
+
+docker exec $CT bash -lc "
+  cd /home/sshliapn/code/rednotdead
+  export HIP_VISIBLE_DEVICES=0 HF_HOME=/huggingface REDLINE_DEBUG_SKIP_SAMPLING=1
+  BENCH='python3 utils/bench/benchmark.py -m $MODEL -i 512 -o 128 --profile q0 -ap w0 -tp 1 -c 1 -n 5 -s -w --no-cache'
+
+  echo '## B ours + PM4';  env LD_LIBRARY_PATH=$OURLIB HIP_PM4_GRAPH=1 \$BENCH | grep -E '^ +1 +[0-9]'
+  echo '## C ours AQL';    env LD_LIBRARY_PATH=$OURLIB                  \$BENCH | grep -E '^ +1 +[0-9]'
+  echo '## D stock 7.2';   env -u LD_LIBRARY_PATH                       \$BENCH | grep -E '^ +1 +[0-9]'
+  echo '## A develop';     env LD_LIBRARY_PATH=$DEVLIB                  \$BENCH | grep -E '^ +1 +[0-9]'
+"
+```
+
+`REDLINE_DEBUG_SKIP_SAMPLING=1` is required so the reported TPOT/Tok/s reflect the
+model+runtime path and not host-side sampling. Confirm each stack bound a different
+runtime with a one-liner that dlopens `libamdhip64` and calls `hipRuntimeGetVersion`
+(see `gptoss_e2e.txt` header for the expected three version ids).
 
 ## Cleanup (optional)
 

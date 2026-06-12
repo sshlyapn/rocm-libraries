@@ -1578,6 +1578,64 @@ keeps all other graphs correct. FULL reconstruction reference: Appendix B.
 
 --------------------------------------------------------------------------------
 
+## 6o. End-to-end gpt-oss-20b decode: PM4 vs AQL vs develop (the real workload)
+
+All the sections above isolate the inter-kernel gap on synthetic chains. This is the
+payoff measured on a real model: full gpt-oss-20b decode through flywheel (direct
+mode) on the same W7900, with the runtime swapped via LD_LIBRARY_PATH / HIP_PM4_GRAPH.
+Four stacks: our PM4 lib (HIP_PM4_GRAPH=1), our same lib as AQL baseline, stock ROCm
+7.2, and upstream/develop (newer CLR + ROCr, carrying develop's own graph work).
+
+Exact commands (run inside test-framework-sshliapn-container-2nd):
+
+```
+CT=test-framework-sshliapn-container-2nd
+MODEL=/huggingface/hub/models--openai--gpt-oss-20b-q0-lmhead-s0t/   # 24 layers, profile q0
+OURLIB=/home/sshliapn/code/rocm-systems/projects/clr/build-gap/hipamd/lib
+DEVLIB=/home/sshliapn/code/rocm-systems-develop/projects/clr/build-develop/hipamd/lib:/home/sshliapn/code/rocm-systems-develop/install/lib:/opt/rocm/lib
+
+docker exec $CT bash -lc "
+  cd /home/sshliapn/code/rednotdead
+  export HIP_VISIBLE_DEVICES=0 HF_HOME=/huggingface REDLINE_DEBUG_SKIP_SAMPLING=1
+  BENCH='python3 utils/bench/benchmark.py -m $MODEL -i 512 -o 128 --profile q0 -ap w0 -tp 1 -c 1 -n 5 -s -w --no-cache'
+  echo '## B ours + PM4'; env LD_LIBRARY_PATH=$OURLIB HIP_PM4_GRAPH=1 \$BENCH | grep -E '^ +1 +[0-9]'
+  echo '## C ours AQL';   env LD_LIBRARY_PATH=$OURLIB                \$BENCH | grep -E '^ +1 +[0-9]'
+  echo '## D stock 7.2';  env -u LD_LIBRARY_PATH                     \$BENCH | grep -E '^ +1 +[0-9]'
+  echo '## A develop';    env LD_LIBRARY_PATH=$DEVLIB                \$BENCH | grep -E '^ +1 +[0-9]'
+"
+```
+
+REDLINE_DEBUG_SKIP_SAMPLING=1 feeds a host-selected random token and skips the
+sampling chain (output text is meaningless; this isolates the model+runtime perf
+path). 512 input / 128 output tokens, concurrency 1, -n 5 requests. Each stack's
+libamdhip64 confirmed distinct via hipRuntimeGetVersion (ours 70253211, develop
+71460850, stock 70226015). Numbers are the median of 3 repeats; spread < 0.5%.
+
+  Stack          Throughput   e2e lat   TTFT    TPOT      Tok/s   Tok/s/User
+                 (req/s)      (ms)      (ms)    (ms)
+  B ours + PM4     1.52        656      ~100    4.37       976      195
+  C ours AQL       1.39        719      ~101    4.87       890      178
+  D stock 7.2      1.39        720      ~101    4.87       889      178
+  A develop        1.39        721      ~102    4.87       887      178
+
+What it shows:
+- Our PM4 path is the ONLY stack that speeds up decode: TPOT 4.87 -> 4.37 ms
+  (-10.3%), Tok/s 890 -> 976 (+9.7%), e2e latency 719 -> 656 ms (-8.8%). Submitting
+  the whole 24-layer decode graph as one PM4 IB per token removes the GPU-side
+  per-dispatch overhead that this report dissects on synthetic chains, and it
+  accumulates over the many small kernels per token.
+- develop, ours-AQL and stock 7.2 are indistinguishable (~4.87 ms TPOT). develop wins
+  the host-launch microbench (~1.2 us/launch, see pm4_gap/DEVELOP_VS_OURS_REPLAY.md),
+  but a decode token costs ~4870 us of GPU compute, so a few-us host-launch delta is
+  in the noise. develop's graph work (HW-signal pooling, doorbell de-dup) is host-side
+  and does not shrink the GPU per-token cost; the PM4 single-IB replay does.
+- TTFT is flat (~100 ms) -- prefill is one compute-bound pass, not graph-replay-bound.
+
+Raw output (all reps) + full reproduction (incl. how develop was built on this 7.2
+box): pm4_gap/gptoss_e2e.txt and pm4_gap/DEVELOP_VS_OURS_REPLAY.md.
+
+--------------------------------------------------------------------------------
+
 ## 7. Artifacts
 
 Benchmarks (in vk_gap_test/):
@@ -1600,6 +1658,8 @@ Benchmarks (in vk_gap_test/):
 - layer_revadd.comp (+ .spv)        -- Vulkan reverse-read shader for CHAIN=rev (section 6l)
   CHAIN=rev KLEN=64: 64-kernel reverse-read chain (ping-pong x<->y) across PM4/HIP/Vulkan
 - pm4_gap/gap_kernel.s              -- gfx1100 RAW-dependency shader (data[0]++ with glc flat access)
+- pm4_gap/gptoss_e2e.txt            -- raw gpt-oss-20b e2e decode numbers, all reps (section 6o)
+- pm4_gap/DEVELOP_VS_OURS_REPLAY.md -- develop-vs-ours host-launch sweep + model e2e + full develop build repro
 - pm4_gap/build.sh                  -- offline-assembles shader + builds pm4_gap (run in hipvk-isolated container)
   NOTE: links libhsakmt directly; uses kfdtest PM4 struct headers from
   rocm-systems/.../libhsakmt/tests/kfdtest/include. Run with /dev/kfd access.
