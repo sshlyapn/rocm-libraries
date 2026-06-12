@@ -2290,3 +2290,853 @@ REMAINING (still fallback, not faults):
   packets inside the AQL batch, and any non-gfx11/gfx12 ASIC.
 - gfx1201 runtime validation pending RDNA4 hardware.
 
+## Appendix C: Where PM4-graph actually helps (benefit sweep)
+
+Driver: pm4_gap/hip_pm4_sweep.cpp + run_pm4_sweep.sh (gfx1100, pinned
+profile_peak). A serially dependent chain of KPL=4 dispatches per layer is
+swept over three axes: per-kernel work size M, arithmetic intensity (mem-bound
+fma=0 / compute-bound fma=256 / LDS-reduction), and chain depth LAYERS. All
+configs are BIT-EXACT baseline vs PM4. Every line below is real measured data.
+
+KEY MODEL: the PM4-graph win is a roughly CONSTANT per-dispatch saving (lean
+raw-PM4 front end + overlapped AGENT cache fence), ~0.6-1.0 us/dispatch. So
+  speedup ~= saving / (saving + per_kernel_GPU_time)
+which is large only when the kernel is short, and vanishes as the kernel grows.
+
+Best speedup per regime (full table from run_pm4_sweep.sh):
+
+  regime                              M        L    speedup  saved us/disp
+  mem-bound,  deep chain, tiny K      <=65536  60   1.36-1.37x   ~0.95-1.0
+  lds/sync,   deep chain, tiny K      <=65536  60   1.18-1.20x   ~0.62-0.71
+  compute,    deep chain, tiny K      any      60   1.04-1.07x   ~0.6 (+overlap)
+  mem-bound,  large K (M=1M)          1048576  60   1.12x        ~1.0
+  any,        shallow chain           any      1    ~1.00x       ~0 (launch-bound)
+
+Three clear conclusions:
+1. Chain depth matters: L=1 is ~1.00x everywhere (host hipGraphLaunch floor
+   dominates 4 dispatches); the per-dispatch saving only shows once the chain
+   is long enough to amortize that floor (L=8 -> ~1.25x, L=60 -> ~1.37x mem).
+2. Kernel duration kills the win: holding the ~1us saving constant, raising M
+   from 256 to 1M on mem-bound drops 1.37x -> 1.12x. Compute-bound kernels keep
+   the CUs busy (little idle gap to overlap) so they sit at 1.04-1.08x; only
+   very long compute kernels recover ~7% from full fence overlap.
+3. LDS/sync kernels behave like memory-bound but slightly lower (wave-drain at
+   the barrier eats some of the overlap): peak 1.20x.
+
+This is exactly why 8B decode (Appendix B) is flat: its kernels are the
+large-M memory-bound GEMV / compute regime (~1.05-1.12x ceiling) AND each
+kernel runs for many us, so the fixed ~1us gap is a negligible fraction.
+
+SWEET SPOT for this technique: deep dependent chains (tens+ of dispatches) of
+SHORT kernels -- i.e. small models, speculative-decode draft models, tiny batch
+elementwise/norm chains, or any latency path where per-kernel GPU time is on
+the order of the ~1us inter-dispatch gap.
+
+### Measured: why 8B decode cannot reach "320 dispatches x 1us = 0.3ms"
+
+rocprofv3 --kernel-trace on the real Llama-3.1-8B decode graph (gfx1100),
+per steady-state decode token (queue 2, segmented by host gaps):
+- dispatches/token        : 203  (NOT 320; ~6-7 fused kernels/layer)
+- kernel duration buckets : <1us=0, 1-3us=83, 3-10us=33, 10-50us=65, >50us=22
+- median kernel duration  : 7.5us  (max 640us)
+- busy time in <3us kernels: 154us of 4832us = 3.2% of GPU busy/token
+- top time sinks: crystal_gemv_swiglu x20 ~1968us, gemv_q0 x40 ~1318us,
+  gemv_s0t x1 615us, gemv_q0_n32 x20 492us, attention x20 173us.
+  => ~97% of GPU time is long memory-bound weight-streaming GEMV.
+
+The ~1us PM4 saving is the NEXT dispatch's front-end + cache fence, exposed only
+when a kernel is shorter than that setup latency. Behind a 10-640us GEMV the CP
+sets up the next kernel in the shadow of execution -> 0 saved. So the realizable
+saving is bounded by the short-kernel transitions only: ~83 x ~1us = 80-150us,
+not 320us. The clean benchmark delta (9.56 -> 9.50 ms = ~60us) is CONSISTENT
+with that bound (within n=3 noise) -- the saving is real but ~1% and buried.
+The ~1ms/token of in-graph gap that does exist is mostly genuine RAW coherence
+drain between dependent GEMVs, which PWS does not remove (it overlaps only the
+cache-flush slice); reclaiming it needs fusion / independent-work overlap.
+
+### Measured: gpt-oss-20b (MoE) DOES show a repeatable win
+
+Same patched runtime, gfx1100, pinned profile_peak, utils/bench/benchmark.py
+-tp 1 -c 1 -i 512 -o 128 -g (greedy), 3 reps x n=10 requests.
+PM4 path engages cleanly: "PM4 graph: compiled 267 dispatches" once per token,
+NO fallback (MoE router + top-k + per-expert grouped GEMVs + norms all compiled
+into a single IB).
+
+  metric            baseline (3 reps)        PM4 graph (3 reps)
+  latency (ms)      920.6 / 929.2 / 931.0    903.9 / 905.1 / 907.8
+  Tok/s             695 / 689 / 687          708 / 707 / 705
+  Tok/s/User        139.0 / 137.7 / 137.5    141.6 / 141.4 / 141.0
+  ms/token          ~7.24                    ~7.08
+
+=> consistent +2.4% throughput, ~21ms latency reduction over 128 tokens
+(~0.16 ms/token). Bands do not overlap (baseline max 695 < PM4 min 705 tok/s),
+so it is signal, not noise.
+
+Why 20b-MoE beats dense 8B (which was flat): MoE adds many SHORT kernels per
+token (router, top-k gating, expert scatter/gather, per-expert grouped GEMVs
+that are smaller than a dense 4096x14336 GEMV, extra elementwise). More short
+gap-exposed transitions -> more of the ~1us per-dispatch saving is realized.
+Effective saving ~= 0.16ms / 267 dispatches ~= 0.6 us/dispatch, exactly the
+sweep's measured per-dispatch gap applied across a larger short-kernel fraction.
+
+### Measured: GPU-busy sum per token vs benchmark ms/token (gpt-oss-20b)
+
+rocprofv3 --kernel-trace on the gpt-oss-20b decode (gfx1100, pinned). Two
+caveats that dictate the method:
+  (a) kernel-trace SERIALIZES dispatches, inflating the per-token WALL ~2x
+      (15.2 ms traced vs 7.24 ms clean) -- so trace wall/gaps are NOT
+      comparable to the benchmark; but each kernel's DURATION is a HW
+      timestamp and stays accurate, so GPU BUSY (sum of durations) is valid.
+  (b) in PM4 mode the 267 in-IB kernels are not individually hooked
+      (trace sees 4574 disp for 40 tok vs 15448 for 24 tok baseline), so PM4
+      busy cannot be summed from a kernel trace -- but it is the SAME kernels,
+      so busy is unchanged; the benchmark wall delta is the real PM4 saving.
+
+Baseline, 45 clean steady decode tokens (311 dispatches/token), summing the
+HW-accurate kernel durations:
+  GPU busy summed over 45 iters : 225.35 ms
+  GPU busy / token (median)     : 4.939 ms
+  benchmark wall / token (clean): 7.240 ms
+  => GPU compute  = 4.94 ms/token = 68% of TPOT
+  => host+launch+inter-kernel idle = 2.30 ms/token = 32% of TPOT
+
+This pins down exactly where PM4 acts: it does NOT touch the 4.94 ms of compute,
+it trims the 2.30 ms idle budget. The measured 7.24 -> 7.08 ms (-0.16 ms/token)
+PM4 win is ~7% of that 2.30 ms idle, consistent with shaving the per-dispatch
+front-end+fence off the short-kernel transitions. It also explains the ceiling:
+even eliminating ALL inter-kernel idle caps the win at ~2.3 ms/token (32%), and
+the realizable part (short-kernel transitions only) is a small slice of that.
+
+### Measured: clean TPOT with REDLINE_DEBUG_SKIP_SAMPLING (no freq pinning)
+
+The 2.30 ms "idle" above was dominated by host SAMPLING per token. Re-running
+with REDLINE_DEBUG_SKIP_SAMPLING=1 (model-offline-benchmarking skill, gfx1100,
+NOT pinned, -i512 -o128 -c1 -s --no-cache -n10, 3 reps) removes that fixed cost
+and exposes the GPU-side launch/fence gaps PM4 actually targets:
+
+  metric        baseline (3 reps)     PM4 graph (3 reps)
+  TPOT (ms)     5.21 / 5.22 / 5.21    4.97 / 4.98 / 4.96
+  Tok/s/User    166.1 / 165.8 / 166.3 172.9 / 172.6 / 173.4
+
+=> +4.6% TPOT (-0.24 ms/token), bands fully separated (base min 5.21 > PM4 max
+4.98). NB the win is a LARGER fraction than the +2.4% with sampling: the ~0.24ms
+absolute saving is ~constant, but removing the ~2ms sampling cost shrinks the
+denominator (7.24 -> 5.21), so the same saving shows as a bigger percentage.
+
+Native-trace busy decomposition (REDLINE_DEBUG_COLLECT_TRACES, iter_marker per
+token; HW kernel durations, no rocprof serialization inflation):
+  BASELINE: ~286 GPU ops/token, GPU busy = 4.44 ms = 85% of the 5.21 ms TPOT;
+            inter-kernel idle + launch = 0.77 ms = 15%.
+  per-layer (~155 us): MoE GEMMs dominate (swiglu 63.9us=40% + grouped 33us=21%
+            = 61%); short kernels rmsnorm 1.6us, rope 1.7us, router 6.2us,
+            w0 gemv 3.3us, unpermute 2us; decode lm_head 675us.
+
+PM4 trims the 0.77 ms idle budget by 0.24 ms = ~31% of it; the 4.44 ms of
+compute is untouched. IMPORTANT measurement note: PM4's in-IB kernels are
+invisible to BOTH rocprofv3 AND the native tracer (only ~19 ops/token are seen
+vs 286 baseline, because the 267 kernels are replayed from one indirect buffer),
+so PM4 GPU-busy cannot be summed from any kernel trace -- the kernels are
+identical to baseline, so busy is unchanged, and the clean TPOT (4.97 ms) is the
+ground-truth measurement of the PM4 path.
+
+--------------------------------------------------------------------------------
+
+## Appendix D: Anatomy of the inter-kernel gap (for newcomers)
+
+This section explains, in plain terms, WHERE the ~2.0 us per-transition gap in
+the PM4-graph path goes, what every acronym means, and whether the host (CPU) is
+involved. Target reader: someone new to GPU command processing.
+
+### D.0 Hardware vocabulary (all on-GPU blocks unless stated)
+
+- HOST / CPU: the x86 processor running the application. It talks to the GPU by
+  writing command packets into a QUEUE (a ring buffer in memory) and ringing a
+  DOORBELL (a memory-mapped register) to tell the GPU "new work is ready".
+- CP (Command Processor): a small processor ON the GPU that reads command
+  packets from the queue and drives everything else. It has sub-engines:
+    * PFP (Pre-Fetch Parser) and ME (Micro Engine) -- graphics front-end;
+    * MEC (Micro Engine, Compute) / ACE (Asynchronous Compute Engine) -- the
+      compute-queue front-end. HSA/HIP compute dispatches are serviced here.
+  The CP is the "front-end" of the GPU: it does setup and scheduling, it does
+  NOT run your kernel math.
+- PM4: the binary command-packet format the CP understands (e.g. SET_SH_REG,
+  DISPATCH_DIRECT, ACQUIRE_MEM). "Raw PM4" = we hand-build these packets; AQL is
+  a higher-level packet that the runtime/CP translates down to PM4.
+- IB (Indirect Buffer): a block of PM4 packets in memory that the CP jumps into
+  and executes, like a subroutine. Our whole decode token is ONE IB.
+- SH registers ("SH" = SHader): the hardware config registers that describe the
+  next dispatch -- COMPUTE_PGM_LO/HI (address of the kernel machine code),
+  COMPUTE_PGM_RSRC1/2 (how many VGPRs/SGPRs/how much LDS the kernel needs),
+  COMPUTE_START / NUM_THREAD (grid and workgroup dimensions), and USER_DATA
+  (small values handed to the kernel in registers -- for HIP, the pointer to the
+  kernel argument block, "kernarg"). Written with the SET_SH_REG packet.
+- SPI (Shader Processor Input): the hardware workgroup/wave LAUNCHER. After the
+  CP issues DISPATCH_DIRECT, the SPI allocates VGPR/SGPR/LDS on the compute units
+  and physically starts the wavefronts.
+- WGP / CU / wave: a Wave is a group of 32 (wave32) or 64 (wave64) threads that
+  execute together. A CU (Compute Unit) runs waves; RDNA pairs 2 CUs into a WGP
+  (WorkGroup Processor). gfx1100 (W7900) has 48 WGPs.
+- Caches (RDNA3): L0 (per-CU vector cache), L1 (per-shader-array), L2 / GL2
+  (device-wide, the coherence point), plus a scalar "K" cache (constants/scalar
+  loads) and an instruction cache, all per-CU. L0/L1/K are NOT coherent across
+  CUs by themselves, so a consumer kernel on a different CU must INVALIDATE them
+  to see a producer's fresh data.
+- GCR (Global Cache Rinse): the control field of an ACQUIRE_MEM/RELEASE_MEM
+  packet that selects which caches to write-back/invalidate. Bits: GLI
+  (instruction), GLK (scalar K), GLV (vector L0), GL1, GL2, GLM (metadata).
+  "0x380" = a full safe set incl. GLK_INV; "AGENT scope" = invalidate L0/L1/K
+  but do NOT touch L2 (producer and consumer already share L2 on one GPU).
+- EOP (End Of Pipe): "the moment the pipeline has fully finished a dispatch".
+- PWS (Pre-shader Wait Sync, a GFX11 feature): lets the CP ISSUE a cache flush
+  asynchronously (RELEASE_MEM, bumps a counter) and WAIT for it later
+  (ACQUIRE_MEM on that counter), so the flush OVERLAPS the next dispatch instead
+  of stalling the queue.
+
+### D.1 What is the "front-end" (~0.5 us)?
+
+For every kernel the CP must, before any math runs, walk these PM4 packets in
+the IB and act on them:
+  - ~7x SET_SH_REG  -> write the kernel's code address, resource sizes, grid
+                       dimensions, and kernarg pointer into SH registers;
+  - 1x DISPATCH_DIRECT -> tell the SPI "launch this grid now".
+This is pure CP work (decode packet, write register, repeat) plus handing the
+launch to the SPI. It is the GPU's command FRONT-END (setup/scheduling), as
+opposed to the BACK-END (the shader cores running your code). For our packet
+count it is ~0.5 us. It is 100% on-GPU; the host is not involved (the packets
+were already written into the IB once, at capture time).
+
+### D.2 Why is "wave drain" counted separately? Isn't it part of the kernel?
+
+Good and subtle. Two different things are being measured:
+
+- KERNEL DURATION (the "busy 4.44 ms" number) is measured from the first wave
+  starting to the last wave ending, per dispatch. So yes -- "kernel finished"
+  means "its waves drained", and that time is already inside the kernel's
+  duration.
+
+- WAVE DRAIN as a separate gap term is about OVERLAP, not double-counting. The
+  CP normally PIPELINES: while kernel N's waves are still running, the CP can
+  already process kernel N+1's SET_SH_REG packets and even start N+1's waves --
+  IF there is no dependency. CS_PARTIAL_FLUSH (the "wave drain" packet) forces
+  the CP to STOP and wait until all of N's compute waves have retired before
+  continuing. So it FORBIDS the overlap.
+  In a throughput microbenchmark of tiny INDEPENDENT kernels, adding the drain
+  makes the per-dispatch period grow by ~0.5 us -- that is the overlap you lose,
+  i.e. the previously-hidden tiny KERNEL becoming exposed.
+
+CORRECTION (this supersedes the earlier "0.5 front-end + 0.5 drain + ..." split):
+the drain is NOT a separate additive term in the real DECODE gap. In decode the
+kernels are genuinely dependent, so N must finish before N+1 starts anyway, and
+N's full duration is ALREADY counted in "busy" (4.44 ms). By the time we measure
+the gap (N-end -> N+1-start), the drain has already completed -- it is what
+detected that N ended. The CP cannot run N+1's front-end DURING the drain (the
+CS_PARTIAL_FLUSH stalls the CP in packet order), so the front-end happens AFTER
+the drain, but the drain itself adds ~0 on top of N's already-counted completion.
+The microbench's "+0.5 us drain" was a TINY kernel being exposed; in real decode
+that exposure is the BUSY time, not the gap.
+
+So the honest real-decode per-transition GAP (~2.0 us) decomposes as:
+  front-end (~0.5 us)  +  launch latency (~few hundred ns)  +  residual fence
+  (~0.5-1.0 us). The drain is the hard ordering BOUNDARY, not an added cost.
+
+### D.3 What is "residual fence" and "launch latency"? (~0.5-1.0 us)
+
+- RESIDUAL FENCE: between two dependent kernels we must (a) make N's writes
+  visible at the shared L2, and (b) invalidate N+1's stale L0/L1/scalar caches so
+  it re-reads fresh data. We do this with a PWS pair (RELEASE_MEM issues the
+  cache rinse asynchronously + ACQUIRE_MEM waits a counter). PWS OVERLAPS most of
+  this with the next dispatch, but the ACQUIRE_MEM still has to confirm the
+  counter reached its target before N+1's memory reads may proceed. That small
+  non-overlapped confirmation (plus the per-CU L0/L1/K invalidate latency that is
+  not fully hidden) is the "residual" -- roughly 0.3-0.5 us.
+- LAUNCH LATENCY: after DISPATCH_DIRECT, the SPI must allocate registers and LDS
+  on the CUs, distribute the workgroups across the 48 WGPs, and fill the
+  pipeline until the first instructions actually execute (and there is a small
+  tail at the end as the last wave winds down). For the tiny grids in decode this
+  is a largely FIXED hardware latency, on the order of a few hundred ns, that you
+  cannot program away. It is on-GPU (SPI hardware).
+
+### D.4 Is ANY of this host (CPU) work? -- No (in graph / PM4-IB mode)
+
+In hipGraph / PM4-graph replay the ENTIRE decode token is one IB submitted to the
+queue ONCE. The CP then walks the whole IB -- every SET_SH_REG, DISPATCH_DIRECT,
+drain, and fence -- entirely on the GPU, with NO per-kernel host involvement. The
+host's only per-token interaction is: submit the IB (one packet), wait for the
+final completion signal, then run sampling on the CPU. So the ~2.0 us
+per-transition gap is 100% GPU-side (CP + SPI + cache hardware); the host is idle
+during it.
+(For contrast, in EAGER mode -- no graph -- the host builds and enqueues a fresh
+packet for every kernel, which is real CPU work per kernel. Section 5.1 showed
+even that is not the bottleneck on this path, but graph/PM4-IB removes it
+entirely. This is exactly why a recorded command stream helps.)
+
+### D.5 Reconciling "Vulkan is faster" vs "Vulkan is slower than HIP here"
+
+Both statements are true; they measure different HIP paths and workloads.
+
+- "VULKAN FASTER" (the common case): compared against the STOCK HIP runtime with
+  its DEFAULT per-dispatch AGENT cache fence, on small kernels, Vulkan wins
+  (section 6b: HIP default 7.94 us vs VK 4.96 us per dispatch). Reason: stock HIP
+  SERIALIZES its fence (a fixed ~5.8 us CP round-trip), while Vulkan OVERLAPS its
+  flush into the dispatch window via PWS.
+  RETRACTION: an earlier version of this section also claimed the llama.cpp
+  Vulkan backend "uses fewer/fused kernels". That was an UNVERIFIED assumption and
+  is withdrawn -- no evidence was collected for it, and the kernel structure may
+  match the HIP backend. Do not rely on it. The only verified "VK faster" result
+  is the single-kernel pinned gap microbench vs STOCK-DEFAULT HIP (below).
+
+- "VULKAN SLOWER" (the isolated decode-layer microbench, section 6n.3): there the
+  comparands were HIP EAGER, HIP GRAPH, and our PM4 PWS -- all leaner than stock
+  default. At realistic decode kernel sizes (M >= 16384), Vulkan pays two costs
+  every dispatch that those paths do not: (1) a FULL L2 write-back+invalidate on
+  every barrier (heavier cache work, scales with dirtied bytes), and (2)
+  vkCmdBindPipeline -- re-emitting compute pipeline STATE every dispatch (~0.6 us;
+  HIP has no pipeline-state object). Those add up, so HIP eager (lighter AGENT
+  fence, no rebind) and especially PM4 PWS (lean front-end + overlapped AGENT
+  fence) come out ahead: PM4 PWS 742.9 vs VK 1359.7 us/token at M=16384.
+
+There is NO contradiction: Vulkan beats the STOCK HIP default on the single-kernel
+gap microbench; but in the decode-layer chain microbench, once HIP's specific
+inefficiency (the serialized AGENT fence) is removed -- which is what the PM4 PWS
+path does -- HIP/PM4 matches or beats Vulkan. Vulkan has no extra gap-hiding trick
+we are missing; its mechanism (overlapped flush) is the one we already replicate,
+and it additionally carries a per-dispatch pipeline rebind we do not.
+IMPORTANT CAVEATS / honesty flags:
+- The recent gpt-oss e2e tests did NOT involve Vulkan at all -- they compared HIP
+  PM4-graph vs HIP baseline (both HIP). "We don't see VK in recent tests" because
+  VK was not run there; VK only appears in the standalone gap microbenches.
+- The factor-2 spread in "default/eager HIP" between the single-kernel gap test
+  (7.94 us/disp) and the decode-layer chain (3.94 us/disp at M=16384) is NOT
+  fully explained (kernel size hiding the fence is the likely cause, but it was
+  not isolated). Treat absolute cross-config numbers as approximate.
+- Absolute cross-API deltas at the ~1 us scale are near this environment's clock
+  noise and are not claimed to sub-microsecond precision.
+
+### D.6 So why is 2.0 us hard to beat, and what actually removes it?
+
+The ~2.0 us is mostly the FLOOR of the serial dependent-dispatch model: set up
+the next kernel (front-end ~0.5 us) + spin its waves up (launch latency) + the
+not-fully-overlapped cache invalidate (residual fence ~0.5-1.0 us). (The drain is
+the ordering boundary, already accounted in busy -- see D.2 correction, not a
+separate term.) The big cache cost is already hidden by PWS. The per-dispatch
+micro-levers (skip redundant register writes; elide fences on independent edges)
+barely apply to decode because (a) consecutive kernels are almost always DIFFERENT
+kernels and (b) the decode dependency chain is nearly linear (every kernel reads
+the prior).
+
+The only ways to make a large dent are STRUCTURAL -- reduce the NUMBER of
+transitions, not the cost of each:
+  1. KERNEL FUSION: fold adjacent ops into one kernel (rmsnorm+residual into the
+     next GEMV, rope into qkv, the small elementwise ops into their neighbour).
+     Each fused pair deletes a whole ~2 us transition. Highest-value lever, and it
+     applies to ANY backend (HIP or Vulkan) -- it is a kernel-count reduction, not
+     a Vulkan-specific feature. (No claim is made here about whether llama.cpp's
+     Vulkan backend fuses more than its HIP backend; that was not verified.)
+  2. PERSISTENT / MEGAKERNEL decode: one long-lived kernel that loops over the
+     whole layer (or token) internally, keeping data in registers/LDS and never
+     returning to the CP between ops -> zero inter-kernel gaps. Largest
+     engineering effort, lowest theoretical floor.
+  3. LARGER BATCH (throughput regime only): bigger kernels make the fixed ~2 us
+     gap a negligible fraction. Does not help single-stream batch-1 latency.
+Per-dispatch tweaks (register-reuse, fence elision, lighter GCR) are at most a
+few percent here; fusion/megakernel are the real answers.
+
+### D.7 RUNTIME-level levers (no kernel fusion / no megakernel)
+
+How the stock runtime picks per-dispatch behavior (rocvirtual.cpp) -- CORRECTED:
+- KEY FACT (rocvirtual.cpp:2270-2273): BOTH header variants carry AGENT
+  acquire/release scope. dispatchPacketHeaderNoSync_ = kernelDispatchHBits |
+  agentScopeHBits; dispatchPacketHeader_ = the same PLUS barrierHBits. The ONLY
+  difference is the AQL BARRIER bit. So the cache fence SCOPE is AGENT on EVERY
+  dispatch unconditionally (when fenceScopeAgent_, the default on gfx11/gfx12).
+- MemoryDependency::validate (rocvirtual.cpp:345-389): for each kernel-argument
+  buffer it checks whether [start,end) OVERLAPS a buffer already WRITTEN by a
+  prior kernel (and not both read-only). On overlap (or on hitting the tracked-
+  object limit) it sets the SYNC header (dispatchPacketHeader_) = AGENT scope WITH
+  the barrier bit (CP WAITS for the prior dispatch to retire). With NO overlap it
+  keeps NoSync = AGENT scope WITHOUT the barrier bit (CP may PIPELINE). It does
+  NOT switch to NONE scope. So the overlap check controls ORDERING (barrier),
+  NOT whether a cache fence happens.
+- SYSTEM scope (rocvirtual.cpp:1124-1135 coalescing, headers at :2257-2263):
+  escalated only when the dispatch touches FINE-GRAINED / host-coherent SVM (so
+  the CPU/peer sees the writes -> L2 flush) or at the batch tail. Plain device-
+  local kernel->kernel stays AGENT; HIP skips the host cache-coherency layer
+  (:772-773).
+  So the CORRECT runtime rule is: AGENT scope ALWAYS, barrier bit ON for device
+  RAW/WAR/WAW edges (and OFF for independent edges), SYSTEM only for host-coherent
+  visibility. There is NO "NONE / no-fence" production path (NONE is only the
+  GAP_NOSCOPE env test override at :2294).
+
+What OUR PM4 graph does instead (buildPm4GraphIb): it emits an AGENT PWS fence
++ a CS_PARTIAL_FLUSH drain between EVERY dispatch (rocvirtual.cpp:2036-2039) plus
+a full-L2 acquire at the leading/trailing token boundary (:1935,:2043). Because
+the runtime ALSO applies AGENT scope to every dispatch, we are NOT cache-scope
+over-fencing -- we MATCH the runtime's cache behavior. The only difference is
+that we ALWAYS drain/serialize (equivalent to the barrier bit being ON on every
+edge), whereas the runtime would clear the barrier bit on INDEPENDENT edges. For
+a strictly LINEAR decode chain every edge is a true RAW, so the runtime would set
+the barrier bit anyway -> we are equivalent there. We only "over-serialize" where
+the graph actually has independent dispatches (which decode does not).
+
+Runtime levers that apply to a strictly LINEAR decode chain, ranked:
+  1. IB REORDER -- hoist kernel N+1's SET_SH_REG ahead of N's drain/fence, so the
+     CP programs N+1's registers WHILE N's waves run (CP is idle then), hiding the
+     ~0.5 us front-end. N+1's DISPATCH_DIRECT still waits behind the fence;
+     registers are latched at DISPATCH so this does NOT affect the running N.
+     Pure IB-builder change, low risk, UNTESTED -- the most promising lever for a
+     linear chain. (Current order is [setsh N][dispatch N][drain][fence][setsh
+     N+1]..., so N+1 setup is serialized in the gap instead of overlapped.)
+     REFINEMENT: place the register setup BETWEEN release and acquire, i.e.
+     [dispatch N][drain N][releaseMemPws N (async flush)][setsh N+1][acquirePws N]
+     [dispatch N+1]. Then N+1's programming overlaps BOTH the CP-idle window AND
+     the cache-flush tail -> attacks front-end AND residual-fence together. KEEP
+     for experiment after the register-delta lever (D.8) lands (it removes most of
+     the SET_SH_REG payload that this reorder hides).
+  2. REGISTER DELTA-ENCODING (NEW, SAFE) -- see D.8. Hoist the IB-constant
+     registers out of the per-dispatch loop and delta-encode the block-dims block.
+     Deterministic, bit-exact, no correctness risk. Cuts the per-dispatch
+     SET_SH_REG payload ~3x. Highest-confidence runtime lever for linear decode.
+  3. PER-EDGE GCR MINIMIZATION (RISKY) -- e.g. drop GLK_INV (bit 7) from the AGENT
+     mask (0x380 -> 0x300) when the consumer does no SCALAR loads of the producer
+     output. GLK is ALREADY PWS-overlapped, so it has only a small residual TAIL
+     (6m.4/6n.1); the upside is small and it is NOT provably safe (the compiler can
+     scalarize uniform loads), which is exactly why 6m.2 flagged the 0x300 path as
+     "fastest but compiler-ABI-specific / unsafe." NOT recommended without per-
+     kernel-pair ISA inspection + bit-exact validation. NOTE: GLI_INV (instruction
+     cache, bit 0) is NOT in the per-edge mask at all -- it is only in the boundary
+     full-L2 fence -- so there is NO per-edge I-cache opportunity to chase.
+
+DROPPED for this workload (recorded so we do not revisit):
+  - DEPENDENCY-AWARE FENCE ELISION -- the runtime only elides the BARRIER bit on
+    independent edges (not the cache scope; see the CORRECTED rule above). Decode
+    is fully linear-dependent (every kernel reads the prior), experts/projections
+    are all fused, so there are NO independent edges to elide. Zero benefit here.
+  - MULTI-QUEUE (async compute) -- needs graph parallelism that linear decode does
+    not have.
+
+HONEST CEILING: for a strictly linear dependent chain, the safe runtime levers
+(#1 reorder + #2 register-delta) can plausibly shave the ~2.0 us toward
+~1.2-1.5 us, NOT to zero. Getting near zero needs fewer kernels
+(fusion/megakernel), which is out of scope here.
+
+### D.8 Register delta-encoding -- per-dispatch SET_SH_REG audit (gfx11/gfx12)
+
+What buildPm4GraphIb emits PER DISPATCH today (rocvirtual.cpp:1975-2028), with
+which fields are IB-constant vs per-kernel:
+
+  setsh(kRegStartX, dims, 8)   8 regs: START_X/Y/Z (always 0,0,0) +
+                               NUM_THREAD_X/Y/Z (block dims) + 2 pad. CONSTANT
+                               unless workgroup_size changes -> DELTA-ENCODE.
+  setsh(kRegPgmLo, 2)          PGM_LO/HI (code entry). Per-kernel -> ALWAYS.
+  setsh(kRegScratchLo, 2)      scratch base (only if needsScratch). IB-CONSTANT.
+  setsh(kRegRsrc1, 2)          RSRC1 + RSRC2 (RSRC2[23:15] = LDS size). Per-kernel
+                               (code resources AND LDS live here) -> ALWAYS.
+  setsh(kRegResLim, 1)         always 0. IB-CONSTANT -> emit once.
+  setsh(kRegTmpring, 1)        0 or the queue's fixed scratch ring. IB-CONSTANT.
+  setsh(kRegUserD0, u)         user SGPRs, enable-bit order. SPLIT THIS:
+                                 - scratch V# (4 regs)  IB-CONSTANT
+                                 - queue_ptr  (2 regs)  IB-CONSTANT (same queue)
+                                 - kernarg    (2 regs)  per-dispatch -> ALWAYS
+  DISPATCH_DIRECT (5 dw)       grid_size_x/y/z live HERE, not in a register. LDS
+                               is NOT here (it is RSRC2). Per-dispatch, cheap.
+
+So of the ~16-18 register dwords / ~7 SET_SH_REG packets emitted per dispatch:
+  - IB-CONSTANT (emit ONCE before the chain): RESLIM(1), TMPRING(1), scratch
+    base(2), UserD0 scratch V#(4), UserD0 queue_ptr(2) = 10 regs.
+  - DELTA (re-emit only on change): kRegStartX block(8) = START offsets + block
+    dims; block dims are stable across most consecutive decode kernels.
+  - TRULY PER-KERNEL (always): PGM(2), RSRC1/2 incl LDS(2), kernarg(2) = 6 regs.
+
+Plan: emit the 10 IB-constant regs once at the top of the IB; track a "previous
+workgroup_size" and re-emit kRegStartX only when it changes; per dispatch emit
+only PGM, RSRC1/2, and the kernarg SUB-RANGE of UserD0 (SET_SH_REG can start at
+any offset, so write just the 2 kernarg regs at their computed offset). When
+block size is stable this is ~6 reg-dwords across ~3 packets/dispatch instead of
+~16-18 across ~7 -> ~3x less front-end payload (which scales with reg-write +
+packet count).
+
+Correctness notes:
+  - SH registers PERSIST across the PWS drain/fence packets (CS_PARTIAL_FLUSH,
+    RELEASE_MEM, ACQUIRE_MEM do not touch SH state), so once-emitted IB-constants
+    stay latched for the whole IB.
+  - RSRC2 carries LDS_SIZE, so RSRC must stay per-kernel (LDS varies per kernel).
+  - Grid is in the DISPATCH packet, so it is naturally per-dispatch with no register
+    write to save.
+  - Must compute a per-field dirty flag against the previous dispatch and re-emit
+    on ANY change; only the block-dims block benefits from dirty-tracking (the
+    others are either always-changing or never-changing).
+
+This is bit-exact with the current emitter for identical inputs (same registers
+end up latched at each DISPATCH), so it is validated by the existing bit-exact
+test matrix (Appendix B) plus the e2e flywheel logits check.
+
+### D.9 Q1 correction summary (scope is NOT chosen by the overlap check)
+
+Earlier text implied the runtime selects NONE / AGENT / SYSTEM per dispatch from
+the MemoryDependency overlap result. That was WRONG. Audited
+(rocvirtual.cpp:2270-2273): both header variants carry AGENT acquire/release; the
+overlap check toggles ONLY the AQL barrier (ordering) bit. AGENT cache scope is
+applied to EVERY dispatch unconditionally; SYSTEM is a separate host-coherence
+escalation. Therefore our unconditional AGENT PM4 fence MATCHES the runtime's
+cache behavior (not over-fencing on scope); we differ only by always-draining,
+which for a linear decode chain is exactly what the runtime's barrier bit would
+do anyway. See the CORRECTED rule in D.7.
+
+## Appendix D-impl: Implementation plan for the two SAFE runtime levers
+
+This is the concrete plan for (1) register delta-encoding and (2) IB-reorder with
+the release/acquire interleave, plus the shared test/verification plan. Both are
+pure buildPm4GraphIb (rocvirtual.cpp) changes; neither touches kernels, the ABI,
+or the cache-fence SCOPE. Both are gated behind opt-in env flags until validated.
+
+### D.10 Register delta-encoding -- per-register plan
+
+#### D.10.0 The core invariant (WHY it is provably safe)
+
+COMPUTE_* shadow (SH) registers are STICKY: a SET_SH_REG write persists until the
+next write to that register. The drain/fence packets we insert between dispatches
+(CS_PARTIAL_FLUSH, RELEASE_MEM, ACQUIRE_MEM) do NOT touch SH state. Therefore, if
+the value we would write to a register already equals what is latched there, we
+can SKIP the SET_SH_REG and the latched state at the consuming DISPATCH is
+BIT-IDENTICAL to the baseline (always-emit) builder.
+
+Mechanism: keep a build-time SHADOW of the last value emitted for each register
+group. For each dispatch, compare the would-be value against the shadow and emit
+ONLY the changed groups; update the shadow. The shadow starts INVALID, so the
+FIRST dispatch in the IB emits every group (re-establishes known state regardless
+of what the queue held before this IB -- important because the IB is cached and
+replayed). This makes the optimization independent of pre-IB register state.
+
+The decision is made at IB BUILD time over the captured packet sequence; the
+built IB is static bytes replayed as-is. Because dispatch 0 always re-emits
+everything, every later delta is valid on every replay.
+
+#### D.10.1 Register-by-register (addresses from rocvirtual.cpp:1759-1765)
+
+1. kRegStartX = 0x2e04, 8 dwords: COMPUTE_START_X/Y/Z + NUM_THREAD_X/Y/Z + 2 tail.
+   - Source: dims[8] = {0,0,0, workgroup_size_x, workgroup_size_y,
+     workgroup_size_z, 0,0} (rocvirtual.cpp:1975-1977).
+   - START_X/Y/Z are ALWAYS 0 (grid offsets); the trailing 2 are ALWAYS 0; only
+     NUM_THREAD_X/Y/Z (the BLOCK dims) can vary.
+   - CLASS: DELTA. Re-emit the whole 8-dword block only when workgroup_size
+     changes. In decode the block size is stable across long runs of consecutive
+     kernels (e.g. a fixed 256-thread block), so this is skipped most of the time.
+   - WHY SAFE: if block dims are unchanged, NUM_THREAD already holds them and the
+     zeros are already latched -> skipping leaves identical state.
+
+2. kRegPgmLo = 0x2e0c, 2 dwords: COMPUTE_PGM_LO/HI (code entry >> 8).
+   - Source: (kernel_object + kernel_code_entry_byte_offset) >> 8
+     (rocvirtual.cpp:1978-1980).
+   - CLASS: DELTA, but effectively ALWAYS for decode (consecutive kernels are
+     different code). Skipped only when the SAME kernel runs back-to-back.
+   - WHY SAFE: trivially, different code => different value => emitted.
+
+3. kRegScratchLo = 0x2e10, 2 dwords: COMPUTE_DISPATCH_SCRATCH_BASE_LO/HI.
+   - Source: queueScratchBase >> 8 (rocvirtual.cpp:1984-1986), only when
+     needsScratch. queueScratchBase = aq->scratch_backing_memory_location, fixed
+     for the queue.
+   - CLASS: DELTA -> effectively ONCE (emitted on the first scratch-using kernel,
+     skipped thereafter). Non-scratch kernels do not touch it.
+   - WHY SAFE: same queue => same scratch base for the whole IB.
+
+4. kRegRsrc1 = 0x2e12, 2 dwords: COMPUTE_PGM_RSRC1 + COMPUTE_PGM_RSRC2.
+   - Source: rsrc[2] = {compute_pgm_rsrc1, rsrc2-with-LDS} (rocvirtual.cpp:
+     2002-2004). RSRC2[23:15] carries the LDS size (recomputed from
+     group_segment_size).
+   - CLASS: DELTA, effectively ALWAYS for decode (VGPR/SGPR/float-mode AND LDS
+     differ per kernel). MUST stay per-kernel because LDS lives here.
+   - WHY SAFE: different resources/LDS => different value => emitted.
+
+5. kRegResLim = 0x2e15, 1 dword: COMPUTE_RESOURCE_LIMITS.
+   - Source: always 0 (rocvirtual.cpp:2005-2006).
+   - CLASS: DELTA -> ONCE (emitted on dispatch 0, skipped forever after).
+   - WHY SAFE: value never changes within an IB.
+
+6. kRegTmpring = 0x2e18, 1 dword: COMPUTE_TMPRING_SIZE.
+   - Source: 0 (no scratch) or aq->compute_tmpring_size (rocvirtual.cpp:2007).
+   - CLASS: DELTA -> at most TWO distinct values in an IB (0 and the queue ring),
+     so emitted on the first kernel of each kind and skipped within runs.
+   - WHY SAFE: the ring size is fixed for the queue; toggling only between 0 and
+     that fixed value, both correctly shadowed.
+
+7. kRegUserD0 = 0x2e40, up to 8 dwords: COMPUTE_USER_DATA_0.. packed in
+   kernel_code_properties ENABLE-BIT order (rocvirtual.cpp:2009-2028):
+     [a] PRIVATE_SEGMENT_BUFFER -> scratch V# (4 dwords) from
+         aq->scratch_resource_descriptor. IB-CONSTANT.
+     [b] QUEUE_PTR -> gpu_queue_ pointer (2 dwords). IB-CONSTANT.
+     [c] KERNARG_SEGMENT_PTR -> p->kernarg_address (2 dwords). PER-DISPATCH.
+   - The enabled SET can differ kernel-to-kernel, so the LAYOUT (offset of the
+     kernarg sub-range) can change. Two sub-cases:
+       * LAYOUT UNCHANGED vs previous dispatch (same enable mask): the constant
+         prefix (scratch V#, queue_ptr) is already latched -> emit ONLY the
+         kernarg 2-dword sub-range, as a SET_SH_REG starting at
+         kRegUserD0 + kernarg_offset (kernarg_offset = (hasScratch?4:0) +
+         (hasQueue?2:0)). This is the common decode case.
+       * LAYOUT CHANGED (enable mask differs): the prefix may now mean different
+         registers -> re-emit the FULL udata[0..u] block for this dispatch.
+   - CLASS: SPLIT DELTA (constant prefix ONCE; kernarg ALWAYS; full re-emit on
+     layout change).
+   - WHY SAFE: SET_SH_REG can start at any register offset (rocvirtual.cpp:
+     1892-1896 writes reg-kShBase then cnt dwords), so writing only the kernarg
+     sub-range leaves the latched prefix intact; on layout change we fall back to
+     a full block so no stale prefix is reused.
+
+NOT a register (recorded so it is not "optimized" by mistake):
+   - grid_size_x/y/z live in the DISPATCH_DIRECT packet (rocvirtual.cpp:2031-2035),
+     not in SH registers. They are per-dispatch and cannot be delta-skipped (the
+     dispatch packet is mandatory). LDS is NOT here -- it is RSRC2[23:15].
+
+#### D.10.2 Expected per-dispatch payload (block size stable, scratch resident)
+
+  Baseline (always emit): StartX(8) + Pgm(2) + ScratchLo(2) + Rsrc(2) + ResLim(1)
+    + Tmpring(1) + UserD0(8) = 24 reg dwords across 7 SET_SH_REG packets.
+  Delta (steady state):    Pgm(2) + Rsrc(2) + kernarg(2) = 6 reg dwords across
+    3 SET_SH_REG packets. (StartX re-emitted only on a block-size change;
+    ScratchLo/ResLim/Tmpring/UserD0-prefix emitted once at the top.)
+  -> ~4x fewer register dwords and ~2.3x fewer SET_SH_REG packets per steady-state
+  dispatch. The front-end term scales with reg-write + packet count, so this
+  directly trims the ~0.5 us front-end.
+
+#### D.10.3 Code changes (buildPm4GraphIb)
+
+  - Add a small struct RegShadow { bool valid; uint32_t v[8]; } per group
+    (StartX, Pgm, ScratchLo, Rsrc, ResLim, Tmpring, UserD0) plus a stored
+    UserD0 enable-mask. Initialize all valid=false before the loop.
+  - Replace each direct setsh(...) with setshDelta(group, reg, vals, cnt): compares
+    vals against the shadow; emits SET_SH_REG only on mismatch (or shadow invalid);
+    updates shadow. For UserD0, compare the enable-mask first: if changed, emit
+    full and reset; else compare only the kernarg sub-range and emit it at its
+    offset.
+  - Gate the whole thing behind getenv("HIP_PM4_GRAPH_DELTA"); when unset, fall
+    back to the existing always-emit path byte-for-byte (so the current bit-exact
+    IB test still passes for the default path).
+
+### D.11 IB-reorder + release/acquire interleave -- plan
+
+#### D.11.1 Current order (per the loop, rocvirtual.cpp:1937-2044)
+
+  acquireFull(leading)                 once, full-L2 (graph inputs coherent)
+  for i in 0..N-1:
+    setsh(regs_i)                      front-end for kernel i
+    DISPATCH_DIRECT i
+    partialFlush                       drain i (wait i's waves done)
+    releaseMemPws(AGENT)               async flush i (PWS counter)
+    acquirePws                         wait flush i  <-- consumer i+1 blocked here
+  partialFlush; acquireFull(final)     full-L2 writeback (system-visible results)
+
+PROBLEM: regs_{i+1} (front-end) is emitted in the NEXT iteration, AFTER acquire_i.
+So the CP programs the next kernel's registers IN the gap, serialized; and the
+flush tail (acquire_i) is not overlapped with anything useful. Front-end and
+flush-tail are additive.
+
+#### D.11.2 Target order (reorder + interleave)
+
+  acquireFull(leading)
+  setsh(regs_0)                        program first kernel up front
+  DISPATCH_DIRECT 0
+  for i in 1..N-1:
+    partialFlush                       drain i-1 (i-1 waves done -> regs reusable)
+    releaseMemPws(AGENT)               async flush i-1 (PWS counter armed)
+    setsh(regs_i)                      <== program kernel i WHILE flush i-1 is in
+                                          flight AND the CP is otherwise idle
+    acquirePws                         wait flush i-1 counter
+    DISPATCH_DIRECT i                  coherent (caches done) + regs latched
+  partialFlush; acquireFull(final)     drain N-1 + full-L2 writeback
+
+EFFECT: kernel i's front-end (its SET_SH_REG burst) now overlaps BOTH the CP-idle
+window during i-1's drain AND the cache-flush tail between release_{i-1} and
+acquire_{i-1}. The only thing left strictly serial on the edge is the flush
+latency MINUS the front-end we just hid under it.
+
+#### D.11.3 Why each move is SAFE
+
+  - DRAIN STAYS FIRST on every edge: partialFlush for i-1 still precedes the
+    reprogramming of regs_i. Kernel i-1's waves are FULLY retired before we
+    overwrite any COMPUTE_* register, so we never corrupt an in-flight kernel.
+    (Registers latch at DISPATCH; i-1 already dispatched and is now drained.)
+  - ACQUIRE STAYS BEFORE THE CONSUMER DISPATCH: acquirePws for i-1 still precedes
+    DISPATCH_DIRECT i, so kernel i observes coherent memory (i-1's writes visible,
+    L0/L1/K invalidated) -- identical coherence to the current code.
+  - REGS BETWEEN RELEASE AND ACQUIRE ARE INDEPENDENT OF THE FLUSH: SET_SH_REG
+    writes CP/SH state; the PWS flush operates in the memory system. They do not
+    alias. dispatch_i, which consumes the registers, is emitted AFTER acquire, so
+    the registers are guaranteed latched and memory guaranteed coherent at launch.
+  - SAME FENCE COUNT/SCOPE PER EDGE: each internal edge still has exactly one
+    drain + one AGENT PWS release + one PWS acquire. Semantics per edge are
+    unchanged; only the POSITION of the register burst moved.
+  - OPTIONAL micro-opt (separate flag): the current code emits an AGENT
+    release/acquire AFTER the last dispatch AND THEN a full-L2 acquireFull -- the
+    trailing AGENT fence is redundant with the full fence (full-L2 invalidate
+    subsumes the AGENT invalidate; RDNA L0/L1 are write-through to L2 so the
+    writeback is covered by GL2_WB). The reorder structure drops this redundant
+    trailing AGENT fence naturally. Keep this behind its own sub-flag and validate
+    independently.
+
+#### D.11.4 Composition with delta-encoding
+
+In the reordered loop the "setsh(regs_i)" burst becomes the DELTA burst from D.10.
+They compose cleanly: delta decides WHICH groups to emit, reorder decides WHERE.
+Delta shrinks the burst that reorder hides, so after delta there is LESS front-end
+to overlap -- the two levers are complementary, not redundant (delta reduces the
+absolute work; reorder hides whatever remains under the flush tail).
+
+#### D.11.5 Code changes + flag
+
+  - Restructure the loop: emit dispatch 0's regs+dispatch before the loop; in the
+    loop body emit drain+release for the PREVIOUS kernel, then regs+acquire+dispatch
+    for the CURRENT kernel. Keep the per-segment compilation (G5) boundaries:
+    reorder applies WITHIN a contiguous dispatch segment; segment edges keep the
+    leading/trailing full fences as today.
+  - Gate behind getenv("HIP_PM4_GRAPH_REORDER"); default OFF (byte-exact baseline).
+  - Allow DELTA and REORDER to be enabled independently and together.
+
+### D.12 Test & verification plan (both levers)
+
+KEY POINT: both levers change the IB BYTES, so the existing "IB bit-exact vs the
+baseline emitter" check (Appendix B) is NOT the right gate for them -- it only
+guards the DEFAULT (flags-off) path, which must remain byte-identical. The levers
+are gated on RESULT bit-exactness plus a register-state invariant check.
+
+#### D.12.1 Invariant-level (cheapest, proves correctness of delta)
+
+  - Debug self-check in buildPm4GraphIb: maintain a parallel "reference" shadow
+    that records, for each DISPATCH, the FULL latched register state, computed two
+    ways -- (a) the baseline always-emit values, (b) the state implied by the
+    delta stream (apply only the emitted writes on top of the running shadow).
+    assert(a == b) at every DISPATCH. This proves the latched state at every launch
+    is identical to baseline. Compile-time/asserts only; no GPU needed.
+  - For reorder: assert the per-edge fence multiset (drain, release(scope),
+    acquire) is unchanged vs baseline, and that for every edge the order
+    drain -> (release) -> (regs) -> acquire -> dispatch holds.
+
+#### D.12.2 Result bit-exactness (the real gate) -- reuse Appendix B suite
+
+  Run the existing HIP test suite with each flag combination
+  (DELTA, REORDER, DELTA+REORDER) and compare OUTPUT buffers byte-for-byte against
+  the baseline AQL path. Cases (already in the suite, extend where noted):
+    - scratch on / off and the on<->off TRANSITION (exercises ScratchLo/Tmpring
+      delta + UserD0 layout change when KCP_PRIVATE_SEGMENT_BUFFER toggles).
+    - dispatch_ptr / queue_ptr variants (UserD0 layout changes -> full re-emit).
+    - wave32 and wave64.
+    - non-multiple grid (USE_THREAD_DIMS path).
+    - VARYING block size across consecutive kernels (NEW: exercises StartX delta
+      both skip and re-emit) -- add a chain that alternates 64 / 128 / 256 blocks.
+    - SAME kernel back-to-back (NEW: exercises Pgm/Rsrc SKIP).
+    - multi-kernel RAW chain (consumer reads producer) -- coherence across the
+      interleaved fence.
+    - the 64-kernel chain + REVERSE-READ kernel from section 6l: this is the
+      cache-coherence proof. If reorder mis-ordered any fence, the reverse-read
+      output corrupts. Run under DELTA, REORDER, and both.
+    - barrier-node graph, destroy+recreate, H2D-then-graph coherence.
+  Run on BOTH arches: gfx1100 (Navi31) and gfx1201 (Navi48).
+
+#### D.12.3 End-to-end model gate
+
+  - Capture the flywheel decode hipGraph; run HIP_PM4_GRAPH=1 with
+    {none, DELTA, REORDER, DELTA+REORDER} under PINNED clocks.
+  - ASSERT identical logits (bit-exact) vs the flags-off PM4 path AND vs the
+    baseline AQL path. Any logit drift => fail (a fence/register bug).
+
+#### D.12.4 Performance measurement (only after correctness passes)
+
+  - PINNED clock (profile_peak), GPUs per the project default; check amd-smi first.
+  - Use the NATIVE runtime trace (NOT rocprofv3 -- it inflates kernel timings) to
+    measure per-dispatch front-end and the inter-kernel gap.
+  - Report: per-dispatch SET_SH_REG dword/packet count (build-time, exact),
+    measured inter-kernel gap, and end-to-end TPOT delta for the 8B decode.
+  - Expected (hypothesis, to be confirmed): DELTA trims the front-end fraction;
+    REORDER hides the residual front-end under the flush tail; combined, the
+    ~2.0 us gap moves toward ~1.2-1.5 us on a linear chain. NOT to zero.
+
+#### D.12.5 Rollout
+
+  Phase 0  shadow/delta infra + flags, default OFF; D.12.1 asserts pass.
+  Phase 1  DELTA only: D.12.2 + D.12.3 bit-exact on gfx1100 + gfx1201; measure.
+  Phase 2  REORDER only, then DELTA+REORDER: same gates; run the 6l reverse-read
+           coherence proof explicitly.
+  Phase 3  optional trailing-AGENT-fence drop (own sub-flag); re-run coherence.
+  Phase 4  flip defaults ON only after bit-exact + perf-positive on both arches.
+
+### D.13 MEASURED results (gfx1100 W7900, implemented + validated)
+
+Both levers are implemented in buildPm4GraphIb (rocvirtual.cpp), gated by
+HIP_PM4_GRAPH_DELTA and HIP_PM4_GRAPH_REORDER, default OFF (flags-off path is
+byte-identical to the prior emitter). New env accessors pm4GraphDeltaEnabled() /
+pm4GraphReorderEnabled(). emitRegs() / emitDispatchPacket() split the per-dispatch
+work; setshDelta() does the minimal-dirty-range shadow emit.
+
+CORRECTNESS (hip_pm4_coverage.cpp, run_pm4_delta_reorder.sh) -- gfx1100, ALL
+scenarios bit-exact vs the baseline AQL path for pm4 / delta / reorder / both:
+  multi, nonmult, coherence, recreate, lds, wave64, barriernode, scratch, and a
+  NEW varblk scenario (alternating 64/128/256 block sizes + same-kernel repeats,
+  to exercise the StartX partial re-emit and the PGM/RSRC skip). Checksums
+  identical across all four flag combinations.
+  (gfx1201 RDNA4: code path is arch-parameterized and build-verified, but no RDNA4
+  hardware is present in this environment to run.)
+
+DELTA payload reduction (runtime "compiled N dispatches -> IB X dwords" log):
+  24-dispatch multi graph:  baseline 1242 dw -> delta 736 dw  (-41%).
+  Steady-state per dispatch: ~28 reg dwords / 6 SET_SH_REG packets ->
+  ~12 reg dwords / 3 packets (StartX/ResLim/Tmpring/scratch/queue_ptr hoisted;
+  only PGM, RSRC1/2, kernarg re-emitted because the multi kernels all differ).
+  REORDER drops exactly one trailing AGENT fence (1242 -> 1224 dw = 18 dwords =
+  one CS_PARTIAL_FLUSH + RELEASE_MEM + ACQUIRE_MEM), subsumed by the final full-L2
+  acquire -- confirms the elision is correct and accounted.
+
+MICROBENCH gap (hip_pws_test, dependent chain, pinned 1124 MHz, L=60, n=2000,
+us/dispatch; identical checksums):
+  M=1024    pm4 2.579  delta 2.388 (-7.4%)  reorder 2.578 (0%)  both 2.385
+  M=4096    pm4 2.594  delta 2.400 (-7.5%)  reorder 2.590 (0%)  both 2.397
+  M=65536   pm4 2.738  delta 2.547 (-7.0%)  reorder 2.735 (0%)  both 2.542
+  (AQL baseline for M=4096 was 3.597 us/dispatch; PM4 graph already cut that to
+  2.594; DELTA cuts a further ~0.19 us.)
+
+  KEY FINDING -- REORDER is NEUTRAL (within noise) at every kernel size. The
+  D.11 hypothesis (hide the front-end under the flush tail) does NOT hold on this
+  hardware: the CP micro-engine (ME) is a single in-order processor that handles
+  BOTH the SET_SH_REG writes AND the ACQUIRE_MEM wait, so moving the register
+  burst before the acquire only reorders serial ME work -- there is no second
+  engine to run it concurrently with the PWS wait. DELTA helps precisely because
+  it REDUCES the absolute amount of ME work (fewer dwords to fetch/decode/write),
+  which is directly on the critical path; REORDER does not reduce the work, so it
+  cannot help. (The PWS flush still overlaps the next dispatch's WAVE execution --
+  that win is already in the pm4 baseline -- but the register PROGRAMMING is ME
+  work either way.) Conclusion: keep DELTA; REORDER stays implemented + gated OFF
+  as a validated null result (no benefit, but bit-exact and harmless if enabled).
+
+E2E (gpt-oss-20b MoE, q0a, 512 in / 128 out, single W7900 gfx1100, patched lib via
+LD_LIBRARY_PATH, REDLINE_DEBUG_SKIP_SAMPLING=1, no clock pin, conc=1):
+  n=3 :  TPOT  baseline 5.17  -> pm4 4.91 (+5.0%) -> delta 4.86 ms (+6.4%/+1.0%)
+  n=10:  Tok/s baseline 839.4 -> pm4 872.0        -> delta 876.9 (+4.5%/+0.56%)
+  DELTA gives a small but CONSISTENT additional e2e gain over PM4 (delta > pm4 in
+  both runs), matching the microbench: ~0.19 us/dispatch x ~286 GPU ops/token of
+  the MoE decode ~= ~0.05 ms/token ~= ~1% TPOT. MoE benefits because it has many
+  SHORT kernels per token (the gap is a non-negligible TPOT fraction); dense 8B
+  decode (Appendix B) stays flat because it is weight-streaming memory-bound and
+  the gap is negligible there.
+
+CORRECTNESS of DELTA/REORDER: gated by the bit-exact coverage suite (same code
+path, all decode-relevant features: multi-kernel, LDS, scratch, wave64, varying
+block size, user-SGPR layout change) -- all four flag combos identical to the AQL
+baseline. setshDelta only skips a write whose value is already latched, so the
+register state at every DISPATCH is provably identical to the pm4 path.
+
+PRE-EXISTING PM4-GRAPH ISSUE found on gpt-oss-20b MoE (NOT a delta/reorder
+regression -- pm4_e2e_check.py, greedy o=48):
+  baseline (AQL graph)  : DETERMINISTIC, sha 579941330f4a164e identical over 3/3 runs
+  pm4 (HIP_PM4_GRAPH=1)  : NON-deterministic, sha varies run-to-run (2a54e297..,
+                           6cb9c585..) AND differs from baseline
+  delta / both           : same non-deterministic behavior as pm4 (no worse)
+The flags-OFF pm4 path is byte-identical to the original emitter, so this predates
+the delta/reorder work. The dense Llama-3.1-8B decode (Appendix B) was bit-
+identical baseline-vs-pm4; the MoE model is not. Hypothesis: the per-edge AGENT
+PWS fence (no L2 flush; only the token-boundary acquire is full-L2) is insufficient
+for some MoE cross-CU dataflow (e.g. the expert scatter/combine through L2), or the
+MoE expert-combine uses timing-sensitive atomics whose race order the PM4 path's
+different timing exposes. Either way it is a PM4-GRAPH fence-scope correctness
+question on MoE, INDEPENDENT of register delta-encoding. ACTION: investigate the
+MoE fence scope (does an internal edge need a full-L2 / GL2 flush where a producer
+expert's L2-resident output is read by a consumer on another CU?) before using
+HIP_PM4_GRAPH on MoE models. DELTA/REORDER remain safe to layer on top once the
+base path is correct, since they preserve the pm4 path's exact register + fence
+semantics.

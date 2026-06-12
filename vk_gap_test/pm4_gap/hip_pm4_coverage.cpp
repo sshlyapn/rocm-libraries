@@ -199,6 +199,23 @@ int main(int argc,char** argv){
         HC(hipGraphExecDestroy(exec)); HC(hipGraphDestroy(graph)); HC(hipEventDestroy(ev));
     }
 
+    // varblk: consecutive kernels with DIFFERENT block sizes (64/128/256). The
+    // COMPUTE_NUM_THREAD_X sub-range of kRegStartX changes each time, exercising
+    // both the delta SKIP (same block repeated) and the partial re-emit (block
+    // change). Also mixes same-kernel-back-to-back to exercise PGM/RSRC skip.
+    {
+        double ck=run_graph(b,s,xs,ys,ws,[&](hipStream_t st){
+            const int bss[4]={256,64,256,128};
+            for(int l=0;l<4;++l){
+                int bs=bss[l]; int bl=(M+bs-1)/bs;
+                hipLaunchKernelGGL(k_copy ,dim3(bl),dim3(bs),0,st,b.y,b.x,b.M);
+                hipLaunchKernelGGL(k_copy ,dim3(bl),dim3(bs),0,st,b.x,b.y,b.M); // repeat: PGM/RSRC skip
+                hipLaunchKernelGGL(k_blend,dim3(bl),dim3(bs),0,st,b.x,b.y,b.M);
+            }
+        });
+        printf("varblk      checksum=%.6f\n",ck);
+    }
+
     // scratch: spilling kernel (opt-in via HIP_PM4_GRAPH_SCRATCH). First launch
     // defers (AQL sizes queue scratch); subsequent launches use the PM4 IB.
     {
