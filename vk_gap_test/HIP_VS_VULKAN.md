@@ -23,7 +23,11 @@ These are the non-obvious costs/constraints of the PM4-IB graph-replay path
    W7900 -- vs ~16-19 us for the stock AQL graph (which has no IB to build). The
    2nd launch already drops to steady (~3-6 us). So this cost is paid ONCE per
    unique instantiated graph and amortizes to ~0/token over a decode loop, but it
-   is a real latency spike on the first decode step. (D.19 Q3/Q4)
+   is a real latency spike on the first decode step. (D.19 Q3/Q4) MITIGATIONS
+   (opt-in, D.20): HIP_PM4_GRAPH_PREWARM reserves the executable IB arena at init
+   (moves the ~3.5 ms one-time warm-up off the first launch); HIP_PM4_GRAPH_BUILD_
+   AFTER replays the first launch via AQL and builds the IB right after, overlapping
+   the build with GPU exec (first-step wall ~5 ms -> ~3.5 ms with real GPU time).
 
 2. "instantiate" (hipGraphInstantiate) is a SEPARATE one-time cost from #1: it
    builds the GraphExec, captures the per-node AQL packets, and allocates the
@@ -3657,3 +3661,66 @@ In a real decode the graph is instantiated once and replayed thousands of times,
 ~4-7 ms first-launch hit lands on the first decode step, amortizes to ~0 us/token, and never
 recurs (warm path thereafter; mutations that rebuild reuse the same pool and are bounded by
 Q2's eviction).
+
+### D.20 Hiding the first-ever cost: PREWARM (arena) + BUILD_AFTER (AQL-first)
+
+Two opt-in levers attack the first-replay cost. Both are bit-exact (validated by
+run_pm4_coverage, hip_keycache_mutate, hip_pm4_evict_stress under every flag combo).
+
+WHY the cold cost exists, and why AQL does not pay it (root cause). The PM4 path
+materializes a NEW device-resident EXECUTABLE instruction buffer (the PM4 IB) and
+DMA-uploads it. allocExecIbFromData on the FIRST call pays a one-time process-wide
+warm-up: the first allocation from the executable device pool (reserve VRAM + create
+a GPU VM mapping + mark pages executable), the first allocation from the CPU
+fine-grain staging pool, and the first SDMA copy. The probe (hip_pm4_prewarm_probe)
+isolates it: cold1=4.2 ms for the FIRST graph but cold2=0.7 ms for the SECOND in the
+same process -- so ~3.5 ms is one-time warm-up, ~0.7-1.6 ms is the genuine per-graph
+build (encode + slice + DMA, scaling with dispatch count). The AQL graph path pays
+NONE of this: it copies the captured AQL packets into the already-existing queue ring
+and rings the doorbell -- no new VRAM, no executable pages, no DMA upload. (Kernel
+CODE pages were made executable once at module load, long before capture.)
+
+C -- HIP_PM4_GRAPH_PREWARM (executable IB arena). Reserve ONE device-local executable
+buffer once at vgpu/stream creation (ensurePm4Arena) and sub-allocate every IB from it
+via a first-fit free list (pm4ArenaAlloc / pm4ArenaFreeBytes, coalescing; IBs that do
+not fit fall back to a direct pool alloc). The reservation also does one throwaway
+allocExecIbFromData so the staging pool AND SDMA path are warmed too (not just the
+executable pool -- warming only the executable pool barely moved the number). Net: the
+~3.5 ms one-time cost is paid at init, OFF the first-replay path, and per-build pool
+alloc/free churn (incl. mutation rebuilds) is gone. This is the clean form of "reserve
+memory up front" -- the arena is a real, used reservation, not a throwaway warm-up.
+
+A -- HIP_PM4_GRAPH_BUILD_AFTER (AQL-first, build-after, single thread, no threads). On
+the FIRST replay (cache miss) do NOT build before submit (tryReplayPm4Graph allowBuild=
+false). Replay this launch via the AQL fallback -- the GPU starts in ~us -- then build
+the PM4 IB right after the submit (prebuildPm4Graph), so the build overlaps the GPU
+executing the graph just submitted. The AQL submit also sizes the queue scratch, so the
+build is never scratch-deferred. The next replay uses the cached single-IB fast path.
+
+MEASURED (gfx1100 W7900). Host-call duration of the first launch is NOT the right metric
+for A: build-after still runs the build on the calling thread (just after the AQL submit),
+so the host call is still build-bound. The right metric is the end-to-end first step
+(launch + synchronize = wall time to the first result), with a realistic GPU workload
+(N=128 dispatches, M=4M elems, so GPU exec is a few ms):
+
+  flags                          FIRST_e2e (launch+sync), 3 runs       takeaway
+  -----------------------------  -----------------------------------   -----------------------
+  PM4 (baseline)                 5.85 / 4.75 / 4.95 ms                 build THEN GPU, serial
+  PM4 PREWARM                    ~4.76 ms                              warm-up moved to init
+  PM4 BUILD_AFTER                3.53 / 3.56 / 3.43 ms                 build overlaps GPU exec
+  PM4 PREWARM+BUILD_AFTER        3.65 / 3.58 / 3.47 ms                 both
+
+  - BUILD_AFTER cuts the first-step wall from ~5 ms to ~3.5 ms: it hides the build under
+    the GPU executing the first replay. The win equals min(build, GPU_exec): real when the
+    graph's GPU time is comparable to or larger than the build (true for non-trivial decode
+    graphs); negligible when GPU time << build (tiny kernels). It also eliminates GPU IDLE
+    on the first step (GPU starts at ~us, not after the build).
+  - PREWARM moves the ~3.5 ms one-time warm-up to init; it helps most when GPU_exec < build
+    (so the build can't be fully hidden by A). PREWARM and BUILD_AFTER are complementary.
+  - On a SINGLE thread neither lever reduces the first step below max(build, GPU_exec):
+    fully hiding the build from the first token needs either a background build thread
+    (deliberately out of scope) or building at instantiate/capture (templating, option B),
+    which frameworks get for free via a warm-up decode step.
+
+STATUS: both opt-in (default off) pending broader validation; correctness is bit-exact.
+Recommendation: PREWARM + BUILD_AFTER together for latency-sensitive first-token paths.

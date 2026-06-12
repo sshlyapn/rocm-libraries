@@ -80,6 +80,8 @@ int main(int argc,char** argv){
     double tc1 = now_us();
     double t_cold = tc1 - tc0;
     HC(hipStreamSynchronize(stream));
+    double tc2 = now_us();
+    double t_cold_e2e = tc2 - tc0;   // first launch host call + GPU completion (wall)
 
     // Second launch (warm, IB already built/cached) for an apples-to-apples delta.
     double tw0 = now_us();
@@ -105,8 +107,8 @@ int main(int argc,char** argv){
     HC(hipStreamSynchronize(stream));
 
     double avg = acc / R;
-    printf("N=%-4d M=%-6d R=%d  instantiate=%.3f us  FIRST(cold,build+upload)=%.3f us  2nd(warm)=%.3f us  "
-           "cold_overhead=%.3f us || steady host hipGraphLaunch: avg=%.3f us  min=%.3f us  max=%.3f us  per-dispatch=%.4f us\n",
-           N, M, R, t_instantiate, t_cold, t_warm2, t_cold - t_warm2, avg, mn, mx, avg/(double)N);
+    printf("N=%-4d M=%-6d R=%d  instantiate=%.3f us  FIRST(cold,build+upload)=%.3f us  FIRST_e2e(launch+sync)=%.3f us  "
+           "2nd(warm)=%.3f us || steady host hipGraphLaunch: avg=%.3f us  min=%.3f us  max=%.3f us  per-dispatch=%.4f us\n",
+           N, M, R, t_instantiate, t_cold, t_cold_e2e, t_warm2, avg, mn, mx, avg/(double)N);
     return 0;
 }
