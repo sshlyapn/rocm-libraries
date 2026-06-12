@@ -1331,7 +1331,16 @@ class VirtualDevice : public amd::ReferenceCountedObject {
   virtual bool dispatchAqlPacketBatch(const std::vector<uint8_t*>& packets,
                                       const std::vector<std::string>& kernelNames,
                                       amd::AccumulateCommand* vcmd = nullptr,
-                                      uint64_t recordedPacketVersion = 0) = 0 ;
+                                      uint64_t recordedPacketVersion = 0,
+                                      const void* pm4Template = nullptr) = 0 ;
+  //! Encode a captured graph into a heap-owned, opaque PM4 template at instantiate
+  //! time (CPU-only, queue-independent) so the per-launch build is just a cheap
+  //! specialize+upload. Returns nullptr when the backend has no PM4 replay path.
+  //! The returned handle is passed back as dispatchAqlPacketBatch's pm4Template and
+  //! must be released with freePm4GraphTemplate.
+  virtual void* buildPm4GraphTemplate(void* const* packets, size_t numPackets) { return nullptr; }
+  //! Free a template returned by buildPm4GraphTemplate (no-op for nullptr).
+  virtual void freePm4GraphTemplate(void* tmpl) {}
   //! Returns the number of outstanding HSA async handlers
   std::atomic<uint64_t>& QueuedAsyncHandlers() const { return queued_async_handlers_; }
 

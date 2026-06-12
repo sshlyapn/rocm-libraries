@@ -833,6 +833,15 @@ class GraphExec : public amd::ReferenceCountedObject, public Graph {
     }
     parallel_streams_.clear();
     if (DEBUG_CLR_GRAPH_PACKET_CAPTURE) {
+      // Free capture-time PM4 templates (host-only) via the vdev that built them.
+      if (pm4TemplateVdev_ != nullptr) {
+        for (auto& batch : packetBatches_) {
+          if (batch.pm4Template != nullptr) {
+            pm4TemplateVdev_->freePm4GraphTemplate(batch.pm4Template);
+            batch.pm4Template = nullptr;
+          }
+        }
+      }
       if (kernArgManager_ != nullptr) {
         kernArgManager_->release();
       }
@@ -869,6 +878,10 @@ class GraphExec : public amd::ReferenceCountedObject, public Graph {
   hipError_t Run(hip::Stream* stream);
   // Capture GPU Packets from graph commands
   hipError_t CaptureAQLPackets();
+  // Encode each captured batch into a queue-independent PM4 template at instantiate
+  // so the first replay skips the CPU encode (specialize+upload only). Opt-in via
+  // the PM4 replay env gate; a no-op when the backend has no PM4 replay path.
+  void EncodePm4Templates();
   hipError_t UpdateAQLPacket(hip::GraphNode* node);
   // Handle packetBatches_ updates when nodes are enabled/disabled
   hipError_t UpdatePacketBatchesForNodeEnableDisable(hip::GraphNode* node, bool isEnabled);
@@ -925,6 +938,8 @@ class GraphExec : public amd::ReferenceCountedObject, public Graph {
   uint64_t flags_ = 0;
   GraphKernelArgManager* kernArgManager_ = nullptr;  //!< Kernel Arg manager for graph.
   int instantiateDeviceId_ = -1;
+  //!< vdev that built the per-batch PM4 templates (used to free them at destroy).
+  device::VirtualDevice* pm4TemplateVdev_ = nullptr;
   bool hasHiddenHeap_ = false;  //!< Hidden heap indicator for Kernel node
   bool repeatLaunch_ = false;
 
@@ -942,6 +957,12 @@ class GraphExec : public amd::ReferenceCountedObject, public Graph {
     std::vector<NodeRange> nodeRanges;
     std::unordered_map<GraphNode*, size_t> nodeToRangeIndex;  // O(1) lookup
     int disabledNodeCount = 0;  // Count of currently disabled nodes
+    //! Opaque capture-time PM4 template (device::VirtualGPU::Pm4GraphTemplate*)
+    //! encoded from this batch's packets at instantiate, so the first replay only
+    //! specializes+uploads instead of running the full O(N) CPU encode. Owned here;
+    //! freed via pm4TemplateVdev_->freePm4GraphTemplate(). nullptr when the backend
+    //! has no PM4 replay path or the graph is not PM4-replayable.
+    void* pm4Template = nullptr;
     PacketBatch() {}
     // O(1) enable/disable operations - just update state
     void setEnabled(GraphNode* node, bool enabled);

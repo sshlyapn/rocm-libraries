@@ -1259,10 +1259,12 @@ template <typename AqlPacket>
 bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& packets,
                                                bool blocking, bool attach_signal,
                                                const std::vector<std::string>* kernelNames,
-                                               uint64_t recordedPacketVersion) {
+                                               uint64_t recordedPacketVersion,
+                                               const void* pm4Template) {
   if (packets.empty()) {
     return false;
   }
+  const auto* tmpl = static_cast<const Pm4GraphTemplate*>(pm4Template);
 
   // EXPERIMENTAL: replay an all-dispatch captured graph as one PM4 IB (single CP
   // jump, lean raw-PM4 dispatches + in-place PWS fences). kernelNames != nullptr
@@ -1277,7 +1279,8 @@ bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& pa
   const bool pm4BuildAfter = pm4GraphReplay && pm4GraphBuildAfterEnabled();
   if (pm4GraphReplay) {
     if (tryReplayPm4Graph(reinterpret_cast<void* const*>(packets.data()), packets.size(), blocking,
-                          attach_signal, recordedPacketVersion, /*allowBuild=*/!pm4BuildAfter)) {
+                          attach_signal, recordedPacketVersion, /*allowBuild=*/!pm4BuildAfter,
+                          tmpl)) {
       return true;
     }
   }
@@ -1482,7 +1485,7 @@ bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& pa
   // already sized by the submit -- so the NEXT replay uses the single-IB fast path.
   if (pm4BuildAfter) {
     prebuildPm4Graph(reinterpret_cast<void* const*>(packets.data()), packets.size(),
-                     recordedPacketVersion);
+                     recordedPacketVersion, tmpl);
   }
 
   return true;
@@ -1492,7 +1495,8 @@ bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& pa
 bool VirtualGPU::dispatchAqlPacketBatch(const std::vector<uint8_t*>& packets,
                                         const std::vector<std::string>& kernelNames,
                                         amd::AccumulateCommand* vcmd,
-                                        uint64_t recordedPacketVersion) {
+                                        uint64_t recordedPacketVersion,
+                                        const void* pm4Template) {
   if (vcmd == nullptr || packets.empty() || packets.size() != kernelNames.size()) {
     return false;
   }
@@ -1510,7 +1514,7 @@ bool VirtualGPU::dispatchAqlPacketBatch(const std::vector<uint8_t*>& packets,
   const auto& aqlPackets =
       reinterpret_cast<const std::vector<hsa_kernel_dispatch_packet_t*>&>(packets);
   bool result = dispatchGenericAqlPacketBatch(aqlPackets, false, false, &kernelNames,
-                                              recordedPacketVersion);
+                                              recordedPacketVersion, pm4Template);
 
   profilingEnd();
 
@@ -2112,9 +2116,22 @@ void* VirtualGPU::allocExecIbFromData(const uint32_t* data, uint32_t dw) {
   return dev;
 }
 
-VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t numPackets) {
-  Pm4GraphIb out;
+// Queue-runtime sentinel: every placeholder dword is encoded as this value so that
+// delta-encoding makes the SAME emit/skip decisions it would with the real (queue)
+// value -- e.g. a scratch kernel's TMPRING (sentinel) differs from a non-scratch
+// kernel's 0, so the non-scratch kernel still re-emits 0. specializeFromTemplate()
+// overwrites the sentinel with the launch stream's value. Plain ASCII only.
+static constexpr uint32_t kPm4PlaceholderSentinel = 0xFFFFFFFFu;
+
+// CPU-only, queue-INDEPENDENT encode of a captured graph into a PM4 template:
+// queue-runtime fields (scratch base/size/V#, amd_queue_t pointer) are emitted as
+// sentinels and their dword offsets recorded in out.patches. Runs at capture/
+// instantiate on any vdev of the graph's device; specializeFromTemplate() later
+// patches the placeholders and uploads. (Was the front half of buildPm4GraphIb.)
+void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
+                                        Pm4GraphTemplate& out) {
   out.status = kPm4UnsupportedPermanent;  // pessimistic; promoted on success
+  out.numPackets = numPackets;
 
   // Select arch (gfx11 RDNA3 vs gfx12 RDNA4). Anything else is unsupported.
   const auto& isa = roc_device_.isa();
@@ -2124,22 +2141,23 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
   } else if (isa.versionMajor() == 12) {
     arch = Pm4Arch{kGcrFullGfx12, true};
   } else {
-    return out;  // only RDNA3/RDNA4 carry this PWS encoding
+    return;  // only RDNA3/RDNA4 carry this PWS encoding
   }
 
-  // Queue scratch state (filled by ROCr after a scratch dispatch runs via AQL).
-  auto* aq = reinterpret_cast<amd_queue_t*>(gpu_queue_);
-  const uint64_t queueScratchBase = aq->scratch_backing_memory_location;
-  const uint32_t queueTmpring = aq->compute_tmpring_size;
-  const bool queueScratchReady = (queueTmpring != 0) && (queueScratchBase != 0);
-
-  std::vector<uint32_t> ib;
+  std::vector<uint32_t>& ib = out.dwords;
+  std::vector<Pm4Placeholder>& patches = out.patches;
   ib.reserve(numPackets * 64 + 24);
 
-  auto setsh = [&](uint32_t reg, const uint32_t* v, uint32_t cnt) {
+  auto setsh = [&](uint32_t reg, const uint32_t* v, uint32_t cnt,
+                   const uint8_t* kinds = nullptr) {
     ib.push_back(pm4Hdr(kOpSetShReg, 2 + cnt));
     ib.push_back(reg - kShBase);
-    for (uint32_t i = 0; i < cnt; ++i) ib.push_back(v[i]);
+    for (uint32_t i = 0; i < cnt; ++i) {
+      if (kinds && kinds[i] != kPhNone) {
+        patches.push_back({static_cast<uint32_t>(ib.size()), kinds[i]});
+      }
+      ib.push_back(v[i]);
+    }
   };
   auto partialFlush = [&]() {
     ib.push_back(pm4Hdr(kOpEventWrite, 2));
@@ -2222,9 +2240,9 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
   struct ShadowReg { bool valid = false; uint32_t cnt = 0; uint32_t sig = 0; uint32_t v[8] = {0}; };
   ShadowReg shStartX, shPgm, shScratch, shRsrc, shResLim, shTmpring, shUserD;
   auto setshDelta = [&](ShadowReg& sh, uint32_t reg, const uint32_t* v, uint32_t cnt,
-                        uint32_t sig) {
+                        uint32_t sig, const uint8_t* kinds = nullptr) {
     if (!delta || !sh.valid || sh.cnt != cnt || sh.sig != sig) {
-      setsh(reg, v, cnt);
+      setsh(reg, v, cnt, kinds);
       sh.valid = true; sh.cnt = cnt; sh.sig = sig;
       for (uint32_t i = 0; i < cnt; ++i) sh.v[i] = v[i];
       return;
@@ -2234,7 +2252,7 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
     if (lo == cnt) return;  // nothing changed -> emit nothing
     uint32_t hi = cnt;
     while (hi > lo && v[hi - 1] == sh.v[hi - 1]) --hi;
-    setsh(reg + lo, v + lo, hi - lo);
+    setsh(reg + lo, v + lo, hi - lo, kinds ? kinds + lo : nullptr);
     for (uint32_t i = lo; i < hi; ++i) sh.v[i] = v[i];
   };
 
@@ -2261,7 +2279,9 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
     if (needsScratch) {
       if (!pm4GraphScratchEnabled()) return kPm4UnsupportedPermanent;   // opt-in only
       if (props & KCP_FLAT_SCRATCH_INIT) return kPm4UnsupportedPermanent;  // not replicated
-      if (!queueScratchReady) return kPm4DeferredScratch;
+      // Scratch base/size/V# are queue-runtime values: emit them as placeholders
+      // and let specializeFromTemplate() patch them (deferring if not yet sized).
+      out.needsScratch = true;
     }
 
     // Only user SGPRs we can source correctly: private_segment_buffer (scratch
@@ -2281,11 +2301,11 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
     const uint32_t pgm[2] = {static_cast<uint32_t>(entry), static_cast<uint32_t>(entry >> 32)};
     setshDelta(shPgm, kRegPgmLo, pgm, 2, 0);
 
-    // Scratch base + TMPRING (only when scratch needed; copied from the queue).
+    // Scratch base (queue runtime) -> placeholder, patched at specialize time.
     if (needsScratch) {
-      const uint64_t sbase = queueScratchBase >> 8;
-      const uint32_t scratch[2] = {static_cast<uint32_t>(sbase), static_cast<uint32_t>(sbase >> 32)};
-      setshDelta(shScratch, kRegScratchLo, scratch, 2, 0);
+      const uint32_t scratch[2] = {kPm4PlaceholderSentinel, kPm4PlaceholderSentinel};
+      const uint8_t scratchKinds[2] = {kPhScratchBaseLo, kPhScratchBaseHi};
+      setshDelta(shScratch, kRegScratchLo, scratch, 2, 0, scratchKinds);
     }
 
     // RSRC1 verbatim from the KD (exactly what the CP loads). RSRC2 too, EXCEPT
@@ -2306,32 +2326,50 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
     setshDelta(shRsrc, kRegRsrc1, rsrc, 2, 0);
     const uint32_t zero = 0;
     setshDelta(shResLim, kRegResLim, &zero, 1, 0);
-    const uint32_t tmpring = needsScratch ? queueTmpring : 0u;
-    setshDelta(shTmpring, kRegTmpring, &tmpring, 1, 0);
+    // TMPRING: queue scratch size for scratch kernels (placeholder), real 0 for
+    // non-scratch kernels. The sentinel keeps delta distinguishing the two so a
+    // non-scratch kernel following a scratch one still re-emits 0.
+    if (needsScratch) {
+      const uint32_t tmpring = kPm4PlaceholderSentinel;
+      const uint8_t tmpringKind = kPhTmpring;
+      setshDelta(shTmpring, kRegTmpring, &tmpring, 1, 0, &tmpringKind);
+    } else {
+      const uint32_t tmpring = 0u;
+      setshDelta(shTmpring, kRegTmpring, &tmpring, 1, 0);
+    }
 
     // G2: user SGPRs in kernel_code_properties enable-bit order. The enabled set
     // is the layout signature; a change forces a full re-emit (same offset would
     // otherwise alias a different register). Within a stable layout only the
     // changed sub-range (typically the kernarg pointer) is re-sent.
     uint32_t udata[8] = {0};
+    uint8_t ukinds[8];
+    for (int i = 0; i < 8; ++i) ukinds[i] = kPhNone;
     uint32_t u = 0;
     if (props & KCP_PRIVATE_SEGMENT_BUFFER) {
-      for (int w = 0; w < 4; ++w) udata[u + w] = aq->scratch_resource_descriptor[w];
+      // scratch V# (queue runtime) -> placeholders.
+      for (int w = 0; w < 4; ++w) {
+        udata[u + w] = kPm4PlaceholderSentinel;
+        ukinds[u + w] = static_cast<uint8_t>(kPhScratchVdesc0 + w);
+      }
       u += 4;
     }
     if (props & KCP_QUEUE_PTR) {
-      const uint64_t q = reinterpret_cast<uint64_t>(gpu_queue_);
-      udata[u + 0] = static_cast<uint32_t>(q);
-      udata[u + 1] = static_cast<uint32_t>(q >> 32);
+      // amd_queue_t pointer (per launch stream) -> placeholder.
+      udata[u + 0] = kPm4PlaceholderSentinel;
+      udata[u + 1] = kPm4PlaceholderSentinel;
+      ukinds[u + 0] = kPhQueuePtrLo;
+      ukinds[u + 1] = kPhQueuePtrHi;
       u += 2;
     }
     if (props & KCP_KERNARG_SEGMENT_PTR) {
+      // kernarg base is graph-fixed (allocated at instantiate) -> bake it in.
       const uint64_t ka = reinterpret_cast<uint64_t>(p->kernarg_address);
       udata[u + 0] = static_cast<uint32_t>(ka);
       udata[u + 1] = static_cast<uint32_t>(ka >> 32);
       u += 2;
     }
-    if (u > 0) setshDelta(shUserD, kRegUserD0, udata, u, props & kSupportedUserSgpr);
+    if (u > 0) setshDelta(shUserD, kRegUserD0, udata, u, props & kSupportedUserSgpr, ukinds);
     return kPm4Ready;
   };
 
@@ -2362,7 +2400,7 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
     for (size_t i = 0; i < numPackets; ++i) {
       auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
       int st = emitRegs(p);
-      if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return out; }
+      if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
       emitDispatchPacket(p);
       partialFlush();          // drain the producer's waves (writes reach L2)
       acquireFull(edgeMask);   // blocking invalidate so the consumer sees them
@@ -2372,7 +2410,7 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
     for (size_t i = 0; i < numPackets; ++i) {
       auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
       int st = emitRegs(p);
-      if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return out; }
+      if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
       emitDispatchPacket(p);
       partialFlush();
       releaseMemPws(kGcrAgent);
@@ -2384,14 +2422,14 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
     // AND the PWS fence it builds on is UNSAFE. Experimentation only.
     auto* p0 = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[0]);
     int st = emitRegs(p0);
-    if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return out; }
+    if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
     emitDispatchPacket(p0);
     for (size_t i = 1; i < numPackets; ++i) {
       partialFlush();              // drain kernel i-1 (its waves retire)
       releaseMemPws(kGcrAgent);    // async AGENT flush of kernel i-1 (PWS armed)
       auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
       st = emitRegs(p);            // program kernel i during the flush / drain
-      if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return out; }
+      if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
       acquirePws();                // wait kernel i-1's flush counter
       emitDispatchPacket(p);       // launch kernel i (coherent + registers latched)
     }
@@ -2401,20 +2439,123 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
   partialFlush();
   acquireFull(arch.gcrFull);
 
+  out.status = kPm4Ready;  // fully encoded; queue specialization happens later
+}
+
+// Patch a capture-time template's queue-dependent placeholders from THIS vdev's
+// queue, then alloc + DMA-upload the IB. No CPU re-encode. Returns kPm4DeferredScratch
+// when the graph needs scratch the queue has not sized yet (replay via AQL once,
+// which sizes it, then a later specialize succeeds).
+VirtualGPU::Pm4GraphIb VirtualGPU::specializeFromTemplate(const Pm4GraphTemplate& t) {
+  Pm4GraphIb out;
+  out.status = kPm4UnsupportedPermanent;
+  if (t.status != kPm4Ready) { out.status = t.status; return out; }
+
+  const bool pm4Timing = getenv("HIP_PM4_GRAPH_TIMING") != nullptr;
+  const uint64_t tStart = pm4Timing ? amd::Os::timeNanos() : 0;
+  auto* aq = reinterpret_cast<amd_queue_t*>(gpu_queue_);
+  const uint64_t scratchBase = aq->scratch_backing_memory_location;
+  const uint32_t tmpring = aq->compute_tmpring_size;
+  if (t.needsScratch && !((tmpring != 0) && (scratchBase != 0))) {
+    out.status = kPm4DeferredScratch;
+    return out;
+  }
+
+  std::vector<uint32_t> ib = t.dwords;  // patch placeholders into a private copy
+  const uint64_t sbase = scratchBase >> 8;
+  const uint64_t qptr = reinterpret_cast<uint64_t>(gpu_queue_);
+  for (const auto& ph : t.patches) {
+    uint32_t v = 0;
+    switch (ph.kind) {
+      case kPhScratchBaseLo: v = static_cast<uint32_t>(sbase); break;
+      case kPhScratchBaseHi: v = static_cast<uint32_t>(sbase >> 32); break;
+      case kPhTmpring:       v = tmpring; break;
+      case kPhScratchVdesc0:
+      case kPhScratchVdesc1:
+      case kPhScratchVdesc2:
+      case kPhScratchVdesc3:
+        v = aq->scratch_resource_descriptor[ph.kind - kPhScratchVdesc0];
+        break;
+      case kPhQueuePtrLo: v = static_cast<uint32_t>(qptr); break;
+      case kPhQueuePtrHi: v = static_cast<uint32_t>(qptr >> 32); break;
+      default: break;
+    }
+    ib[ph.offset] = v;
+  }
+
   void* dev = allocExecIbFromData(ib.data(), static_cast<uint32_t>(ib.size()));
   if (dev == nullptr) return out;
   out.ib = dev;
   out.dw = static_cast<uint32_t>(ib.size());
   out.status = kPm4Ready;
+  if (pm4Timing) {
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[pm4-timing] specialize %zu dispatches -> %u dw: patch+alloc+upload=%.1f us (arena=%d)",
+            t.numPackets, out.dw, (amd::Os::timeNanos() - tStart) / 1000.0,
+            pm4ArenaOwns(dev) ? 1 : 0);
+  }
   ClPrint(amd::LOG_INFO, amd::LOG_AQL,
-          "PM4 graph: compiled %zu dispatches -> IB %u dwords @%p (gfx%u)", numPackets, out.dw,
-          out.ib, isa.versionMajor());
+          "PM4 graph: compiled %zu dispatches -> IB %u dwords @%p", t.numPackets, out.dw, out.ib);
   return out;
+}
+
+// Full build = CPU encode + specialize+upload on THIS vdev's queue. Used on the
+// launch path when no capture-time template is available (e.g. post-mutation
+// rebuild and HIP_PM4_GRAPH_BUILD_AFTER). With a template the cache miss path
+// calls specializeFromTemplate() directly and skips the encode.
+VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t numPackets) {
+  const bool pm4Timing = getenv("HIP_PM4_GRAPH_TIMING") != nullptr;
+  const uint64_t tEncodeStart = pm4Timing ? amd::Os::timeNanos() : 0;
+  Pm4GraphTemplate t;
+  encodePm4GraphTemplate(packets, numPackets, t);
+  const uint64_t tEncodeEnd = pm4Timing ? amd::Os::timeNanos() : 0;
+  Pm4GraphIb out = specializeFromTemplate(t);
+  if (pm4Timing && out.status == kPm4Ready) {
+    const uint64_t tAllocEnd = amd::Os::timeNanos();
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[pm4-timing] build %zu dispatches -> %u dw: encode=%.1f us  alloc+upload=%.1f us "
+            "(arena=%d)",
+            numPackets, out.dw, (tEncodeEnd - tEncodeStart) / 1000.0,
+            (tAllocEnd - tEncodeEnd) / 1000.0, pm4ArenaOwns(out.ib) ? 1 : 0);
+  }
+  return out;
+}
+
+// Capture-time entry (called from hipGraphInstantiate via the base virtual): encode
+// the packets into a heap-owned template stamped with their content key. Returns
+// nullptr (and allocates nothing) if the graph is not PM4-replayable, so the launch
+// path stays on the existing build/AQL fallback. Queue-independent, so any vdev of
+// the graph's device produces an identical template.
+void* VirtualGPU::buildPm4GraphTemplate(void* const* packets, size_t numPackets) {
+  if (!pm4GraphActive() || numPackets == 0) return nullptr;
+  // A/B + safety toggle: HIP_PM4_GRAPH_TEMPLATE=0 disables capture-time encode so
+  // the first replay pays the full build (the pre-template behavior). Default on.
+  const char* te = getenv("HIP_PM4_GRAPH_TEMPLATE");
+  if (te != nullptr && te[0] == '0') return nullptr;
+  auto* t = new Pm4GraphTemplate();
+  const bool pm4Timing = getenv("HIP_PM4_GRAPH_TIMING") != nullptr;
+  const uint64_t t0 = pm4Timing ? amd::Os::timeNanos() : 0;
+  encodePm4GraphTemplate(packets, numPackets, *t);
+  if (t->status != kPm4Ready) {
+    delete t;
+    return nullptr;
+  }
+  t->key = pm4GraphKey(packets, numPackets);
+  if (pm4Timing) {
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[pm4-timing] capture-time encode %zu dispatches -> %zu dw: encode=%.1f us",
+            numPackets, t->dwords.size(), (amd::Os::timeNanos() - t0) / 1000.0);
+  }
+  return t;
+}
+
+void VirtualGPU::freePm4GraphTemplate(void* tmpl) {
+  delete static_cast<Pm4GraphTemplate*>(tmpl);
 }
 
 bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking,
                                    bool attach_signal, uint64_t recordedPacketVersion,
-                                   bool allowBuild) {
+                                   bool allowBuild, const Pm4GraphTemplate* tmpl) {
   if (numPackets == 0) return false;
 
   // Fast path: same recorded packet set as the previous launch -> reuse the cached
@@ -2434,7 +2575,7 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
     }
   }
 
-  Pm4GraphIb* g = findOrBuildPm4Graph(packets, numPackets, recordedPacketVersion, allowBuild);
+  Pm4GraphIb* g = findOrBuildPm4Graph(packets, numPackets, recordedPacketVersion, allowBuild, tmpl);
   if (g == nullptr) {
     return false;  // cache miss with allowBuild=false, or unsupported/deferred build
   }
@@ -2445,14 +2586,25 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
 // ================================================================================================
 VirtualGPU::Pm4GraphIb* VirtualGPU::findOrBuildPm4Graph(void* const* packets, size_t numPackets,
                                                         uint64_t recordedPacketVersion,
-                                                        bool allowBuild) {
+                                                        bool allowBuild,
+                                                        const Pm4GraphTemplate* tmpl) {
+  // With a capture-time template, a cache miss only needs specialize+upload (patch
+  // the queue-dependent placeholders + DMA); the CPU encode already ran at
+  // instantiate. Without one, fall back to a full build (encode+specialize). The
+  // template must match these exact packets (same recorded set) -- enforced by the
+  // hip layer keying it to the batch -- so it is ignored if its dword count is 0.
   const uint64_t key = pm4GraphKey(packets, numPackets);
+  // Only use the template if it was encoded from THESE exact packets: a stale
+  // template (graph mutated after instantiate -> different bytes) or a disabled-
+  // node filtered subset has a different key and must fall back to a full build.
+  const bool useTmpl = (tmpl != nullptr) && (tmpl->status == kPm4Ready) && (tmpl->key == key);
   auto it = pm4Graphs_.find(key);
   if (it == pm4Graphs_.end()) {
     if (!allowBuild) {
       return nullptr;  // build-after mode: this launch goes AQL; build happens post-submit
     }
-    it = pm4Graphs_.emplace(key, buildPm4GraphIb(packets, numPackets)).first;
+    Pm4GraphIb built = useTmpl ? specializeFromTemplate(*tmpl) : buildPm4GraphIb(packets, numPackets);
+    it = pm4Graphs_.emplace(key, built).first;
     pm4GraphKeyOrder_.push_back(key);
     // A mutated graph lands here every time its packet content changes, leaving
     // the previous content's IB unreferenced. Bound the VRAM held by dead IBs.
@@ -2461,10 +2613,10 @@ VirtualGPU::Pm4GraphIb* VirtualGPU::findOrBuildPm4Graph(void* const* packets, si
   Pm4GraphIb& g = it->second;
   // Deferred scratch: a prior launch fell back to AQL (which sizes the queue
   // scratch); rebuild now that scratch may be ready. Free the stale IB first so
-  // the rebuild does not orphan it.
+  // the rebuild does not orphan it. specializeFromTemplate re-checks readiness.
   if (g.status == kPm4DeferredScratch && allowBuild) {
     freePm4GraphIb(g);
-    g = buildPm4GraphIb(packets, numPackets);
+    g = useTmpl ? specializeFromTemplate(*tmpl) : buildPm4GraphIb(packets, numPackets);
   }
   if (g.status != kPm4Ready) {
     return nullptr;
@@ -2508,11 +2660,12 @@ void VirtualGPU::submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_sig
 
 // ================================================================================================
 void VirtualGPU::prebuildPm4Graph(void* const* packets, size_t numPackets,
-                                  uint64_t recordedPacketVersion) {
+                                  uint64_t recordedPacketVersion, const Pm4GraphTemplate* tmpl) {
   // Build + insert + arm the IB without submitting. Called right after the AQL
   // fallback submit (HIP_PM4_GRAPH_BUILD_AFTER), which has already sized scratch,
-  // so the build is never scratch-deferred. The next replay finds it armed.
-  (void)findOrBuildPm4Graph(packets, numPackets, recordedPacketVersion, /*allowBuild=*/true);
+  // so the build is never scratch-deferred. The next replay finds it armed. With a
+  // capture-time template this is just specialize+upload (no CPU re-encode).
+  (void)findOrBuildPm4Graph(packets, numPackets, recordedPacketVersion, /*allowBuild=*/true, tmpl);
 }
 
 // ================================================================================================

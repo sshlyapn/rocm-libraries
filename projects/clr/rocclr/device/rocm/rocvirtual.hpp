@@ -479,7 +479,13 @@ class VirtualGPU : public device::VirtualDevice {
   bool dispatchAqlPacketBatch(const std::vector<uint8_t*>& packets,
                               const std::vector<std::string>& kernelNames,
                               amd::AccumulateCommand* vcmd = nullptr,
-                              uint64_t recordedPacketVersion = 0);
+                              uint64_t recordedPacketVersion = 0,
+                              const void* pm4Template = nullptr) override;
+  //! Encode a captured graph into a heap-owned PM4 template (CPU-only, queue-
+  //! independent) for capture-time build. Returns an opaque Pm4GraphTemplate* or
+  //! nullptr if the graph is not PM4-replayable. Free with freePm4GraphTemplate.
+  void* buildPm4GraphTemplate(void* const* packets, size_t numPackets) override;
+  void freePm4GraphTemplate(void* tmpl) override;
   template <typename AqlPacket> bool dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header,
                                                               uint16_t rest, bool blocking,
                                                               bool attach_signal = false);
@@ -487,7 +493,8 @@ class VirtualGPU : public device::VirtualDevice {
   template <typename AqlPacket> bool dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& packets,
                                                                    bool blocking, bool attach_signal = false,
                                                                    const std::vector<std::string>* kernelNames = nullptr,
-                                                                   uint64_t recordedPacketVersion = 0);
+                                                                   uint64_t recordedPacketVersion = 0,
+                                                                   const void* pm4Template = nullptr);
 
   bool dispatchCounterAqlPacket(hsa_ext_amd_aql_pm4_packet_t* packet, const uint32_t gfxVersion,
                                 bool blocking, const hsa_ven_amd_aqlprofile_1_00_pfn_t* extApi);
@@ -516,6 +523,35 @@ class VirtualGPU : public device::VirtualDevice {
     void* ib = nullptr;
     uint32_t dw = 0;
     Pm4GraphStatus status = kPm4Unbuilt;
+  };
+  //!< Queue-runtime-dependent dword that a capture-time template leaves as a
+  //!< placeholder (written as 0) and that specializeFromTemplate() patches from
+  //!< the launch stream's queue. All are graph-constant (one value for the whole
+  //!< graph), so the encoder emits each exactly once under delta-encoding.
+  enum Pm4PlaceholderKind : uint8_t {
+    kPhScratchBaseLo, kPhScratchBaseHi,  //!< COMPUTE_USER_DATA scratch base >> 8
+    kPhTmpring,                          //!< COMPUTE_TMPRING_SIZE
+    kPhScratchVdesc0, kPhScratchVdesc1, kPhScratchVdesc2, kPhScratchVdesc3,  //!< scratch V#
+    kPhQueuePtrLo, kPhQueuePtrHi,        //!< amd_queue_t pointer (queue_ptr user SGPR)
+    kPhNone = 0xFF                       //!< not a placeholder (graph-fixed dword)
+  };
+  struct Pm4Placeholder { uint32_t offset; uint8_t kind; };
+  //!< CPU-only encode of a captured graph: the PM4 dwords with queue-dependent
+  //!< fields zeroed, plus the offsets of those fields. Produced at capture/
+  //!< instantiate (queue-independent) and specialized per launch stream. status
+  //!< is kPm4Ready (encodable) or kPm4UnsupportedPermanent; the scratch-not-yet-
+  //!< sized decision is deferred to specialize time (needsScratch).
+  struct Pm4GraphTemplate {
+    std::vector<uint32_t> dwords;
+    std::vector<Pm4Placeholder> patches;
+    Pm4GraphStatus status = kPm4Unbuilt;
+    bool needsScratch = false;
+    size_t numPackets = 0;
+    //! Content hash of the packet set this template was encoded from. A cache
+    //! miss specializes from the template only when it matches the launch packets
+    //! (pm4GraphKey), so a stale template (graph mutated -> different bytes) or a
+    //! disabled-node filtered subset is ignored and falls back to a full build.
+    uint64_t key = 0;
   };
   std::unordered_map<uint64_t, Pm4GraphIb> pm4Graphs_;  //!< compiled IB cache, keyed by content hash
   //! Insertion order of pm4Graphs_ keys, used to bound the VRAM held by compiled
@@ -570,7 +606,17 @@ class VirtualGPU : public device::VirtualDevice {
   void freePm4GraphIb(Pm4GraphIb& g);             //!< free g.ib (arena or pool) and null it
   void* allocExecIbFromData(const uint32_t* data, uint32_t dw);  //!< stage data into an executable IB
   static uint64_t pm4GraphKey(void* const* packets, size_t numPackets);  //!< content hash
+  //! Full build = encode (CPU) + specialize+upload, using THIS vdev's queue.
   Pm4GraphIb buildPm4GraphIb(void* const* packets, size_t numPackets);
+  //! CPU-only encode of the packets into a queue-independent template (placeholders
+  //! for queue-dependent fields). Returns a heap-owned template (free with
+  //! freePm4GraphTemplate) or nullptr if encode is unsupported. Queue-independent,
+  //! so it can run at instantiate on any vdev of the graph's device.
+  void encodePm4GraphTemplate(void* const* packets, size_t numPackets, Pm4GraphTemplate& out);
+  //! Patch a template's placeholders from THIS vdev's queue, then alloc+upload the
+  //! IB. Returns kPm4DeferredScratch (queue scratch not sized yet), kPm4Ready, or
+  //! the template's terminal status. No CPU re-encode -- just patch + DMA.
+  Pm4GraphIb specializeFromTemplate(const Pm4GraphTemplate& t);
   //! Free oldest cached IBs (by insertion order) while pm4Graphs_ exceeds
   //! kPm4MaxCachedIbs. Never frees the armed entry (pm4IbCacheEntry_) or the
   //! protected entry just built/selected this launch.
@@ -578,15 +624,20 @@ class VirtualGPU : public device::VirtualDevice {
   //! Find the cached ready IB for these packets, or (if allowBuild) build+insert+
   //! arm it. Returns the ready entry, or nullptr (cache miss with allowBuild=false,
   //! or an unsupported/deferred build). Handles eviction and deferred-scratch.
+  //! tmpl (optional) is a capture-time encode: when present a cache miss
+  //! specializes from it (no CPU re-encode) instead of a full build.
   Pm4GraphIb* findOrBuildPm4Graph(void* const* packets, size_t numPackets,
-                                  uint64_t recordedPacketVersion, bool allowBuild);
+                                  uint64_t recordedPacketVersion, bool allowBuild,
+                                  const Pm4GraphTemplate* tmpl);
   //! Submit one compiled IB as a single vendor PM4-IB packet (ring write + doorbell).
   void submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_signal);
   //! Build + insert + arm the IB for these packets WITHOUT submitting. Used by
   //! HIP_PM4_GRAPH_BUILD_AFTER after the AQL fallback submit has sized scratch.
-  void prebuildPm4Graph(void* const* packets, size_t numPackets, uint64_t recordedPacketVersion);
+  void prebuildPm4Graph(void* const* packets, size_t numPackets, uint64_t recordedPacketVersion,
+                        const Pm4GraphTemplate* tmpl);
   bool tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking, bool attach_signal,
-                         uint64_t recordedPacketVersion, bool allowBuild = true);
+                         uint64_t recordedPacketVersion, bool allowBuild = true,
+                         const Pm4GraphTemplate* tmpl = nullptr);
   void dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveDepSignal = false,
                                   hsa_signal_t signal = hsa_signal_t{0},
                                   hsa_signal_value_t value = 0, hsa_signal_value_t mask = 0,

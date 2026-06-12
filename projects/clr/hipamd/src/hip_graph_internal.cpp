@@ -439,6 +439,11 @@ hipError_t GraphExec::Init() {
     if (DEBUG_CLR_GRAPH_PACKET_CAPTURE) {
       // For graph nodes capture AQL packets to dispatch them directly during graph launch.
       status = CaptureAQLPackets();
+      if (status == hipSuccess) {
+        // Encode the captured packets into PM4 templates now (instantiate) so the
+        // first replay pays only specialize+upload, not the O(N) CPU encode.
+        EncodePm4Templates();
+      }
     }
   } else {
     status = CreateStreams(max_streams_, hip::getCurrentDevice()->deviceId());
@@ -645,6 +650,38 @@ hipError_t GraphExec::CaptureAQLPackets() {
 }
 
 // ================================================================================================
+void GraphExec::EncodePm4Templates() {
+  // Only the single-device single-stream batched path replays through
+  // dispatchAqlPacketBatch (where the template is consumed). Skip otherwise.
+  if (max_streams_ != 1 || max_streams_dev_.size() > 1) {
+    return;
+  }
+  hip::Device* dev = hip::getCurrentDevice();
+  // wait=false: we only need the vdev (queue-independent encode), not a sync point.
+  hip::Stream* nullStream = (dev != nullptr) ? dev->NullStream(false) : nullptr;
+  device::VirtualDevice* vdev = (nullStream != nullptr) ? nullStream->vdev() : nullptr;
+  if (vdev == nullptr) {
+    return;  // no vdev available yet -> first replay falls back to the full build
+  }
+  pm4TemplateVdev_ = vdev;
+  for (auto& batch : packetBatches_) {
+    if (batch.pm4Template != nullptr) {
+      vdev->freePm4GraphTemplate(batch.pm4Template);
+      batch.pm4Template = nullptr;
+    }
+    if (batch.dispatchPackets.empty()) {
+      continue;
+    }
+    // The template is keyed to these exact packet bytes; a later mutation simply
+    // produces a different key at launch and falls back to a full build (the stale
+    // template is ignored, never wrongly reused). Encode is queue-independent.
+    batch.pm4Template = vdev->buildPm4GraphTemplate(
+        reinterpret_cast<void* const*>(batch.dispatchPackets.data()),
+        batch.dispatchPackets.size());
+  }
+}
+
+// ================================================================================================
 hipError_t GraphExec::UpdateAQLPacket(hip::GraphNode* node) {
   if (max_streams_ != 1 || !node->GraphCaptureEnabled()) {
     return hipSuccess;
@@ -777,10 +814,11 @@ hipError_t GraphExec::EnqueueGraphWithSingleList(hip::Stream* hip_stream) {
         // O(1) check: if no disabled nodes, dispatch entire batch directly
         // This avoids creating new vectors when all nodes are enabled (common case)
         if (batch.disabledNodeCount == 0) {
-          // Fast path: all nodes enabled, dispatch entire batch
+          // Fast path: all nodes enabled, dispatch entire batch. Pass the capture-
+          // time template so a cache miss specializes from it (no CPU re-encode).
           bool batchStatus = hip_stream->vdev()->dispatchAqlPacketBatch(
               batch.dispatchPackets, batch.dispatchKernelNames, accumulate,
-              RecordedPacketVersion(batchIndex));
+              RecordedPacketVersion(batchIndex), batch.pm4Template);
           if (!batchStatus) {
             status = hipErrorUnknown;
             accumulate->release();

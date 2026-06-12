@@ -362,7 +362,8 @@ class VirtualGPU : public device::VirtualDevice {
   bool dispatchAqlPacketBatch(const std::vector<uint8_t*>& packets,
                               const std::vector<std::string>& kernelNames,
                               amd::AccumulateCommand* vcmd = nullptr,
-                              uint64_t recordedPacketVersion = 0) {
+                              uint64_t recordedPacketVersion = 0,
+                              const void* pm4Template = nullptr) {
     return false;
   }
 
