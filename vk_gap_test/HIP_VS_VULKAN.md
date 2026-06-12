@@ -11,6 +11,44 @@ variable shader core clock.
 
 --------------------------------------------------------------------------------
 
+## KNOWN LIMITATIONS & TRICKY MOMENTS (read first)
+
+These are the non-obvious costs/constraints of the PM4-IB graph-replay path
+(HIP_PM4_GRAPH=1). Details and measurements are in Appendix D (D.16-D.19).
+
+1. FIRST-EVER replay of a graph is EXPENSIVE (one-time). The first hipGraphLaunch
+   after instantiate compiles the whole graph into one PM4 IB, allocates an
+   executable device-memory-pool buffer, and DMA-uploads it synchronously before
+   the doorbell. Measured ~4 ms (N=1) to ~7.6 ms (N=256 dispatches) on gfx1100
+   W7900 -- vs ~16-19 us for the stock AQL graph (which has no IB to build). The
+   2nd launch already drops to steady (~3-6 us). So this cost is paid ONCE per
+   unique instantiated graph and amortizes to ~0/token over a decode loop, but it
+   is a real latency spike on the first decode step. (D.19 Q3/Q4)
+
+2. "instantiate" (hipGraphInstantiate) is a SEPARATE one-time cost from #1: it
+   builds the GraphExec, captures the per-node AQL packets, and allocates the
+   kernarg pool. It grows with node count (~48 us at N=1 to ~310 us at N=256) and
+   is essentially the SAME for AQL and PM4 (the PM4 IB build happens later, on
+   first launch, not here). (D.19 Q4)
+
+3. VRAM is BOUNDED but a mutated graph rebuilds. Any mutation that changes a
+   hashed packet field (grid/block dims, kernel object, kernarg address -- e.g.
+   split-K with varying launch dims) produces a NEW compiled IB; the old one is
+   freed by a 16-entry LRU/FIFO eviction (kPm4MaxCachedIbs) so dead IBs do not
+   accumulate. Pure kernarg-VALUE updates (same address) do NOT rebuild. Proven:
+   2000 distinct-IB mutations -> cache never exceeds 16. (D.19 Q2)
+
+4. The key cache is DEFAULT ON and correct for any graph caller, but only the HIP
+   graph layer supplies the recorded-packet version; non-graph callers pass 0 and
+   always take the slow rehash path. Multi-device linear graphs also pass 0 (the
+   PM4 path does not target multi-GPU). (D.18 / D.19 Q1)
+
+5. The per-edge fence MUST be the blocking AGENT acquire, not PWS deferred-wait --
+   PWS is non-deterministic on MoE. This is already the default in the PM4 path.
+   (D.14)
+
+--------------------------------------------------------------------------------
+
 ## 0. TL;DR (what is actually true)
 
 - The inter-kernel gap is REAL on both APIs. It is wave-drain + cache invalidate +
@@ -3476,22 +3514,146 @@ consumer + plumbing in the rocm backend.
      target multi-GPU graphs, so 0 = always-slow-path is correct there).
 
 (B) rocm backend -- device.hpp / palvirtual.hpp / rocvirtual.hpp / rocvirtual.cpp:
-  6. dispatchAqlPacketBatch gains an optional trailing "uint64_t graphReplayToken = 0"
-     on the device virtual (device.hpp), the pal override (ignores it), and the rocm
+  6. dispatchAqlPacketBatch gains an optional trailing "uint64_t recordedPacketSetVersion
+     = 0" on the device virtual (device.hpp), the pal override (ignores it), and the rocm
      override; rocm passes it into dispatchGenericAqlPacketBatch, which passes it into
      tryReplayPm4Graph. The default 0 keeps every non-graph caller on the slow path.
-  7. pm4GraphKeyCacheEnabled() -- new env gate HIP_PM4_GRAPH_KEYCACHE (default off).
-  8. Per-VirtualGPU fast-path state: {bool pm4KeyCacheValid_, uint64_t pm4KeyCacheToken_,
-     Pm4GraphIb* pm4KeyCacheIb_}. The cached pointer is into the node-based
+  7. pm4GraphKeyCacheEnabled() -- env gate HIP_PM4_GRAPH_KEYCACHE. Now DEFAULT ON (see
+     D.19); set HIP_PM4_GRAPH_KEYCACHE=0 to force the always-rehash path.
+  8. Per-VirtualGPU fast-path state: {bool pm4IbCacheValid_, uint64_t pm4IbCacheVersion_,
+     Pm4GraphIb* pm4IbCacheEntry_}. The cached pointer is into the node-based
      pm4Graphs_ unordered_map, whose element pointers stay valid across inserts.
-  9. tryReplayPm4Graph: if keycache on and token != 0 and token == pm4KeyCacheToken_ and
-     the cached IB is still kPm4Ready, submit it directly (build vendor packet, ring
+  9. tryReplayPm4Graph: if keycache on and version != 0 and version == pm4IbCacheVersion_
+     and the cached IB is still kPm4Ready, submit it directly (build vendor packet, ring
      write, doorbell) -- skipping BOTH pm4GraphKey (the O(N) hash) and the map find.
      Otherwise take the slow path (hash, find/build) and, if the result is a ready IB
-     and token != 0, arm {token, &entry} for next time. The earlier heuristic identity
+     and version != 0, arm {version, &entry} for next time. The earlier heuristic identity
      (first/last packet pointers + content fold) was removed entirely.
 
-WHY a token instead of re-hashing or a pointer: re-hashing is the O(N) cost we are
-removing; a raw pointer identity is unsafe (ABA + interior in-place updates). The
-token is both cheap (O(1) to compare) and exact (changes on every mutation, unique per
+NAMING (renamed for clarity, see D.19 Q2): the value formerly called the "PM4 replay
+token" is the recorded packet VERSION. HIP layer: RecordedPacketVersion(batchIndex),
+InvalidateRecordedPacketVersion(), recordedPacketInstanceId_,
+recordedPacketMutationCount_. Device layer param: recordedPacketVersion. (The "...Set..."
+spelling was dropped because "Set" reads as a verb; it is a version stamp, not an action.)
+
+WHY a version stamp instead of re-hashing or a pointer: re-hashing is the O(N) cost we are
+removing; a raw pointer identity is unsafe (ABA + interior in-place updates). The version
+is both cheap (O(1) to compare) and exact (changes on every mutation, unique per
 instantiation), so it is the only option that is simultaneously fast AND correct.
+
+### D.19 Mutation-site audit, DEFAULT-ON decision, rename, and first-launch cost
+
+Three follow-ups: (1) is the invalidation complete enough to enable by default?
+(2) rename the "token" to something more verbose; (3) what does the FIRST-EVER PM4
+replay cost?
+
+Q1 -- mutation-site audit (is the version bumped on EVERY packet change?).
+The dispatched packet set for a single-device graph lives in GraphExec::packetBatches_
+(vectors of AQL packet pointers per batch). Auditing every writer in
+hip_graph_internal.cpp / .hpp:
+
+  - CaptureAndFormPacketsForGraph()  -- initial capture + child-graph recursion. BUMPS.
+  - UpdateAQLPacket(node)            -- per-node in-place param update (insert/erase/
+                                        overwrite of dispatchPackets). BUMPS.
+  - UpdatePacketBatchesForNodeEnableDisable(node) -- enable/disable a node. BUMPS.
+
+Those are the ONLY three functions that mutate packetBatches_ / dispatchPackets /
+nodeRanges / gpuPackets_. The launch path (EnqueueGraphWithSingleList, lines ~775-817)
+is strictly read-only over dispatchPackets. Tracing the public API surface confirms
+every mutation routes through one of the three:
+
+  - hipGraphExecKernelNodeSetParams / Memcpy / Memcpy1D / FromSymbol / ToSymbol /
+    Memset / ChildGraph exec-setparams  -> UpdateAQLPacket (per cloned node).
+  - hipGraphExecUpdate (whole-graph)                                  -> UpdateAQLPacket loop.
+  - hipGraphNodeSetEnabled                              -> UpdatePacketBatchesForNodeEnableDisable.
+  - hipGraphInstantiate                  -> CaptureAQLPackets -> CaptureAndFormPacketsForGraph.
+
+Only kernel (non-coop), memset, and D2D-memcpy nodes are GraphCaptureEnabled (hence
+baked into PM4 IBs); host nodes are not capture-enabled and so cannot change the
+dispatched packet set. In-place kernarg CONTENT changes at the SAME address need no
+rebuild (the IB points at the address, the GPU reads fresh bytes at replay) -- and even
+those still bump conservatively because they go through UpdateAQLPacket. Conclusion:
+the invalidation is EXACT, not a heuristic, with no interior-node blind spot.
+
+DECISION: key cache is now DEFAULT ON. Because the version is supplied only by the HIP
+graph layer (non-graph callers pass 0 -> always slow path) and is provably bumped on
+every mutation, there is no correctness risk, and ANY latency-sensitive graph workload
+(not just our decode loop) benefits from skipping the per-launch O(N) rehash. Opt out
+with HIP_PM4_GRAPH_KEYCACHE=0.
+
+Validation of the default-on path (gfx1100, W7900):
+  - run_pm4_coverage.sh: all 9 scenarios (incl. recreate, varblk, scratch, wave64)
+    BIT-EXACT vs AQL baseline.
+  - hip_keycache_mutate (new): instantiate -> replay (arm cache) -> mutate -> replay,
+    for BOTH param update (hipGraphExecKernelNodeSetParams) and enable/disable
+    (hipGraphNodeSetEnabled). AQL baseline, PM4 keycache-on, and PM4 keycache-off all
+    produce the identical sequence  1.0 7.0 7.0 42.0 0.0 42.0  and PASS. A stale-IB bug
+    would have shown the PM4 value lagging the requested mutation; it does not.
+  - hip_pm4_evict_stress (new): 2000 distinct-IB mutations -> all replays correct AND
+    the IB cache never exceeds 16 entries (1984 evictions). Validates Q2's VRAM bound.
+
+Q2 -- rename + VRAM deallocation on mutation.
+
+Rename: the "token" is renamed to the recorded packet VERSION everywhere (HIP:
+RecordedPacketVersion / InvalidateRecordedPacketVersion / recordedPacketInstanceId_ /
+recordedPacketMutationCount_; device param: recordedPacketVersion; cache state:
+pm4IbCacheValid_ / pm4IbCacheVersion_ / pm4IbCacheEntry_). "Set" was dropped because it
+reads as a verb; the value is a version stamp, not an action.
+
+VRAM: YES, mutated-away IBs are now deallocated. The compiled-IB map pm4Graphs_ is keyed
+by content hash. A mutation that changes a HASHED packet field (grid/block dims, kernel
+object, kernarg address -- e.g. split-K with varying launch dims) hashes to a NEW key, so
+a NEW executable-pool IB is built while the pre-mutation IB becomes unreferenced. Two leaks
+were fixed:
+  - The deferred-scratch rebuild used to overwrite the Pm4GraphIb in place WITHOUT freeing
+    the old .ib (memory_pool_free) -- now freed first.
+  - Mutation accumulation: every distinct content left a dead IB in the map until the
+    VirtualGPU was destroyed. Now bounded by evictPm4GraphsIfNeeded(): a FIFO over
+    pm4GraphKeyOrder_ frees the oldest entries once pm4Graphs_ exceeds kPm4MaxCachedIbs
+    (16), NEVER freeing the armed entry (pm4IbCacheEntry_) or the entry built this launch.
+    unordered_map keeps pointers to surviving entries valid across erase, so the armed
+    fast-path pointer stays sound.
+NOTE: a pure kernarg-VALUE update (same address, new bytes) does NOT change the hash and
+does NOT rebuild -- which is exactly why the steady decode loop is a cache HIT, not a leak.
+
+Proof (hip_pm4_evict_stress, gfx1100 W7900): instantiate one graph, then mutate it 2000
+times each to a STRICTLY-NEW grid size (2000 distinct IBs). Result: every replay produces
+the requested value under both AQL and PM4 (PASS), and with AMD_LOG_LEVEL=3 the printed
+"[pm4-evict] cache size now N" never exceeds 16, with 1984 = (2000 - 16) evictions. The
+pool stays flat instead of growing by 2000 IBs.
+
+Q3/Q4 -- FIRST-EVER replay cost, PM4 vs default HIP graph (hip_replay_timing instrumented
+to time the cold launch in isolation; M=256, gfx1100 W7900). The first hipGraphLaunch after
+instantiate is where the PM4 path runs buildPm4GraphIb (encode the whole chain into one PM4
+IB), allocates the executable IB from a device memory pool, and DMA-uploads it -- a
+SYNCHRONOUS one-time cost that must complete before the submit doorbell. The AQL path has no
+IB to build, so its first launch is ~ its warm launch. Side-by-side:
+
+  WHAT IS "instantiate": hipGraphInstantiate (graph -> exec). It captures the per-node AQL
+  packets and allocates the kernarg pool. It is a SEPARATE one-time cost from the first
+  launch, grows with node count, and is ~identical for AQL and PM4 (the PM4 IB is NOT built
+  here -- it is built on the first launch). It is shown so the two one-time costs are not
+  conflated.
+
+  chain N |        instantiate       |  FIRST launch (cold)     |    2nd (warm)   |  steady avg
+          |  AQL    /  PM4           |  AQL     /  PM4          |  AQL  /  PM4    |  AQL  /  PM4
+  --------+--------------------------+--------------------------+----------------+--------------
+     1    |   48 us /   50 us        |   16 us  /   4189 us     | 4.6us / 6.2us  | 4.0us / 3.9us
+    64    |   99 us /  102 us        |   18 us  /   4879 us     | 5.0us / 7.2us  | 4.1us / 3.4us
+   256    |  313 us /  250 us        |   19 us  /   7619 us     | 6.9us / 5.5us  | 5.0us / 2.6us
+
+Reading:
+  - instantiate: AQL == PM4 (the PM4 IB build is deferred to first launch). Grows with N.
+  - FIRST launch: AQL ~16-19 us (no build). PM4 ~4.2 ms (N=1) to ~7.6 ms (N=256): a ~4 ms
+    floor + ~13 us/dispatch. The floor is the ONE-TIME executable-pool allocation + blocking
+    DMA copy/signal-wait; the per-N slope is the IB encode + larger upload. This is the
+    headline PM4 one-time cost and the single biggest "tricky moment" (top-of-file #1).
+  - 2nd launch: PM4 already == steady (~5-7 us), proving the entire build is paid exactly
+    ONCE per unique instantiated graph.
+  - steady: AQL rises 4.0 -> 5.0 us with N (it copies N packets each launch); PM4 is FLAT
+    ~2.6-3.9 us across N (the default-on key cache delivers the O(1) host issue).
+
+In a real decode the graph is instantiated once and replayed thousands of times, so the PM4
+~4-7 ms first-launch hit lands on the first decode step, amortizes to ~0 us/token, and never
+recurs (warm path thereafter; mutations that rebuild reuse the same pool and are bounded by
+Q2's eviction).

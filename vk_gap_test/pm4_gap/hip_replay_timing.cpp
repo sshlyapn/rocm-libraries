@@ -61,9 +61,34 @@ int main(int argc,char** argv){
     for(int it=0; it<N; ++it)
         hipLaunchKernelGGL(addk, grid, block, 0, stream, x, w, M);
     HC(hipStreamEndCapture(stream,&graph));
-    HC(hipGraphInstantiate(&exec,graph,nullptr,nullptr,0));
 
-    // Warm up: first launch compiles+uploads the PM4 IB (or primes the AQL path).
+    // One-time instantiate cost (graph -> exec; captures AQL packets for the
+    // PM4 path, allocates kernarg pool). Host-only.
+    double ti0 = now_us();
+    HC(hipGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+    double ti1 = now_us();
+    double t_instantiate = ti1 - ti0;
+
+    // FIRST-EVER replay: this host call is where the PM4 path compiles the whole
+    // chain into one PM4 IB (buildPm4GraphIb), allocates the executable IB from a
+    // device memory pool, and DMA-uploads it -- a synchronous one-time cost that
+    // must finish before the submit doorbell. Time the host call in isolation;
+    // every later launch reuses this IB. The AQL path has no IB build, so its
+    // first launch ~ its steady launch.
+    double tc0 = now_us();
+    HC(hipGraphLaunch(exec,stream));
+    double tc1 = now_us();
+    double t_cold = tc1 - tc0;
+    HC(hipStreamSynchronize(stream));
+
+    // Second launch (warm, IB already built/cached) for an apples-to-apples delta.
+    double tw0 = now_us();
+    HC(hipGraphLaunch(exec,stream));
+    double tw1 = now_us();
+    double t_warm2 = tw1 - tw0;
+    HC(hipStreamSynchronize(stream));
+
+    // Remaining warmup.
     for(int i=0;i<3;++i){ HC(hipGraphLaunch(exec,stream)); }
     HC(hipStreamSynchronize(stream));
 
@@ -80,7 +105,8 @@ int main(int argc,char** argv){
     HC(hipStreamSynchronize(stream));
 
     double avg = acc / R;
-    printf("N=%-4d M=%-6d R=%d  host hipGraphLaunch: avg=%.3f us  min=%.3f us  max=%.3f us  per-dispatch=%.4f us\n",
-           N, M, R, avg, mn, mx, avg/(double)N);
+    printf("N=%-4d M=%-6d R=%d  instantiate=%.3f us  FIRST(cold,build+upload)=%.3f us  2nd(warm)=%.3f us  "
+           "cold_overhead=%.3f us || steady host hipGraphLaunch: avg=%.3f us  min=%.3f us  max=%.3f us  per-dispatch=%.4f us\n",
+           N, M, R, t_instantiate, t_cold, t_warm2, t_cold - t_warm2, avg, mn, mx, avg/(double)N);
     return 0;
 }
