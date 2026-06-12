@@ -3140,3 +3140,70 @@ expert's L2-resident output is read by a consumer on another CU?) before using
 HIP_PM4_GRAPH on MoE models. DELTA/REORDER remain safe to layer on top once the
 base path is correct, since they preserve the pm4 path's exact register + fence
 semantics.
+  [RESOLVED in D.14: it was the PWS fence MECHANISM, not the cache scope. Fixed by
+  switching the per-edge fence to a blocking AGENT acquire, which is also faster.]
+
+### D.14 ROOT CAUSE + FIX: the per-edge fence must be BLOCKING, not PWS
+
+Investigation (gpt-oss-20b MoE, gfx1100, greedy decode sha over 48 tokens; the AQL
+baseline is deterministic at sha 579941330f4a164e):
+
+1. The MoE token compiles to ONE PM4 IB, 267 dispatches, NO fallback -- PM4 fully
+   drives it.
+2. Forcing a BLOCKING full-L2 fence per edge (HIP_PM4_GRAPH_FULLFENCE) made it
+   deterministic AND identical to baseline. So it is a per-edge fence problem.
+3. Bisecting the per-edge GCR mask as a BLOCKING acquire (HIP_PM4_GRAPH_EDGE_GCR):
+   mask 0x380 (AGENT: GLK|GLV|GL1, the SAME bits the PWS path carries) was ALREADY
+   deterministic + correct. 0x3B0/0xC380/0xC3B1 also correct. So the cache SCOPE
+   was never the issue.
+4. Therefore the bug is the PWS (partially-waited-sync) MECHANISM, not the scope:
+   RELEASE_MEM arms a counter and ACQUIRE_MEM waits on it, but the consumer DISPATCH
+   can begin before the AGENT invalidate is GLOBALLY complete -- the deferred wait
+   does not actually gate the consumer's reads on invalidate completion. Dense
+   Llama-8B hid this behind larger kernels' launch latency; MoE's 267 tiny
+   dependent dispatches/token expose it as non-deterministic stale reads.
+
+THE FIX: per-edge fence = BLOCKING AGENT acquire --
+  partialFlush() (drain producer waves) + acquireFull(kGcrAgent) (ACQUIRE_MEM with
+  GCR_CNTL = GLK|GLV|GL1, no L2 flush). L2 is the device coherence point; L0/L1 are
+  write-through, the drain puts the producer's writes in L2, and the blocking
+  ACQUIRE invalidates the consumer's L0/L1/K so it misses to L2. The token boundary
+  still does a full-L2 writeback. This is exactly the AGENT scope the runtime
+  applies to every AQL dispatch.
+
+It is also FASTER than PWS (the original study only compared PWS against a blocking
+FULL-L2 fence, whose GLK/GL2 invalidate cost grows with M -- it never tried a
+blocking AGENT fence, which has none of that cost):
+
+  Microbench (gfx1100, pinned, L=60, n=2000, us/dispatch; identical checksums):
+    M=4096   AQL 3.597 | PWS 2.597 | PWS+delta 2.403 |
+             blockAGENT 1.280 | blockAGENT+delta 1.085
+    M=65536  PWS 2.753 | blockAGENT 1.445 | blockAGENT+delta 1.251
+  => blocking AGENT ~2x cheaper per dispatch than PWS (one ACQUIRE_MEM vs a
+     RELEASE_MEM+ACQUIRE_MEM counter round-trip); +delta on top is fastest.
+
+  E2E gpt-oss-20b MoE (q0a, 512/128, SKIP_SAMPLING, n=10, clean):
+    baseline(AQL)        5.17 ms  839 Tok/s   (deterministic)
+    PWS  (old default)   4.94 ms  871 Tok/s   (NON-deterministic, WRONG)
+    blockAGENT           4.71 ms  905 Tok/s   (deterministic, matches baseline)
+    blockAGENT+delta     4.70 ms  910 Tok/s   (deterministic; +8.4% vs baseline)
+    blocking full-L2     4.91 ms  875 Tok/s   (correct but the L2 flush costs)
+
+IMPLEMENTATION (rocvirtual.cpp buildPm4GraphIb):
+  - DEFAULT per-edge fence is now blocking AGENT. Correct, deterministic, fastest.
+  - HIP_PM4_GRAPH_PWS=1 selects the LEGACY PWS fence (A/B only; UNSAFE for chains of
+    many tiny dependent kernels).
+  - HIP_PM4_GRAPH_DELTA composes with the blocking fence.
+  - HIP_PM4_GRAPH_REORDER only applies under PWS and remains a measured no-op.
+  - HIP_PM4_GRAPH_FULLFENCE / HIP_PM4_GRAPH_EDGE_GCR=<hex> are diagnostics that
+    override the blocking mask.
+
+VALIDATION on the new default:
+  - hip_pm4_coverage: ALL scenarios bit-exact vs AQL baseline (pm4/delta/reorder/
+    both), gfx1100, incl. varblk + scratch + wave64 + lds.
+  - gpt-oss-20b MoE: pm4 and pm4+delta now DETERMINISTIC (3/3 and 2/2) and identical
+    to the AQL baseline (sha 579941330f4a164e).
+
+NOTE: this supersedes the Appendix B / 6n framing that PWS was "THE FIX". PWS was a
+correct-looking but actually unsafe + slower detour; the blocking AGENT fence is
+the correct and faster per-edge primitive for the PM4-graph replay path.
