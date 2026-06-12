@@ -3327,3 +3327,43 @@ Q: Why is the default path AQL->PM4 translation instead of submitting PM4 direct
   but as a single AMD vendor PM4-IB packet that points the CP at our pre-built PM4 IB --
   keeping the safe user-mode one-submit path while bypassing the per-dispatch AQL->PM4
   translation and the per-packet serialized fence that made the default path slow.
+
+### D.17 MEASURED: isolated HOST (CPU) cost of issuing a replay -- O(1) claim REFUTED
+
+Tool: hip_replay_timing.cpp (vk_gap_test/pm4_gap). Captures an N-long addk chain
+into one hipGraph and times ONLY the host return latency of hipGraphLaunch with an
+empty queue each iteration (hipStreamSynchronize is done OUTSIDE the timer), so the
+number is the runtime's host work to submit the replay, not GPU execution. gfx1100
+W7900, M=256 (tiny grid so the GPU never lags), R=8000 timed launches, avg / min us.
+
+  N      AQL graph replay (avg/min)     PM4-IB replay (avg/min)
+  1      2.46 / 1.85                    2.59 / 1.91
+  16     3.36 / 2.71                    2.81 / 2.22
+  64     3.94 / 3.32                    4.38 / 3.66
+  256    5.11 / 4.50                    9.82 / 9.03
+  512    7.03 / 5.83                   17.02 / 16.41
+  per-dispatch host slope: AQL ~8.9 ns/disp   PM4 ~28 ns/disp
+
+FINDING (correcting an earlier verbal claim that PM4 host issue is O(1)): it is NOT.
+Both paths are O(N) on the host, and PM4 is actually the STEEPER one (crosses over
+around N ~ 32-64 and is ~2.4x slower at N=512). Reasons:
+  - The CLR hipGraph executor materializes/processes the per-node AQL packet list on
+    the host on EVERY launch, for both paths -- that is the shared O(N) floor.
+  - The PM4 path then adds a per-launch O(N) CONTENT HASH (pm4GraphKey) to look up the
+    cached IB: it reads 6 scattered fields from each recorded packet and runs a
+    byte-wise FNV loop. That is heavier per packet than the AQL path's streaming
+    64-byte ring memcpy it replaces. The O(1) part (buildPwsVendorPkt + one ring write
+    + one doorbell) is real, but it is preceded by that O(N) hash.
+So PM4's win is ENTIRELY GPU/CP-side (fewer, leaner packets + lean fence); it does
+NOT reduce -- and slightly increases -- host issue cost.
+
+WHY IT DOES NOT MATTER FOR TPOT: even at N=512 the host issue is ~17 us, vs ~5000 us
+per decode token (gpt-oss-20b). That is ~0.3% of token time and it OVERLAPS GPU
+execution (hipGraphLaunch is async). The measured e2e speedup (D.15) is unaffected by
+this and is purely the GPU-side dispatch-gap reduction.
+
+FOLLOW-UP OPPORTUNITY (not yet implemented): the recorded packet set is stable for a
+given hipGraphExec, so pm4GraphKey could be computed ONCE (first launch) and cached on
+the graph/exec, removing PM4's per-launch O(N) hash and finally making PM4 host issue
+O(1) (one vendor packet + doorbell). It would only shave ~10-15 us/token (~0.3%), so
+it is low priority, but it would also make PM4 the cheapest host path at every N.
