@@ -1982,6 +1982,37 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
   // re-emit. Plain ASCII only.
   const bool delta = pm4GraphDeltaEnabled();
   const bool reorder = pm4GraphReorderEnabled();
+
+  // Per-edge fence mechanism. DEFAULT (and the only correct choice) is a BLOCKING
+  // AGENT acquire: CS_PARTIAL_FLUSH (drain the producer's waves) + ACQUIRE_MEM
+  // with GCR_CNTL = kGcrAgent (invalidate GLK/GLV/GL1; NO L2 flush -- L2 is the
+  // device coherence point and only the token boundary needs a full-L2 writeback).
+  // This mirrors the runtime's AGENT dispatch scope and is sufficient for
+  // device-local kernel->kernel RAW: L0/L1 are write-through to L2, the drain puts
+  // the producer's writes in L2, and the consumer's L0/L1/K invalidate makes it
+  // miss to L2. It is correct, deterministic, and ~2x cheaper per dispatch than the
+  // PWS path (one ACQUIRE_MEM vs a RELEASE_MEM+ACQUIRE_MEM counter round-trip).
+  //
+  // HIP_PM4_GRAPH_PWS (opt-in, LEGACY, UNSAFE): the old partially-waited-sync
+  // deferred fence (RELEASE_MEM arms a counter, ACQUIRE_MEM waits) that tried to
+  // overlap the flush with the next dispatch. It is BUGGY: the consumer DISPATCH
+  // can begin before the AGENT invalidate is globally complete, so a chain of many
+  // tiny dependent kernels (e.g. gpt-oss MoE, 267 dispatches/token) reads stale
+  // data NON-deterministically and diverges from the AQL baseline. Larger dense
+  // kernels (Llama-8B) happened to hide the race behind launch latency. Kept only
+  // for A/B; do NOT use in production. (See HIP_VS_VULKAN.md D.13/D.14.)
+  const bool usePws = (getenv("HIP_PM4_GRAPH_PWS") != nullptr);
+
+  // DIAGNOSTIC (HIP_PM4_GRAPH_FULLFENCE / HIP_PM4_GRAPH_EDGE_GCR): override the
+  // blocking per-edge GCR mask. FULLFENCE uses the full-L2 mask; EDGE_GCR=<hexmask>
+  // uses an explicit GCR_CNTL so we can bisect which cache bit a graph needs.
+  // GCR bits: GLI_INV(0) GLM_WB(4) GLM_INV(5) GLK_INV(7) GLV_INV(8) GL1_INV(9)
+  //           GL2_INV(14) GL2_WB(15). kGcrAgent=0x380, full gfx11=0xC3B1.
+  const char* edgeGcrEnv = getenv("HIP_PM4_GRAPH_EDGE_GCR");
+  const bool fullFence = (getenv("HIP_PM4_GRAPH_FULLFENCE") != nullptr) || (edgeGcrEnv != nullptr);
+  const uint32_t edgeGcr =
+      edgeGcrEnv ? static_cast<uint32_t>(strtoul(edgeGcrEnv, nullptr, 0)) : arch.gcrFull;
+  const uint32_t edgeMask = fullFence ? edgeGcr : kGcrAgent;
   struct ShadowReg { bool valid = false; uint32_t cnt = 0; uint32_t sig = 0; uint32_t v[8] = {0}; };
   ShadowReg shStartX, shPgm, shScratch, shRsrc, shResLim, shTmpring, shUserD;
   auto setshDelta = [&](ShadowReg& sh, uint32_t reg, const uint32_t* v, uint32_t cnt,
@@ -2118,30 +2149,33 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
   // first packet's acquire scope; the self-contained microbench hid the need.
   acquireFull(arch.gcrFull);
 
-  if (!reorder) {
-    // Baseline order (byte-identical to the pre-delta emitter when delta is off):
-    // [regs i][dispatch i][drain][release][acquire] per dispatch.
+  if (!usePws) {
+    // DEFAULT: blocking AGENT fence per edge -- [regs i][dispatch i][drain][acquire].
+    // Correct, deterministic, and faster than PWS. fullFence/EDGE_GCR override the
+    // mask for diagnostics; otherwise it is kGcrAgent (no L2 flush per edge).
     for (size_t i = 0; i < numPackets; ++i) {
       auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
       int st = emitRegs(p);
       if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return out; }
       emitDispatchPacket(p);
-      // In-place PWS fence (overlap the AGENT cache flush with the next dispatch).
+      partialFlush();          // drain the producer's waves (writes reach L2)
+      acquireFull(edgeMask);   // blocking invalidate so the consumer sees them
+    }
+  } else if (!reorder) {
+    // LEGACY PWS (HIP_PM4_GRAPH_PWS): deferred-wait fence. UNSAFE (see above).
+    for (size_t i = 0; i < numPackets; ++i) {
+      auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
+      int st = emitRegs(p);
+      if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return out; }
+      emitDispatchPacket(p);
       partialFlush();
       releaseMemPws(kGcrAgent);
       acquirePws();
     }
   } else {
-    // Reorder: program kernel i's registers BETWEEN the drain/release of kernel
-    // i-1 and its acquire, so the CP front-end overlaps i-1's wave drain and the
-    // in-flight AGENT cache flush. The drain stays first (i-1 retired -> its
-    // registers are reusable) and the acquire stays before dispatch i (kernel i
-    // observes coherent memory). The trailing AGENT fence after the last dispatch
-    // is subsumed by the final full-L2 acquire, so it is naturally elided.
-    //
-    // WARNING: measured NO-OP for performance on RDNA3 (the CP ME is in-order, so
-    // this overlap does not exist in practice). Kept for experimentation only;
-    // prefer HIP_PM4_GRAPH_DELTA. See pm4GraphReorderEnabled() and D.13.
+    // LEGACY PWS + reorder: program kernel i's registers BETWEEN i-1's release and
+    // acquire. WARNING: reorder is a measured NO-OP on RDNA3 (the CP ME is in-order)
+    // AND the PWS fence it builds on is UNSAFE. Experimentation only.
     auto* p0 = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[0]);
     int st = emitRegs(p0);
     if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return out; }
