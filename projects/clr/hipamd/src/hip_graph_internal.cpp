@@ -504,6 +504,10 @@ void GraphExec::PacketBatch::setEnabled(GraphNode* node, bool enabled) {
 hipError_t GraphExec::CaptureAndFormPacketsForGraph() {
   hipError_t status = hipSuccess;
 
+  // Recorded packet set is being (re)formed: invalidate the PM4 replay token so
+  // any cached PM4 IB is recompiled/relooked-up on the next launch.
+  BumpPm4Epoch();
+
   // Clear previous capture status and batches
   nodeCaptureStatus_.clear();
   nodeCaptureStatus_.resize(topoOrder_.size(), false);
@@ -645,6 +649,8 @@ hipError_t GraphExec::UpdateAQLPacket(hip::GraphNode* node) {
   if (max_streams_ != 1 || !node->GraphCaptureEnabled()) {
     return hipSuccess;
   }
+  // A node's recorded packet is about to change -> invalidate the PM4 replay token.
+  BumpPm4Epoch();
   //ToDo: Add batching support for multi-device linear graph
   if (max_streams_dev_.size() == 1) {
     // Find which batch contains this node and update it
@@ -718,6 +724,9 @@ hipError_t GraphExec::UpdatePacketBatchesForNodeEnableDisable(hip::GraphNode* no
     // Only handle single stream and single device case with captured nodes
     return hipSuccess;
   }
+  // The dispatched packet set changes (a node is enabled/disabled) -> invalidate
+  // the PM4 replay token so the cached IB is not reused for a different set.
+  BumpPm4Epoch();
   // Find which batch contains this node and update its enabled state
   for (auto& batch : packetBatches_) {
     auto it = batch.nodeToRangeIndex.find(node);
@@ -770,7 +779,8 @@ hipError_t GraphExec::EnqueueGraphWithSingleList(hip::Stream* hip_stream) {
         if (batch.disabledNodeCount == 0) {
           // Fast path: all nodes enabled, dispatch entire batch
           bool batchStatus = hip_stream->vdev()->dispatchAqlPacketBatch(
-              batch.dispatchPackets, batch.dispatchKernelNames, accumulate);
+              batch.dispatchPackets, batch.dispatchKernelNames, accumulate,
+              Pm4ReplayToken(batchIndex));
           if (!batchStatus) {
             status = hipErrorUnknown;
             accumulate->release();
@@ -793,7 +803,8 @@ hipError_t GraphExec::EnqueueGraphWithSingleList(hip::Stream* hip_stream) {
           // Only dispatch if there are enabled packets
           if (!enabledPackets.empty()) {
             bool batchStatus = hip_stream->vdev()->dispatchAqlPacketBatch(
-                enabledPackets, enabledKernelNames, accumulate);
+                enabledPackets, enabledKernelNames, accumulate,
+                Pm4ReplayToken(batchIndex));
             if (!batchStatus) {
               status = hipErrorUnknown;
               accumulate->release();

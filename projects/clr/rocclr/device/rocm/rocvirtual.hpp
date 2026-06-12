@@ -475,14 +475,16 @@ class VirtualGPU : public device::VirtualDevice {
   //! Dispatches multiple AQL packets in a single batch operation
   bool dispatchAqlPacketBatch(const std::vector<uint8_t*>& packets,
                               const std::vector<std::string>& kernelNames,
-                              amd::AccumulateCommand* vcmd = nullptr);
+                              amd::AccumulateCommand* vcmd = nullptr,
+                              uint64_t graphReplayToken = 0);
   template <typename AqlPacket> bool dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header,
                                                               uint16_t rest, bool blocking,
                                                               bool attach_signal = false);
   //! Dispatches multiple AQL packets with a single doorbell ring
   template <typename AqlPacket> bool dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& packets,
                                                                    bool blocking, bool attach_signal = false,
-                                                                   const std::vector<std::string>* kernelNames = nullptr);
+                                                                   const std::vector<std::string>* kernelNames = nullptr,
+                                                                   uint64_t graphReplayToken = 0);
 
   bool dispatchCounterAqlPacket(hsa_ext_amd_aql_pm4_packet_t* packet, const uint32_t gfxVersion,
                                 bool blocking, const hsa_ven_amd_aqlprofile_1_00_pfn_t* extApi);
@@ -518,16 +520,16 @@ class VirtualGPU : public device::VirtualDevice {
   int pm4GraphDeltaState_ = -1;     //!< HIP_PM4_GRAPH_DELTA env gate (register delta-encode)
   int pm4GraphReorderState_ = -1;   //!< HIP_PM4_GRAPH_REORDER env gate (front-end reorder)
   int pm4GraphKeyCacheState_ = -1;  //!< HIP_PM4_GRAPH_KEYCACHE env gate (skip per-launch rehash)
-  // Last-lookup fast path: when the same packet array is replayed back-to-back
-  // (the steady-state decode loop), skip recomputing the O(N) content hash. A
-  // strong identity (count + first/last packet pointers AND a fold of their
-  // content fields) guards against ABA reuse; the cached pointer is into the
-  // node-based pm4Graphs_ map so it stays valid across inserts.
+  // Last-lookup fast path: when the SAME recorded packet set is replayed back to
+  // back (the steady-state decode loop), skip recomputing the O(N) content hash.
+  // Validated by the graph-supplied replay token, which is nonzero, unique per
+  // GraphExec instantiation+batch, and bumped on ANY packet mutation (param
+  // update / enable-disable / re-capture) -- so this is a RELIABLE invalidation,
+  // not a heuristic. token 0 (non-graph caller) always takes the slow path. The
+  // cached pointer is into the node-based pm4Graphs_ map, so it stays valid
+  // across map inserts.
   bool pm4KeyCacheValid_ = false;
-  const void* pm4KeyCacheFirst_ = nullptr;
-  const void* pm4KeyCacheLast_ = nullptr;
-  size_t pm4KeyCacheNum_ = 0;
-  uint64_t pm4KeyCacheSig_ = 0;
+  uint64_t pm4KeyCacheToken_ = 0;
   Pm4GraphIb* pm4KeyCacheIb_ = nullptr;
   bool pm4GraphActive();
   bool pm4GraphScratchEnabled();
@@ -537,7 +539,8 @@ class VirtualGPU : public device::VirtualDevice {
   void* allocExecIbFromData(const uint32_t* data, uint32_t dw);  //!< stage data into an executable IB
   static uint64_t pm4GraphKey(void* const* packets, size_t numPackets);  //!< content hash
   Pm4GraphIb buildPm4GraphIb(void* const* packets, size_t numPackets);
-  bool tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking, bool attach_signal);
+  bool tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking, bool attach_signal,
+                         uint64_t graphReplayToken);
   void dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveDepSignal = false,
                                   hsa_signal_t signal = hsa_signal_t{0},
                                   hsa_signal_value_t value = 0, hsa_signal_value_t mask = 0,

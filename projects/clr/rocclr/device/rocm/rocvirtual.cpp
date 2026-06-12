@@ -1258,7 +1258,8 @@ bool VirtualGPU::dispatchAqlPacket(hsa_barrier_and_packet_t* packet, uint16_t he
 template <typename AqlPacket>
 bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& packets,
                                                bool blocking, bool attach_signal,
-                                               const std::vector<std::string>* kernelNames) {
+                                               const std::vector<std::string>* kernelNames,
+                                               uint64_t graphReplayToken) {
   if (packets.empty()) {
     return false;
   }
@@ -1269,7 +1270,7 @@ bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& pa
   // unsupported (non-dispatch, scratch, or non-trivial kernarg ABI).
   if (pm4GraphActive() && kernelNames != nullptr) {
     if (tryReplayPm4Graph(reinterpret_cast<void* const*>(packets.data()), packets.size(), blocking,
-                          attach_signal)) {
+                          attach_signal, graphReplayToken)) {
       return true;
     }
   }
@@ -1475,7 +1476,8 @@ bool VirtualGPU::dispatchGenericAqlPacketBatch(const std::vector<AqlPacket*>& pa
 // ================================================================================================
 bool VirtualGPU::dispatchAqlPacketBatch(const std::vector<uint8_t*>& packets,
                                         const std::vector<std::string>& kernelNames,
-                                        amd::AccumulateCommand* vcmd) {
+                                        amd::AccumulateCommand* vcmd,
+                                        uint64_t graphReplayToken) {
   if (vcmd == nullptr || packets.empty() || packets.size() != kernelNames.size()) {
     return false;
   }
@@ -1492,7 +1494,8 @@ bool VirtualGPU::dispatchAqlPacketBatch(const std::vector<uint8_t*>& packets,
   // Cast packets vector to AQL packets vector on the fly
   const auto& aqlPackets =
       reinterpret_cast<const std::vector<hsa_kernel_dispatch_packet_t*>&>(packets);
-  bool result = dispatchGenericAqlPacketBatch(aqlPackets, false, false, &kernelNames);
+  bool result = dispatchGenericAqlPacketBatch(aqlPackets, false, false, &kernelNames,
+                                              graphReplayToken);
 
   profilingEnd();
 
@@ -2226,35 +2229,20 @@ VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t 
 }
 
 bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking,
-                                   bool attach_signal) {
+                                   bool attach_signal, uint64_t graphReplayToken) {
   if (numPackets == 0) return false;
 
-  // Fast path: same packet array as the previous launch -> reuse the cached IB
-  // pointer without recomputing the O(N) content hash (HIP_PM4_GRAPH_KEYCACHE).
-  // Strong identity: count + first/last packet pointers + a fold of their content
-  // fields (kernel_object/kernarg_address/dims) so ABA reuse or an endpoint param
-  // change forces the slow path. Deferred-scratch entries are never cached here
-  // (their status flips), so the fast path only ever serves kPm4Ready IBs.
+  // Fast path: same recorded packet set as the previous launch -> reuse the cached
+  // IB pointer without recomputing the O(N) content hash (HIP_PM4_GRAPH_KEYCACHE).
+  // Validated by the graph-supplied replay token: nonzero, unique per GraphExec
+  // instantiation+batch, and bumped on ANY packet mutation (param update,
+  // enable/disable, re-capture). This is a RELIABLE invalidation, not a heuristic.
+  // token 0 (non-graph caller) always takes the slow path. Deferred-scratch entries
+  // are never cached here (status flips), so the fast path only serves kPm4Ready.
   const bool keyCache = pm4GraphKeyCacheEnabled();
-  uint64_t fastSig = 0;
-  if (keyCache) {
-    auto foldPkt = [](uint64_t h, hsa_kernel_dispatch_packet_t* p) -> uint64_t {
-      auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
-      mix(p->kernel_object);
-      mix(reinterpret_cast<uint64_t>(p->kernarg_address));
-      mix(static_cast<uint64_t>(p->grid_size_x) | (static_cast<uint64_t>(p->grid_size_y) << 21) |
-          (static_cast<uint64_t>(p->grid_size_z) << 42));
-      mix(p->header | (static_cast<uint64_t>(p->setup) << 16));
-      return h;
-    };
-    fastSig = foldPkt(1469598103934665603ull,
-                      reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[0]));
-    fastSig = foldPkt(fastSig,
-                      reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[numPackets - 1]));
-    if (pm4KeyCacheValid_ && pm4KeyCacheNum_ == numPackets &&
-        pm4KeyCacheFirst_ == packets[0] && pm4KeyCacheLast_ == packets[numPackets - 1] &&
-        pm4KeyCacheSig_ == fastSig && pm4KeyCacheIb_ != nullptr &&
-        pm4KeyCacheIb_->status == kPm4Ready) {
+  if (keyCache && graphReplayToken != 0) {
+    if (pm4KeyCacheValid_ && pm4KeyCacheToken_ == graphReplayToken &&
+        pm4KeyCacheIb_ != nullptr && pm4KeyCacheIb_->status == kPm4Ready) {
       Pm4GraphIb& gc = *pm4KeyCacheIb_;
       bool attachSignalC = timestamp_ != nullptr || attach_signal;
       hsa_signal_t sigC = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignalC);
@@ -2294,13 +2282,11 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
   }
   if (g.status != kPm4Ready) return false;
 
-  // Arm the fast path for the next launch (only for ready, non-scratch IBs).
-  if (keyCache) {
+  // Arm the fast path for the next launch (only for ready, non-scratch IBs and a
+  // valid graph token).
+  if (keyCache && graphReplayToken != 0) {
     pm4KeyCacheValid_ = true;
-    pm4KeyCacheNum_ = numPackets;
-    pm4KeyCacheFirst_ = packets[0];
-    pm4KeyCacheLast_ = packets[numPackets - 1];
-    pm4KeyCacheSig_ = fastSig;
+    pm4KeyCacheToken_ = graphReplayToken;
     pm4KeyCacheIb_ = &g;
   }
 

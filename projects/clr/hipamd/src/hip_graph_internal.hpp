@@ -20,6 +20,7 @@
 
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <queue>
 #include <stack>
 #include <iostream>
@@ -892,7 +893,27 @@ class GraphExec : public amd::ReferenceCountedObject, public Graph {
   //! child graphs to determine the maximum concurrent streams needed per device
   void FindStreamsReqPerDev();
 
+  //! PM4-graph replay token: a RELIABLE identity for the current recorded packet
+  //! set. Unique per GraphExec instantiation (pm4ReplayId_) and bumped on any
+  //! packet mutation (pm4Epoch_), folded with the batch index so each batch in a
+  //! multi-batch graph gets a distinct nonzero value. The rocm PM4 replay key
+  //! cache uses it to skip the per-launch content rehash without losing
+  //! correctness: any update changes the token, so a stale IB can never be reused.
+  uint64_t Pm4ReplayToken(size_t batchIndex) const {
+    uint64_t t = (pm4ReplayId_ * 1099511628211ull) ^
+                 (pm4Epoch_ * 0x9E3779B97F4A7C15ull) ^ (batchIndex + 1);
+    return t == 0 ? 1 : t;
+  }
+  //! Invalidate the replay token (call on any recorded-packet mutation).
+  void BumpPm4Epoch() { ++pm4Epoch_; }
+
  protected:
+  static uint64_t NextPm4ReplayId() {
+    static std::atomic<uint64_t> gen{0};
+    return ++gen;
+  }
+  uint64_t pm4ReplayId_ = NextPm4ReplayId();  //!< unique per instantiation
+  uint64_t pm4Epoch_ = 0;                      //!< bumped on any packet mutation
   //! Topological order of the graph doesn't include nodes embedded as part of the child graph
   std::vector<Node> topoOrder_;
   //! parallel streams per device

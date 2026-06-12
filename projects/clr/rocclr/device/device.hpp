@@ -1324,10 +1324,13 @@ class VirtualDevice : public amd::ReferenceCountedObject {
   //! Init hidden heap for device memory allocations
   virtual void HiddenHeapInit() = 0;
 
-  //! Dispatches multiple AQL packets in a single batch operation
+  //! Dispatches multiple AQL packets in a single batch operation. graphReplayToken
+  //! is a reliable identity for the recorded packet set (nonzero, stable iff the
+  //! packets are unchanged, bumped on any graph update); 0 means "unknown".
   virtual bool dispatchAqlPacketBatch(const std::vector<uint8_t*>& packets,
                                       const std::vector<std::string>& kernelNames,
-                                      amd::AccumulateCommand* vcmd = nullptr) = 0 ;
+                                      amd::AccumulateCommand* vcmd = nullptr,
+                                      uint64_t graphReplayToken = 0) = 0 ;
   //! Returns the number of outstanding HSA async handlers
   std::atomic<uint64_t>& QueuedAsyncHandlers() const { return queued_async_handlers_; }
 
