@@ -1442,18 +1442,56 @@ bool VirtualGPU::dispatchAqlPacket(hsa_barrier_and_packet_t* packet, uint16_t he
 // For graphs that fit in the queue the yield never fires.  For oversized graphs the GPU drains
 // earlier chunks while the CPU copies later ones, avoiding a deadlock.  Packet-0's header is
 // committed last in the first chunk per the AQL protocol.
+//
+// recordedPacketVersion / pm4Template carry the optional PM4-IB graph-replay fast
+// path (HIP_PM4_GRAPH): when active the whole captured dispatch chain replays as one
+// vendor PM4 IB instead of N AQL packets, falling through to the flat AQL path below
+// when PM4 replay is off or the graph is not PM4-replayable.
 bool VirtualGPU::dispatchAqlPacketBatchFlat(const std::vector<uint8_t>& flatPacketData,
                                             const std::vector<uint32_t>& validFullHeaders,
                                             amd::AccumulateCommand* vcmd, bool attach_signal,
                                             const std::vector<const std::string*>* kernelNames,
-                                            bool pre_patched, bool blocking) {
+                                            bool pre_patched, bool blocking,
+                                            uint64_t recordedPacketVersion,
+                                            const void* pm4Template) {
   if (vcmd == nullptr || flatPacketData.empty() || validFullHeaders.empty()) {
     return false;
   }
-
   const size_t numPackets = validFullHeaders.size();
-  if (flatPacketData.size() != numPackets * 64) {
+  if (flatPacketData.size() != numPackets * sizeof(hsa_kernel_dispatch_packet_t)) {
     return false;
+  }
+
+  // EXPERIMENTAL: replay an all-dispatch captured graph as one PM4 IB (single CP
+  // jump, lean raw-PM4 dispatches + in-place PWS fences). kernelNames != nullptr
+  // marks the graph-replay path. Falls back to the flat AQL replay below if any
+  // packet is unsupported (non-dispatch, scratch, or non-trivial kernarg ABI).
+  //
+  // The flat buffer stores 64-byte packet bodies with the 2-byte AQL header
+  // invalidated (the real header is in validFullHeaders) and the completion signal
+  // zeroed. The queue-independent PM4 encoder/replayer needs valid dispatch packets,
+  // so restore the headers into a local copy and pass an array of packet pointers.
+  //
+  // HIP_PM4_GRAPH_BUILD_AFTER: on the FIRST replay (cache miss) do NOT build the IB
+  // before submit (allowBuild=false) -- replay via AQL below and build right after
+  // the submit (prebuildPm4Graph), so the build overlaps the GPU executing the
+  // graph just submitted, and the AQL submit sizes the scratch the build needs.
+  const auto* tmpl = static_cast<const Pm4GraphTemplate*>(pm4Template);
+  const bool pm4GraphReplay = pm4GraphActive() && kernelNames != nullptr;
+  const bool pm4BuildAfter = pm4GraphReplay && pm4GraphBuildAfterEnabled();
+  if (pm4GraphReplay) {
+    constexpr size_t kAqlBytes = sizeof(hsa_kernel_dispatch_packet_t);
+    std::vector<uint8_t> hdrRestored(flatPacketData);
+    std::vector<void*> pktPtrs(numPackets);
+    for (size_t i = 0; i < numPackets; ++i) {
+      const uint16_t hdr = static_cast<uint16_t>(validFullHeaders[i]);
+      memcpy(hdrRestored.data() + i * kAqlBytes, &hdr, sizeof(hdr));
+      pktPtrs[i] = hdrRestored.data() + i * kAqlBytes;
+    }
+    if (tryReplayPm4Graph(pktPtrs.data(), numPackets, blocking, attach_signal,
+                          recordedPacketVersion, /*allowBuild=*/!pm4BuildAfter, tmpl)) {
+      return true;
+    }
   }
 
   std::scoped_lock lock(execution());
@@ -1662,6 +1700,23 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const std::vector<uint8_t>& flatPack
     }
   }
 
+  // HIP_PM4_GRAPH_BUILD_AFTER: the graph just replayed via the flat AQL path above.
+  // Build the PM4 IB now -- overlapped with the GPU executing that replay, and with
+  // scratch already sized by the submit -- so the NEXT replay uses the single-IB fast
+  // path. Reconstruct the header-restored packet pointers (same bridge as the replay
+  // attempt at the top of this function).
+  if (pm4BuildAfter) {
+    constexpr size_t kAqlBytes = sizeof(hsa_kernel_dispatch_packet_t);
+    std::vector<uint8_t> hdrRestored(flatPacketData);
+    std::vector<void*> pktPtrs(numPackets);
+    for (size_t i = 0; i < numPackets; ++i) {
+      const uint16_t hdr = static_cast<uint16_t>(validFullHeaders[i]);
+      memcpy(hdrRestored.data() + i * kAqlBytes, &hdr, sizeof(hdr));
+      pktPtrs[i] = hdrRestored.data() + i * kAqlBytes;
+    }
+    prebuildPm4Graph(pktPtrs.data(), numPackets, recordedPacketVersion, tmpl);
+  }
+
   profilingEnd();
   return true;
 }
@@ -1758,6 +1813,1127 @@ void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,
   barrier_packet_.dep_signal[2] = hsa_signal_t{};
   barrier_packet_.dep_signal[3] = hsa_signal_t{};
   barrier_packet_.dep_signal[4] = hsa_signal_t{};
+}
+
+// ================================================================================================
+// EXPERIMENTAL PWS inter-kernel fence (HIP_PWS_FENCE=1, gfx11 only).
+//
+// Replicates RADV's GFX11 overlap mechanism on the HIP AQL queue: instead of the
+// firmware doing a blocking ACQUIRE_MEM from the dispatch packet's acquire/release
+// scope, we strip that scope (see submitKernelInternal) and inject an inline
+// vendor PM4-IB packet whose IB is CS_PARTIAL_FLUSH + RELEASE_MEM(PWS) +
+// ACQUIRE_MEM(PWS). RELEASE_MEM issues the GCR cache flush async and bumps the PWS
+// counter; the PWS ACQUIRE_MEM waits the counter without stalling the CP inline,
+// so the flush overlaps the next dispatch. Validated standalone in
+// vk_gap_test/pm4_gap/hsa_pws_spike.cpp (bit-exact vs the scope fence, no hang).
+// Plain ASCII only.
+bool VirtualGPU::pwsFenceActive() {
+  if (pwsFenceState_ < 0) {
+    pwsFenceState_ = (getenv("HIP_PWS_FENCE") != nullptr) ? 1 : 0;
+  }
+  return pwsFenceState_ == 1;
+}
+
+bool VirtualGPU::ensurePwsIb() {
+  if (pwsIbBuf_ != nullptr) {
+    return true;
+  }
+  // PM4 IB dwords lifted verbatim from pm4_layer.cpp (GCR_AGENT_LIKE = 0x380:
+  // GL1_INV | GLV_INV | GLK_INV). shaderType=1 on the inner packets (MEC).
+  // HIP_PWS_NODRAIN=1 drops the leading CS_PARTIAL_FLUSH: in the AQL path the
+  // next dispatch's BARRIER bit already drains the prior dispatch, so the
+  // explicit wave drain may be redundant (must be verified bit-exact).
+  static const uint32_t kPwsIbFull[] = {
+      0xC0004602u, 0x00000407u,                                  // CS_PARTIAL_FLUSH
+      0xC0064902u, 0xC000C528u, 0, 0, 0, 0, 0, 0,                // RELEASE_MEM(PWS, GCR=0x380)
+      0xC0065802u, 0x00022800u, 0xFFFFFFFFu, 0x01FFFFFFu, 0, 0, 0x80000000u, 0,  // ACQUIRE_MEM(PWS)
+  };
+  const bool noDrain = getenv("HIP_PWS_NODRAIN") != nullptr;
+  const uint32_t* kPwsIb = noDrain ? (kPwsIbFull + 2) : kPwsIbFull;  // skip CS_PARTIAL_FLUSH
+  pwsIbDw_ = noDrain ? 16u : 18u;
+  // The CP indirect-buffer fetcher needs EXECUTABLE GPU memory.
+  void* dev = nullptr;
+  if (Hsa::memory_pool_allocate(roc_device_.getGpuvmSegment(), 0x1000,
+                                HSA_AMD_MEMORY_POOL_EXECUTABLE_FLAG, &dev) != HSA_STATUS_SUCCESS) {
+    LogError("PWS: executable IB allocation failed");
+    return false;
+  }
+  hsa_agent_t gpu = roc_device_.getBackendDevice();
+  Hsa::agents_allow_access(1, &gpu, nullptr, dev);
+  // Executable device memory is not CPU-writable, so stage via a host buffer.
+  void* host = nullptr;
+  if (Hsa::memory_pool_allocate(roc_device_.getCpuFineGrainPool(), 0x1000, 0, &host) !=
+      HSA_STATUS_SUCCESS) {
+    Hsa::memory_pool_free(dev);
+    LogError("PWS: host staging allocation failed");
+    return false;
+  }
+  hsa_agent_t agents[2] = {gpu, roc_device_.getCpuAgent()};
+  Hsa::agents_allow_access(2, agents, nullptr, host);
+  memset(host, 0, 0x1000);
+  memcpy(host, kPwsIb, pwsIbDw_ * sizeof(uint32_t));
+  hsa_signal_t s;
+  Hsa::signal_create(1, 0, nullptr, &s);
+  Hsa::memory_async_copy(dev, gpu, host, roc_device_.getCpuAgent(), 0x1000, 0, nullptr, s);
+  while (Hsa::signal_wait_scacquire(s, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX,
+                                    HSA_WAIT_STATE_BLOCKED) >= 1) {}
+  Hsa::signal_destroy(s);
+  Hsa::memory_pool_free(host);
+  pwsIbBuf_ = dev;
+  ClPrint(amd::LOG_INFO, amd::LOG_AQL, "PWS: inter-kernel fence IB ready @%p", pwsIbBuf_);
+  return true;
+}
+
+// Vendor AMD_AQL_FORMAT_PM4_IB packet (same 64-byte layout ROCr
+// AqlQueue::ExecutePM4 uses). completion_signal = 0 so the CP does not block on
+// it inline -- the PWS RELEASE/ACQUIRE inside the IB provide the ordering, and
+// the cache flush overlaps the next dispatch.
+struct PwsVendorPkt {
+  uint16_t header;
+  uint16_t ven_hdr;
+  uint32_t ib_jump_cmd[4];
+  uint32_t dw_cnt_remain;
+  uint32_t reserved[8];
+  hsa_signal_t completion_signal;
+};
+static void buildPwsVendorPkt(PwsVendorPkt* pkt, void* ibBuf, uint32_t kPwsIbDw) {
+  const uint64_t base = reinterpret_cast<uint64_t>(ibBuf);
+  memset(pkt, 0, sizeof(*pkt));
+  pkt->header = HSA_PACKET_TYPE_VENDOR_SPECIFIC << HSA_PACKET_HEADER_TYPE;  // = 0
+  pkt->ven_hdr = 0x1;                                                       // AMD_AQL_FORMAT_PM4_IB
+  pkt->ib_jump_cmd[0] = (3u << 30) | ((4u - 2u) << 16) | (0x3Fu << 8);     // INDIRECT_BUFFER, shaderType 0
+  pkt->ib_jump_cmd[1] = static_cast<uint32_t>(((base >> 2) & 0x3FFFFFFFull) << 2);
+  pkt->ib_jump_cmd[2] = static_cast<uint32_t>((base >> 32) & 0xFFFFull);
+  pkt->ib_jump_cmd[3] = (kPwsIbDw & 0xFFFFFu) | (1u << 23);                // IB_SIZE | IB_VALID
+  pkt->dw_cnt_remain = 0xA;
+  pkt->completion_signal = hsa_signal_t{0};
+}
+
+// Eager path: append the PWS vendor packet directly to the live HW queue.
+void VirtualGPU::injectPwsFence() {
+  if (!ensurePwsIb()) {
+    return;
+  }
+  PwsVendorPkt pkt;
+  buildPwsVendorPkt(&pkt, pwsIbBuf_, pwsIbDw_);
+
+  const uint32_t queueMask = gpu_queue_->size - 1;
+  uint64_t index = Hsa::queue_add_write_index_screlease(gpu_queue_, 1);
+  while ((index - Hsa::queue_load_read_index_scacquire(gpu_queue_)) >= queueMask) {
+    amd::Os::yield();
+  }
+  PwsVendorPkt* slot =
+      &(reinterpret_cast<PwsVendorPkt*>(gpu_queue_->base_address))[index & queueMask];
+  // Write the body first, then the header dword with release so the CP does not
+  // read the slot until it is fully written.
+  memcpy(reinterpret_cast<uint8_t*>(slot) + sizeof(uint32_t),
+         reinterpret_cast<uint8_t*>(&pkt) + sizeof(uint32_t), sizeof(pkt) - sizeof(uint32_t));
+  packet_store_release(reinterpret_cast<uint32_t*>(slot), pkt.header, pkt.ven_hdr);
+  Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, index);
+  hasPendingDispatch_ = true;
+}
+
+// Graph-capture path: write the PWS vendor packet into a recorded 64-byte slot.
+// CaptureAndFormPacket pushes one kernel-name per gpuPackets_ entry, so the
+// extra recorded packet stays aligned with the batch's kernelNames vector.
+void VirtualGPU::capturePwsFence(uint8_t* dst) {
+  if (dst == nullptr || !ensurePwsIb()) {
+    return;
+  }
+  PwsVendorPkt pkt;
+  buildPwsVendorPkt(&pkt, pwsIbBuf_, pwsIbDw_);
+  memcpy(dst, &pkt, sizeof(pkt));
+}
+
+// ================================================================================================
+// PM4 graph replay (HIP_PM4_GRAPH=1): compile a captured all-dispatch hipGraph into
+// one PM4 indirect buffer and replay it via a single vendor PM4-IB packet.
+
+namespace {
+// AMD kernel descriptor (first 64 bytes), AMDHSA ABI. Mirrors pm4_layer.cpp.
+struct AmdKernelDescriptor {
+  uint32_t group_segment_fixed_size, private_segment_fixed_size, kernarg_size;
+  uint8_t  reserved0[4];
+  int64_t  kernel_code_entry_byte_offset;
+  uint8_t  reserved1[20];
+  uint32_t compute_pgm_rsrc3, compute_pgm_rsrc1, compute_pgm_rsrc2;
+  uint16_t kernel_code_properties, kernarg_preload;
+  uint8_t  reserved2[4];
+};
+// kernel_code_properties enable bits (AMDHSA), in user-SGPR layout order.
+enum {
+  KCP_PRIVATE_SEGMENT_BUFFER = 1u << 0,   // 4 SGPRs (scratch V#)
+  KCP_DISPATCH_PTR           = 1u << 1,   // 2 SGPRs
+  KCP_QUEUE_PTR              = 1u << 2,   // 2 SGPRs
+  KCP_KERNARG_SEGMENT_PTR    = 1u << 3,   // 2 SGPRs
+  KCP_DISPATCH_ID            = 1u << 4,   // 2 SGPRs
+  KCP_FLAT_SCRATCH_INIT      = 1u << 5,   // 2 SGPRs
+  KCP_PRIVATE_SEGMENT_SIZE   = 1u << 6,   // 1 SGPR
+  KCP_WAVEFRONT_SIZE32       = 1u << 10,  // 1 = wave32, 0 = wave64
+};
+// SH compute register addresses (dword). Identical across gfx11 and gfx12: the
+// COMPUTE_* block is at the same offsets in every RDNA shadow-reg table (mesa
+// ac_shadowed_regs.c R_00B810/30/40/48/54/60/900). SET_SH ordinal = reg - base.
+enum {
+  kShBase        = 0x2c00,   // PERSISTENT_SPACE_START
+  kRegStartX     = 0x2e04,   // COMPUTE_START_X..NUM_THREAD_Z span (8 regs)
+  kRegPgmLo      = 0x2e0c,   // COMPUTE_PGM_LO/HI
+  kRegScratchLo  = 0x2e10,   // COMPUTE_DISPATCH_SCRATCH_BASE_LO/HI (R_00B840/44)
+  kRegRsrc1      = 0x2e12,   // COMPUTE_PGM_RSRC1/2
+  kRegResLim     = 0x2e15,   // COMPUTE_RESOURCE_LIMITS
+  kRegTmpring    = 0x2e18,   // COMPUTE_TMPRING_SIZE
+  kRegUserD0     = 0x2e40,   // COMPUTE_USER_DATA_0
+};
+// PM4 type-3 opcodes.
+enum { kOpSetShReg = 0x76, kOpDispatchDirect = 0x15, kOpEventWrite = 0x46,
+       kOpReleaseMem = 0x49, kOpAcquireMem = 0x58 };
+// ACQUIRE_MEM GCR_CNTL bits: GLI_INV(0) GLM_WB(4) GLM_INV(5) GLK_INV(7) GLV_INV(8)
+// GL1_INV(9) GL2_INV(14) GL2_WB(15). AGENT-like (no L2 flush) vs full L2.
+constexpr uint32_t kGcrAgent  = (1u<<7)|(1u<<8)|(1u<<9);                       // 0x380
+constexpr uint32_t kGcrGlmBits = (1u<<4)|(1u<<5);                              // metadata cache
+constexpr uint32_t kGcrFullGfx11 = (1u<<15)|(1u<<14)|(1u<<9)|(1u<<8)|(1u<<7)|(1u<<0) | kGcrGlmBits; // 0xC3B1
+// gfx12 has no metadata (GLM) cache: radv drops GLM_WB/GLM_INV from the L2 flush
+// (radv_cs.c gfx10_cs_emit_cache_flush, "gfx_level < GFX12 ? GLM... : 0").
+constexpr uint32_t kGcrFullGfx12 = kGcrFullGfx11 & ~kGcrGlmBits;              // 0xC381
+// DISPATCH_INITIATOR: CS_EN(0) | USE_THREAD_DIMS(5). CS_W32_EN(15) added per wave.
+constexpr uint32_t kDispatchBase  = 0x21u;       // CS_EN | USE_THREAD_DIMS
+constexpr uint32_t kDispatchW32   = 0x8000u;     // CS_W32_EN (wave32 only)
+
+// Per-arch PM4 emission parameters. gfx11 (RDNA3) and gfx12 (RDNA4) share the
+// PWS RELEASE_MEM/ACQUIRE_MEM encoding and the COMPUTE_* register map; only the
+// full-L2 GCR mask differs (no GLM cache on gfx12).
+struct Pm4Arch {
+  uint32_t gcrFull;   // GCR for the trailing/leading full-L2 acquire
+  bool     isGfx12;
+};
+
+inline uint32_t pm4Hdr(uint32_t opcode, uint32_t dw) {
+  // type3 (3<<30), count=(dw-2)<<16, opcode<<8, shaderType=1 (bit1).
+  return 0xC0000000u | ((dw - 2u) << 16) | (opcode << 8) | 0x2u;
+}
+}  // namespace
+
+bool VirtualGPU::pm4GraphActive() {
+  if (pm4GraphState_ < 0) {
+    pm4GraphState_ = (getenv("HIP_PM4_GRAPH") != nullptr) ? 1 : 0;
+  }
+  return pm4GraphState_ == 1;
+}
+
+// Scratch-kernel support is opt-in: replicating the CP scratch setup (TMPRING,
+// scratch base, scratch V#) is correct only after ROCr has sized the queue
+// scratch, and a mistake faults the GPU. Default off keeps scratch kernels on
+// the safe AQL fallback.
+bool VirtualGPU::pm4GraphScratchEnabled() {
+  if (pm4GraphScratchState_ < 0) {
+    pm4GraphScratchState_ = (getenv("HIP_PM4_GRAPH_SCRATCH") != nullptr) ? 1 : 0;
+  }
+  return pm4GraphScratchState_ == 1;
+}
+
+// Register delta-encoding: emit a SET_SH_REG only for the minimal contiguous
+// sub-range whose value changed vs the previous dispatch in the same IB. SH
+// registers are sticky and the drain/PWS packets do not touch them, so skipping
+// an unchanged write leaves the latched state at the consuming DISPATCH
+// bit-identical to the always-emit path. Opt-in; default off keeps the IB
+// byte-identical to the baseline emitter. See HIP_VS_VULKAN.md Appendix D-impl.
+bool VirtualGPU::pm4GraphDeltaEnabled() {
+  if (pm4GraphDeltaState_ < 0) {
+    pm4GraphDeltaState_ = (getenv("HIP_PM4_GRAPH_DELTA") != nullptr) ? 1 : 0;
+  }
+  return pm4GraphDeltaState_ == 1;
+}
+
+// IB-reorder: emit kernel N+1's register programming BETWEEN N's RELEASE_MEM and
+// ACQUIRE_MEM, so the CP programs the next kernel while N's waves drain and the
+// AGENT cache flush is in flight (CP otherwise idle). The drain stays first and
+// the acquire stays before the consuming DISPATCH, so coherence is unchanged.
+//
+// WARNING: this lever does NOT improve performance on measured RDNA3 (gfx1100)
+// hardware -- it is a validated NULL RESULT, kept only for experimentation. The
+// CP micro-engine (ME) is a single in-order processor that handles BOTH the
+// SET_SH_REG writes AND the ACQUIRE_MEM wait, so moving the register burst ahead
+// of the acquire merely reorders serial ME work; there is no second engine to run
+// it concurrently with the PWS wait. Across kernel sizes the inter-kernel gap was
+// unchanged within noise (HIP_VS_VULKAN.md Appendix D-impl D.13). Use
+// HIP_PM4_GRAPH_DELTA instead, which REDUCES the ME work and is a real win. This
+// path is correct (bit-exact) and harmless, but pointless on this hardware.
+bool VirtualGPU::pm4GraphReorderEnabled() {
+  if (pm4GraphReorderState_ < 0) {
+    pm4GraphReorderState_ = (getenv("HIP_PM4_GRAPH_REORDER") != nullptr) ? 1 : 0;
+    if (pm4GraphReorderState_ == 1) {
+      ClPrint(amd::LOG_WARNING, amd::LOG_AQL,
+              "HIP_PM4_GRAPH_REORDER is enabled but is a NO-OP for performance on "
+              "RDNA3 (CP micro-engine is in-order: register programming cannot "
+              "overlap the PWS wait). It is bit-exact and harmless. Use "
+              "HIP_PM4_GRAPH_DELTA instead, which actually reduces the gap.");
+    }
+  }
+  return pm4GraphReorderState_ == 1;
+}
+
+// Last-lookup IB cache (HIP_PM4_GRAPH_KEYCACHE): the per-launch pm4GraphKey hash
+// is O(N) over every packet, and in the steady-state decode loop the SAME packet
+// array is replayed every token (nothing the hash covers changes -- only kernarg
+// CONTENTS change, which the hash ignores). So the hash returns the same key every
+// launch: pure overhead that also sits BEFORE the submit doorbell, delaying GPU
+// start. This fast path keys the cached IB by the graph-supplied recorded packet
+// set version (see GraphExec::RecordedPacketVersion) and, on a version match,
+// reuses the cached IB pointer without rehashing -> O(1) host issue, GPU starts
+// sooner. The version is bumped on EVERY recorded-packet mutation site (initial
+// capture, per-node param update, node enable/disable -- all routed through
+// CaptureAndFormPacketsForGraph / UpdateAQLPacket / UpdatePacketBatchesForNodeEnable
+// Disable), so invalidation is RELIABLE and EXACT, not a heuristic: there is no
+// interior-node blind spot. Default ON because it is correct for any caller that
+// supplies a version; set HIP_PM4_GRAPH_KEYCACHE=0 to force the always-rehash path.
+// version 0 (non-graph caller) always takes the slow rehash path regardless.
+bool VirtualGPU::pm4GraphKeyCacheEnabled() {
+  if (pm4GraphKeyCacheState_ < 0) {
+    const char* env = getenv("HIP_PM4_GRAPH_KEYCACHE");
+    pm4GraphKeyCacheState_ = (env != nullptr && env[0] == '0') ? 0 : 1;
+  }
+  return pm4GraphKeyCacheState_ == 1;
+}
+
+// Executable IB arena prewarm (HIP_PM4_GRAPH_PREWARM): reserve one device-local
+// executable buffer once (warming the executable memory pool off the launch
+// critical path) and sub-allocate IBs from it. Opt-in for now; measured before
+// considering default-on. See HIP_VS_VULKAN.md Appendix D.
+bool VirtualGPU::pm4GraphPrewarmEnabled() {
+  if (pm4GraphPrewarmState_ < 0) {
+    pm4GraphPrewarmState_ = (getenv("HIP_PM4_GRAPH_PREWARM") != nullptr) ? 1 : 0;
+  }
+  return pm4GraphPrewarmState_ == 1;
+}
+
+// Build-after (HIP_PM4_GRAPH_BUILD_AFTER): on the FIRST replay of a graph (cache
+// miss), do NOT build the PM4 IB synchronously before submit. Instead replay this
+// launch via the AQL fallback (GPU starts in ~us, no build-induced idle) and build
+// the PM4 IB right after the submit, so the build (and, with PREWARM off, the
+// one-time pool warm-up) overlaps the GPU executing the graph just submitted. The
+// AQL submit also sizes the queue scratch, so the deferred build is never
+// scratch-deferred. The next replay reuses the cached IB. Opt-in.
+bool VirtualGPU::pm4GraphBuildAfterEnabled() {
+  if (pm4GraphBuildAfterState_ < 0) {
+    pm4GraphBuildAfterState_ = (getenv("HIP_PM4_GRAPH_BUILD_AFTER") != nullptr) ? 1 : 0;
+  }
+  return pm4GraphBuildAfterState_ == 1;
+}
+
+// GraphExec-owned shared IB: a queue-INDEPENDENT graph (no scratch, no queue_ptr)
+// compiles to one device-scoped IB built once at instantiate and referenced by every
+// stream that replays it (no per-stream specialize/upload, one VRAM copy). Default
+// on; HIP_PM4_GRAPH_SHARED_IB=0 disables (each stream specializes its own IB).
+bool VirtualGPU::pm4GraphSharedIbEnabled() {
+  if (pm4GraphSharedIbState_ < 0) {
+    const char* e = getenv("HIP_PM4_GRAPH_SHARED_IB");
+    pm4GraphSharedIbState_ = (e != nullptr && e[0] == '0') ? 0 : 1;
+  }
+  return pm4GraphSharedIbState_ == 1;
+}
+
+// Reserve the executable IB arena once. The single allocation pays the one-time
+// executable-pool first-touch cost here (at init / first PM4 use) instead of on
+// the first replay. Idempotent.
+void VirtualGPU::ensurePm4Arena() {
+  if (pm4Arena_ != nullptr || !pm4GraphActive() || !pm4GraphPrewarmEnabled()) {
+    return;
+  }
+  void* dev = nullptr;
+  if (Hsa::memory_pool_allocate(roc_device_.getGpuvmSegment(), kPm4ArenaBytes,
+                                HSA_AMD_MEMORY_POOL_EXECUTABLE_FLAG, &dev) != HSA_STATUS_SUCCESS) {
+    ClPrint(amd::LOG_WARNING, amd::LOG_CODE,
+            "[pm4-arena] reserve of %zu bytes failed; falling back to per-IB pool alloc",
+            kPm4ArenaBytes);
+    return;
+  }
+  hsa_agent_t gpu = roc_device_.getBackendDevice();
+  Hsa::agents_allow_access(1, &gpu, nullptr, dev);
+  pm4Arena_ = dev;
+  pm4ArenaBytes_ = kPm4ArenaBytes;
+  pm4ArenaFree_.clear();
+  pm4ArenaFree_.emplace_back(0, kPm4ArenaBytes);  // one big free span
+  ClPrint(amd::LOG_INFO, amd::LOG_CODE, "[pm4-arena] reserved %zu bytes at %p",
+          kPm4ArenaBytes, pm4Arena_);
+
+  // Warm the FULL upload path once, not just the executable pool: the one-time
+  // first-touch cost is dominated by the CPU fine-grain staging pool's first
+  // allocation and the first SDMA copy, which the arena reservation alone does
+  // not exercise. Do one throwaway allocExecIbFromData (arena slice + host
+  // staging + async copy + wait) and return the slice, so the first REAL build
+  // pays only the (now-warm) per-build cost.
+  uint32_t warmData[64] = {0};
+  void* warm = allocExecIbFromData(warmData, 64);
+  if (warm != nullptr) {
+    Pm4GraphIb tmp;
+    tmp.ib = warm;
+    tmp.dw = 64;
+    tmp.status = kPm4Ready;
+    freePm4GraphIb(tmp);
+  }
+}
+
+// First-fit allocation from the arena free list. bytes must be page-rounded by
+// the caller. Returns nullptr if no span fits (caller falls back to a pool alloc).
+void* VirtualGPU::pm4ArenaAlloc(size_t bytes) {
+  if (pm4Arena_ == nullptr || bytes == 0) {
+    return nullptr;
+  }
+  for (size_t i = 0; i < pm4ArenaFree_.size(); ++i) {
+    if (pm4ArenaFree_[i].second >= bytes) {
+      size_t off = pm4ArenaFree_[i].first;
+      if (pm4ArenaFree_[i].second == bytes) {
+        pm4ArenaFree_.erase(pm4ArenaFree_.begin() + i);
+      } else {
+        pm4ArenaFree_[i].first += bytes;
+        pm4ArenaFree_[i].second -= bytes;
+      }
+      return reinterpret_cast<uint8_t*>(pm4Arena_) + off;
+    }
+  }
+  return nullptr;  // fragmented / too big -> caller uses a direct pool alloc
+}
+
+bool VirtualGPU::pm4ArenaOwns(const void* p) const {
+  if (pm4Arena_ == nullptr || p == nullptr) {
+    return false;
+  }
+  auto base = reinterpret_cast<uintptr_t>(pm4Arena_);
+  auto q = reinterpret_cast<uintptr_t>(p);
+  return q >= base && q < base + pm4ArenaBytes_;
+}
+
+// Return a slice to the free list and coalesce with adjacent free spans.
+void VirtualGPU::pm4ArenaFreeBytes(void* p, size_t bytes) {
+  size_t off = reinterpret_cast<uint8_t*>(p) - reinterpret_cast<uint8_t*>(pm4Arena_);
+  // Insert sorted by offset.
+  size_t i = 0;
+  while (i < pm4ArenaFree_.size() && pm4ArenaFree_[i].first < off) {
+    ++i;
+  }
+  pm4ArenaFree_.insert(pm4ArenaFree_.begin() + i, std::make_pair(off, bytes));
+  // Coalesce right then left.
+  if (i + 1 < pm4ArenaFree_.size() &&
+      pm4ArenaFree_[i].first + pm4ArenaFree_[i].second == pm4ArenaFree_[i + 1].first) {
+    pm4ArenaFree_[i].second += pm4ArenaFree_[i + 1].second;
+    pm4ArenaFree_.erase(pm4ArenaFree_.begin() + i + 1);
+  }
+  if (i > 0 && pm4ArenaFree_[i - 1].first + pm4ArenaFree_[i - 1].second == pm4ArenaFree_[i].first) {
+    pm4ArenaFree_[i - 1].second += pm4ArenaFree_[i].second;
+    pm4ArenaFree_.erase(pm4ArenaFree_.begin() + i);
+  }
+}
+
+// Free an IB's storage, routing to the arena free list or the device pool.
+void VirtualGPU::freePm4GraphIb(Pm4GraphIb& g) {
+  if (g.ib == nullptr) {
+    return;
+  }
+  // Non-owning entry: only a reference to a GraphExec-owned shared IB. Drop the
+  // reference; the GraphExec frees the storage in freePm4GraphTemplate.
+  if (!g.owned) {
+    g.ib = nullptr;
+    return;
+  }
+  if (pm4ArenaOwns(g.ib)) {
+    size_t bytes = (static_cast<size_t>(g.dw) * 4 + 0xFFF) & ~static_cast<size_t>(0xFFF);
+    pm4ArenaFreeBytes(g.ib, bytes);
+  } else {
+    Hsa::memory_pool_free(g.ib);
+  }
+  g.ib = nullptr;
+}
+
+// Content hash over the fields that define the compiled IB, so a destroyed and
+// reallocated graph that happens to reuse the same host packet address does not
+// replay a stale IB (the old packet[0]-pointer key could alias). FNV-1a.
+uint64_t VirtualGPU::pm4GraphKey(void* const* packets, size_t numPackets) {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&](uint64_t v) {
+    for (int b = 0; b < 8; ++b) {
+      h ^= (v & 0xff);
+      h *= 1099511628211ull;
+      v >>= 8;
+    }
+  };
+  mix(numPackets);
+  for (size_t i = 0; i < numPackets; ++i) {
+    auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
+    mix(p->header | (static_cast<uint64_t>(p->setup) << 16));
+    mix(p->kernel_object);
+    mix(reinterpret_cast<uint64_t>(p->kernarg_address));
+    mix(static_cast<uint64_t>(p->grid_size_x) | (static_cast<uint64_t>(p->grid_size_y) << 32));
+    mix(static_cast<uint64_t>(p->grid_size_z) | (static_cast<uint64_t>(p->workgroup_size_x) << 32));
+    mix(static_cast<uint64_t>(p->workgroup_size_y) | (static_cast<uint64_t>(p->workgroup_size_z) << 32));
+  }
+  return h;
+}
+
+void VirtualGPU::evictPm4GraphsIfNeeded(const Pm4GraphIb* protect) {
+  // Free oldest-inserted entries until under the cap. Skip the armed entry (its
+  // pointer is cached for the fast path) and the entry just built this launch.
+  // The guard counter bounds the loop: each iteration either erases one entry
+  // (size shrinks) or re-queues a protected key (no progress on size but finite).
+  size_t guard = pm4GraphKeyOrder_.size();
+  while (pm4Graphs_.size() > kPm4MaxCachedIbs && guard-- > 0) {
+    uint64_t k = pm4GraphKeyOrder_.front();
+    pm4GraphKeyOrder_.pop_front();
+    auto it = pm4Graphs_.find(k);
+    if (it == pm4Graphs_.end()) {
+      continue;  // stale key (entry already erased) -- drop it
+    }
+    Pm4GraphIb* e = &it->second;
+    if (e == protect || e == pm4IbCacheEntry_) {
+      pm4GraphKeyOrder_.push_back(k);  // never free a live/armed IB; try the next
+      continue;
+    }
+    freePm4GraphIb(*e);
+    pm4Graphs_.erase(it);
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[pm4-evict] freed stale IB; cache size now %zu (cap %zu)",
+            pm4Graphs_.size(), kPm4MaxCachedIbs);
+  }
+}
+
+void* VirtualGPU::allocExecIbFromData(const uint32_t* data, uint32_t dw, bool deviceScoped) {
+  size_t bytes = (static_cast<size_t>(dw) * 4 + 0xFFF) & ~static_cast<size_t>(0xFFF);
+  hsa_agent_t gpu = roc_device_.getBackendDevice();
+  // Prefer a slice from the pre-reserved arena (already GPU-accessible); fall back
+  // to a direct executable-pool allocation if the arena is off / full / too small.
+  // deviceScoped skips the per-vdev arena so the IB outlives any single stream.
+  void* dev = deviceScoped ? nullptr : pm4ArenaAlloc(bytes);
+  if (dev == nullptr) {
+    if (Hsa::memory_pool_allocate(roc_device_.getGpuvmSegment(), bytes,
+                                  HSA_AMD_MEMORY_POOL_EXECUTABLE_FLAG, &dev) != HSA_STATUS_SUCCESS) {
+      return nullptr;
+    }
+    Hsa::agents_allow_access(1, &gpu, nullptr, dev);
+  }
+  void* host = nullptr;
+  if (Hsa::memory_pool_allocate(roc_device_.getCpuFineGrainPool(), bytes, 0, &host) !=
+      HSA_STATUS_SUCCESS) {
+    if (pm4ArenaOwns(dev)) {
+      pm4ArenaFreeBytes(dev, bytes);
+    } else {
+      Hsa::memory_pool_free(dev);
+    }
+    return nullptr;
+  }
+  hsa_agent_t agents[2] = {gpu, roc_device_.getCpuAgent()};
+  Hsa::agents_allow_access(2, agents, nullptr, host);
+  memcpy(host, data, static_cast<size_t>(dw) * 4);
+  hsa_signal_t s;
+  Hsa::signal_create(1, 0, nullptr, &s);
+  Hsa::memory_async_copy(dev, gpu, host, roc_device_.getCpuAgent(), static_cast<size_t>(dw) * 4, 0,
+                         nullptr, s);
+  while (Hsa::signal_wait_scacquire(s, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX,
+                                    HSA_WAIT_STATE_BLOCKED) >= 1) {}
+  Hsa::signal_destroy(s);
+  Hsa::memory_pool_free(host);
+  return dev;
+}
+
+// Queue-runtime sentinel: every placeholder dword is encoded as this value so that
+// delta-encoding makes the SAME emit/skip decisions it would with the real (queue)
+// value -- e.g. a scratch kernel's TMPRING (sentinel) differs from a non-scratch
+// kernel's 0, so the non-scratch kernel still re-emits 0. specializeFromTemplate()
+// overwrites the sentinel with the launch stream's value. Plain ASCII only.
+static constexpr uint32_t kPm4PlaceholderSentinel = 0xFFFFFFFFu;
+
+// CPU-only, queue-INDEPENDENT encode of a captured graph into a PM4 template:
+// queue-runtime fields (scratch base/size/V#, amd_queue_t pointer) are emitted as
+// sentinels and their dword offsets recorded in out.patches. Runs at capture/
+// instantiate on any vdev of the graph's device; specializeFromTemplate() later
+// patches the placeholders and uploads. (Was the front half of buildPm4GraphIb.)
+void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
+                                        Pm4GraphTemplate& out) {
+  out.status = kPm4UnsupportedPermanent;  // pessimistic; promoted on success
+  out.numPackets = numPackets;
+
+  // Select arch (gfx11 RDNA3 vs gfx12 RDNA4). Anything else is unsupported.
+  const auto& isa = roc_device_.isa();
+  Pm4Arch arch;
+  if (isa.versionMajor() == 11) {
+    arch = Pm4Arch{kGcrFullGfx11, false};
+  } else if (isa.versionMajor() == 12) {
+    arch = Pm4Arch{kGcrFullGfx12, true};
+  } else {
+    return;  // only RDNA3/RDNA4 carry this PWS encoding
+  }
+
+  std::vector<uint32_t>& ib = out.dwords;
+  std::vector<Pm4Placeholder>& patches = out.patches;
+  ib.reserve(numPackets * 64 + 24);
+
+  auto setsh = [&](uint32_t reg, const uint32_t* v, uint32_t cnt,
+                   const uint8_t* kinds = nullptr) {
+    ib.push_back(pm4Hdr(kOpSetShReg, 2 + cnt));
+    ib.push_back(reg - kShBase);
+    for (uint32_t i = 0; i < cnt; ++i) {
+      if (kinds && kinds[i] != kPhNone) {
+        patches.push_back({static_cast<uint32_t>(ib.size()), kinds[i]});
+      }
+      ib.push_back(v[i]);
+    }
+  };
+  auto partialFlush = [&]() {
+    ib.push_back(pm4Hdr(kOpEventWrite, 2));
+    ib.push_back(0x00000407u);  // EVENT_INDEX=4 (CS_VS_PS_PARTIAL_FLUSH), CS_PARTIAL_FLUSH
+  };
+  auto releaseMemPws = [&](uint32_t gcr) {
+    uint32_t op = 40u | (5u << 8);          // EVENT_TYPE=BOTTOM_OF_PIPE_TS, EVENT_INDEX=5
+    if (gcr & (1u << 7)) op |= (1u << 30);  // GLK_INV
+    if (gcr & (1u << 8)) op |= (1u << 14);  // GLV_INV
+    if (gcr & (1u << 9)) op |= (1u << 15);  // GL1_INV
+    op |= (1u << 31);                       // PWS_ENABLE
+    ib.push_back(pm4Hdr(kOpReleaseMem, 8));
+    ib.push_back(op);
+    for (int i = 0; i < 6; ++i) ib.push_back(0);
+  };
+  auto acquirePws = [&]() {
+    ib.push_back(pm4Hdr(kOpAcquireMem, 8));
+    ib.push_back((5u << 11) | (1u << 17));  // PWS_STAGE_SEL=CP_ME, PWS_ENA2=1, COUNT=0
+    ib.push_back(0xFFFFFFFFu);
+    ib.push_back(0x01FFFFFFu);
+    ib.push_back(0);
+    ib.push_back(0);
+    ib.push_back(1u << 31);                 // PWS_ENA
+    ib.push_back(0);                        // GCR_CNTL (flush carried by RELEASE_MEM)
+  };
+  auto acquireFull = [&](uint32_t gcr) {
+    ib.push_back(pm4Hdr(kOpAcquireMem, 8));
+    ib.push_back(0);            // CP_COHER_CNTL
+    ib.push_back(0xFFFFFFFFu);  // CP_COHER_SIZE
+    ib.push_back(0x00FFFFFFu);  // CP_COHER_SIZE_HI
+    ib.push_back(0);            // CP_COHER_BASE
+    ib.push_back(0);            // CP_COHER_BASE_HI
+    ib.push_back(0x0Au);        // POLL_INTERVAL
+    ib.push_back(gcr);          // GCR_CNTL
+  };
+
+  // Register delta-encoding (HIP_PM4_GRAPH_DELTA). SH registers are sticky and the
+  // drain/PWS packets do not touch them, so a SET_SH_REG whose value already
+  // matches what is latched can be skipped: the state at the consuming DISPATCH
+  // is identical to the always-emit path. We keep a per-group shadow of the last
+  // value emitted in THIS IB and emit only the minimal contiguous changed
+  // sub-range. The shadow starts invalid, so dispatch 0 emits every group (state
+  // is re-established on every replay regardless of pre-IB register contents).
+  // 'sig' guards layout-sensitive groups (USER_DATA): a different enabled-SGPR
+  // set means the same offset holds a different register, so we force a full
+  // re-emit. Plain ASCII only.
+  const bool delta = pm4GraphDeltaEnabled();
+  const bool reorder = pm4GraphReorderEnabled();
+
+  // Per-edge fence mechanism. DEFAULT (and the only correct choice) is a BLOCKING
+  // AGENT acquire: CS_PARTIAL_FLUSH (drain the producer's waves) + ACQUIRE_MEM
+  // with GCR_CNTL = kGcrAgent (invalidate GLK/GLV/GL1; NO L2 flush -- L2 is the
+  // device coherence point and only the token boundary needs a full-L2 writeback).
+  // This mirrors the runtime's AGENT dispatch scope and is sufficient for
+  // device-local kernel->kernel RAW: L0/L1 are write-through to L2, the drain puts
+  // the producer's writes in L2, and the consumer's L0/L1/K invalidate makes it
+  // miss to L2. It is correct, deterministic, and ~2x cheaper per dispatch than the
+  // PWS path (one ACQUIRE_MEM vs a RELEASE_MEM+ACQUIRE_MEM counter round-trip).
+  //
+  // HIP_PM4_GRAPH_PWS (opt-in, LEGACY, UNSAFE): the old partially-waited-sync
+  // deferred fence (RELEASE_MEM arms a counter, ACQUIRE_MEM waits) that tried to
+  // overlap the flush with the next dispatch. It is BUGGY: the consumer DISPATCH
+  // can begin before the AGENT invalidate is globally complete, so a chain of many
+  // tiny dependent kernels (e.g. gpt-oss MoE, 267 dispatches/token) reads stale
+  // data NON-deterministically and diverges from the AQL baseline. Larger dense
+  // kernels (Llama-8B) happened to hide the race behind launch latency. Kept only
+  // for A/B; do NOT use in production. (See HIP_VS_VULKAN.md D.13/D.14.)
+  const bool usePws = (getenv("HIP_PM4_GRAPH_PWS") != nullptr);
+
+  // DIAGNOSTIC (HIP_PM4_GRAPH_FULLFENCE / HIP_PM4_GRAPH_EDGE_GCR): override the
+  // blocking per-edge GCR mask. FULLFENCE uses the full-L2 mask; EDGE_GCR=<hexmask>
+  // uses an explicit GCR_CNTL so we can bisect which cache bit a graph needs.
+  // GCR bits: GLI_INV(0) GLM_WB(4) GLM_INV(5) GLK_INV(7) GLV_INV(8) GL1_INV(9)
+  //           GL2_INV(14) GL2_WB(15). kGcrAgent=0x380, full gfx11=0xC3B1.
+  const char* edgeGcrEnv = getenv("HIP_PM4_GRAPH_EDGE_GCR");
+  const bool fullFence = (getenv("HIP_PM4_GRAPH_FULLFENCE") != nullptr) || (edgeGcrEnv != nullptr);
+  const uint32_t edgeGcr =
+      edgeGcrEnv ? static_cast<uint32_t>(strtoul(edgeGcrEnv, nullptr, 0)) : arch.gcrFull;
+  const uint32_t edgeMask = fullFence ? edgeGcr : kGcrAgent;
+  struct ShadowReg { bool valid = false; uint32_t cnt = 0; uint32_t sig = 0; uint32_t v[8] = {0}; };
+  ShadowReg shStartX, shPgm, shScratch, shRsrc, shResLim, shTmpring, shUserD;
+  auto setshDelta = [&](ShadowReg& sh, uint32_t reg, const uint32_t* v, uint32_t cnt,
+                        uint32_t sig, const uint8_t* kinds = nullptr) {
+    if (!delta || !sh.valid || sh.cnt != cnt || sh.sig != sig) {
+      setsh(reg, v, cnt, kinds);
+      sh.valid = true; sh.cnt = cnt; sh.sig = sig;
+      for (uint32_t i = 0; i < cnt; ++i) sh.v[i] = v[i];
+      return;
+    }
+    uint32_t lo = 0;
+    while (lo < cnt && v[lo] == sh.v[lo]) ++lo;
+    if (lo == cnt) return;  // nothing changed -> emit nothing
+    uint32_t hi = cnt;
+    while (hi > lo && v[hi - 1] == sh.v[hi - 1]) --hi;
+    setsh(reg + lo, v + lo, hi - lo, kinds ? kinds + lo : nullptr);
+    for (uint32_t i = lo; i < hi; ++i) sh.v[i] = v[i];
+  };
+
+  // Emit the SET_SH_REG programming for one dispatch (delta-aware). Returns
+  // kPm4Ready, or a fallback status (kPm4UnsupportedPermanent / kPm4DeferredScratch)
+  // BEFORE emitting anything for this dispatch, so the caller can bail to AQL.
+  auto emitRegs = [&](hsa_kernel_dispatch_packet_t* p) -> int {
+    uint8_t type = extractAqlBits(p->header, HSA_PACKET_HEADER_TYPE, HSA_PACKET_HEADER_WIDTH_TYPE);
+    if (type != HSA_PACKET_TYPE_KERNEL_DISPATCH) {
+      return kPm4UnsupportedPermanent;  // non-dispatch packet -> AQL fallback
+    }
+    if (p->kernel_object == 0) return kPm4UnsupportedPermanent;
+    auto* kd = reinterpret_cast<const AmdKernelDescriptor*>(p->kernel_object);
+    const uint16_t props = kd->kernel_code_properties;
+
+    // Kernarg preload (gfx11/gfx12) changes the entry/SGPR contract; not handled.
+    if (kd->kernarg_preload != 0) return kPm4UnsupportedPermanent;
+
+    // G1: scratch. Wire from the queue scratch state when ready, else defer
+    // (replay via AQL once so ROCr sizes scratch, then rebuild next launch).
+    const bool needsScratch = (kd->private_segment_fixed_size != 0) ||
+                              (p->private_segment_size != 0) ||
+                              (props & (KCP_PRIVATE_SEGMENT_BUFFER | KCP_FLAT_SCRATCH_INIT));
+    if (needsScratch) {
+      if (!pm4GraphScratchEnabled()) return kPm4UnsupportedPermanent;   // opt-in only
+      if (props & KCP_FLAT_SCRATCH_INIT) return kPm4UnsupportedPermanent;  // not replicated
+      // Scratch base/size/V# are queue-runtime values: emit them as placeholders
+      // and let specializeFromTemplate() patch them (deferring if not yet sized).
+      out.needsScratch = true;
+    }
+
+    // Only user SGPRs we can source correctly: private_segment_buffer (scratch
+    // V# from the queue), queue_ptr (the amd_queue_t), kernarg_segment_ptr.
+    // dispatch_ptr / dispatch_id / private_segment_size are not replicated.
+    constexpr uint16_t kSupportedUserSgpr =
+        KCP_PRIVATE_SEGMENT_BUFFER | KCP_QUEUE_PTR | KCP_KERNARG_SEGMENT_PTR;
+    constexpr uint16_t kUserSgprMask =
+        KCP_PRIVATE_SEGMENT_BUFFER | KCP_DISPATCH_PTR | KCP_QUEUE_PTR | KCP_KERNARG_SEGMENT_PTR |
+        KCP_DISPATCH_ID | KCP_FLAT_SCRATCH_INIT | KCP_PRIVATE_SEGMENT_SIZE;
+    if ((props & kUserSgprMask) & ~kSupportedUserSgpr) return kPm4UnsupportedPermanent;
+
+    const uint32_t dims[8] = {0, 0, 0, p->workgroup_size_x, p->workgroup_size_y,
+                              p->workgroup_size_z, 0, 0};
+    setshDelta(shStartX, kRegStartX, dims, 8, 0);
+    uint64_t entry = (p->kernel_object + kd->kernel_code_entry_byte_offset) >> 8;
+    const uint32_t pgm[2] = {static_cast<uint32_t>(entry), static_cast<uint32_t>(entry >> 32)};
+    setshDelta(shPgm, kRegPgmLo, pgm, 2, 0);
+
+    // Scratch base (queue runtime) -> placeholder, patched at specialize time.
+    if (needsScratch) {
+      const uint32_t scratch[2] = {kPm4PlaceholderSentinel, kPm4PlaceholderSentinel};
+      const uint8_t scratchKinds[2] = {kPhScratchBaseLo, kPhScratchBaseHi};
+      setshDelta(shScratch, kRegScratchLo, scratch, 2, 0, scratchKinds);
+    }
+
+    // RSRC1 verbatim from the KD (exactly what the CP loads). RSRC2 too, EXCEPT
+    // LDS_SIZE (bits[23:15]): COV5 leaves it 0 and the runtime/CP programs it from
+    // the dispatch packet's group_segment_size. The LDS_SIZE field is encoded in
+    // the gfx11 LDS encode granule = 128 dwords = 512 bytes (mesa ac_gpu_info.c
+    // lds_encode_granularity). The original /128 (128-byte) recompute over-
+    // allocated LDS 4x, which exceeds the per-workgroup limit on large-LDS GEMM
+    // kernels and hangs the queue (the 0-LDS microbench never exercised it).
+    constexpr uint32_t kLdsEncodeGranuleBytes = 512;
+    constexpr uint32_t kLdsSizeMask = 0x00FF8000u;  // COMPUTE_PGM_RSRC2[23:15]
+    const uint32_t groupSeg = std::max<uint32_t>(kd->group_segment_fixed_size,
+                                                 p->group_segment_size);
+    const uint32_t ldsUnits = std::min<uint32_t>(
+        (groupSeg + kLdsEncodeGranuleBytes - 1) / kLdsEncodeGranuleBytes, 0x1FFu);
+    uint32_t rsrc2 = (kd->compute_pgm_rsrc2 & ~kLdsSizeMask) | ((ldsUnits << 15) & kLdsSizeMask);
+    const uint32_t rsrc[2] = {kd->compute_pgm_rsrc1, rsrc2};
+    setshDelta(shRsrc, kRegRsrc1, rsrc, 2, 0);
+    const uint32_t zero = 0;
+    setshDelta(shResLim, kRegResLim, &zero, 1, 0);
+    // TMPRING: queue scratch size for scratch kernels (placeholder), real 0 for
+    // non-scratch kernels. The sentinel keeps delta distinguishing the two so a
+    // non-scratch kernel following a scratch one still re-emits 0.
+    if (needsScratch) {
+      const uint32_t tmpring = kPm4PlaceholderSentinel;
+      const uint8_t tmpringKind = kPhTmpring;
+      setshDelta(shTmpring, kRegTmpring, &tmpring, 1, 0, &tmpringKind);
+    } else {
+      const uint32_t tmpring = 0u;
+      setshDelta(shTmpring, kRegTmpring, &tmpring, 1, 0);
+    }
+
+    // G2: user SGPRs in kernel_code_properties enable-bit order. The enabled set
+    // is the layout signature; a change forces a full re-emit (same offset would
+    // otherwise alias a different register). Within a stable layout only the
+    // changed sub-range (typically the kernarg pointer) is re-sent.
+    uint32_t udata[8] = {0};
+    uint8_t ukinds[8];
+    for (int i = 0; i < 8; ++i) ukinds[i] = kPhNone;
+    uint32_t u = 0;
+    if (props & KCP_PRIVATE_SEGMENT_BUFFER) {
+      // scratch V# (queue runtime) -> placeholders.
+      for (int w = 0; w < 4; ++w) {
+        udata[u + w] = kPm4PlaceholderSentinel;
+        ukinds[u + w] = static_cast<uint8_t>(kPhScratchVdesc0 + w);
+      }
+      u += 4;
+    }
+    if (props & KCP_QUEUE_PTR) {
+      // amd_queue_t pointer (per launch stream) -> placeholder.
+      udata[u + 0] = kPm4PlaceholderSentinel;
+      udata[u + 1] = kPm4PlaceholderSentinel;
+      ukinds[u + 0] = kPhQueuePtrLo;
+      ukinds[u + 1] = kPhQueuePtrHi;
+      u += 2;
+    }
+    if (props & KCP_KERNARG_SEGMENT_PTR) {
+      // kernarg base is graph-fixed (allocated at instantiate) -> bake it in.
+      const uint64_t ka = reinterpret_cast<uint64_t>(p->kernarg_address);
+      udata[u + 0] = static_cast<uint32_t>(ka);
+      udata[u + 1] = static_cast<uint32_t>(ka >> 32);
+      u += 2;
+    }
+    if (u > 0) setshDelta(shUserD, kRegUserD0, udata, u, props & kSupportedUserSgpr, ukinds);
+    return kPm4Ready;
+  };
+
+  // Emit the DISPATCH_DIRECT packet that launches the kernel. Kept separate from
+  // emitRegs so the reorder path can place the register programming BEFORE the
+  // acquire while the launch stays AFTER it (coherence preserved).
+  auto emitDispatchPacket = [&](hsa_kernel_dispatch_packet_t* p) {
+    auto* kd = reinterpret_cast<const AmdKernelDescriptor*>(p->kernel_object);
+    const bool wave32 = (kd->kernel_code_properties & KCP_WAVEFRONT_SIZE32) != 0;
+    const uint32_t dispatchInit = kDispatchBase | (wave32 ? kDispatchW32 : 0u);
+    // DISPATCH_DIRECT: USE_THREAD_DIMS -> dim_x is total work-items (AQL grid_size).
+    ib.push_back(pm4Hdr(kOpDispatchDirect, 5));
+    ib.push_back(p->grid_size_x);
+    ib.push_back(p->grid_size_y ? p->grid_size_y : 1);
+    ib.push_back(p->grid_size_z ? p->grid_size_z : 1);
+    ib.push_back(dispatchInit);
+  };
+
+  // G6: leading full acquire so the first kernel sees writes from prior ops
+  // (H2D copy, a previous graph) -- the normal AQL batch carries this on the
+  // first packet's acquire scope; the self-contained microbench hid the need.
+  acquireFull(arch.gcrFull);
+
+  if (!usePws) {
+    // DEFAULT: blocking AGENT fence per edge -- [regs i][dispatch i][drain][acquire].
+    // Correct, deterministic, and faster than PWS. fullFence/EDGE_GCR override the
+    // mask for diagnostics; otherwise it is kGcrAgent (no L2 flush per edge).
+    for (size_t i = 0; i < numPackets; ++i) {
+      auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
+      int st = emitRegs(p);
+      if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
+      emitDispatchPacket(p);
+      partialFlush();          // drain the producer's waves (writes reach L2)
+      acquireFull(edgeMask);   // blocking invalidate so the consumer sees them
+    }
+  } else if (!reorder) {
+    // LEGACY PWS (HIP_PM4_GRAPH_PWS): deferred-wait fence. UNSAFE (see above).
+    for (size_t i = 0; i < numPackets; ++i) {
+      auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
+      int st = emitRegs(p);
+      if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
+      emitDispatchPacket(p);
+      partialFlush();
+      releaseMemPws(kGcrAgent);
+      acquirePws();
+    }
+  } else {
+    // LEGACY PWS + reorder: program kernel i's registers BETWEEN i-1's release and
+    // acquire. WARNING: reorder is a measured NO-OP on RDNA3 (the CP ME is in-order)
+    // AND the PWS fence it builds on is UNSAFE. Experimentation only.
+    auto* p0 = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[0]);
+    int st = emitRegs(p0);
+    if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
+    emitDispatchPacket(p0);
+    for (size_t i = 1; i < numPackets; ++i) {
+      partialFlush();              // drain kernel i-1 (its waves retire)
+      releaseMemPws(kGcrAgent);    // async AGENT flush of kernel i-1 (PWS armed)
+      auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
+      st = emitRegs(p);            // program kernel i during the flush / drain
+      if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
+      acquirePws();                // wait kernel i-1's flush counter
+      emitDispatchPacket(p);       // launch kernel i (coherent + registers latched)
+    }
+  }
+  // Final full-L2 writeback so the graph's results are system-visible (matches the
+  // SYSTEM-scope release the normal AQL batch forces on its last packet).
+  partialFlush();
+  acquireFull(arch.gcrFull);
+
+  out.status = kPm4Ready;  // fully encoded; queue specialization happens later
+}
+
+// Patch a capture-time template's queue-dependent placeholders from THIS vdev's
+// queue, then alloc + DMA-upload the IB. No CPU re-encode. Returns kPm4DeferredScratch
+// when the graph needs scratch the queue has not sized yet (replay via AQL once,
+// which sizes it, then a later specialize succeeds).
+VirtualGPU::Pm4GraphIb VirtualGPU::specializeFromTemplate(const Pm4GraphTemplate& t,
+                                                          bool deviceScoped) {
+  Pm4GraphIb out;
+  out.status = kPm4UnsupportedPermanent;
+  if (t.status != kPm4Ready) { out.status = t.status; return out; }
+
+  const bool pm4Timing = getenv("HIP_PM4_GRAPH_TIMING") != nullptr;
+  const uint64_t tStart = pm4Timing ? amd::Os::timeNanos() : 0;
+  auto* aq = reinterpret_cast<amd_queue_t*>(gpu_queue_);
+  const uint64_t scratchBase = aq->scratch_backing_memory_location;
+  const uint32_t tmpring = aq->compute_tmpring_size;
+  if (t.needsScratch && !((tmpring != 0) && (scratchBase != 0))) {
+    out.status = kPm4DeferredScratch;
+    return out;
+  }
+
+  std::vector<uint32_t> ib = t.dwords;  // patch placeholders into a private copy
+  const uint64_t sbase = scratchBase >> 8;
+  const uint64_t qptr = reinterpret_cast<uint64_t>(gpu_queue_);
+  for (const auto& ph : t.patches) {
+    uint32_t v = 0;
+    switch (ph.kind) {
+      case kPhScratchBaseLo: v = static_cast<uint32_t>(sbase); break;
+      case kPhScratchBaseHi: v = static_cast<uint32_t>(sbase >> 32); break;
+      case kPhTmpring:       v = tmpring; break;
+      case kPhScratchVdesc0:
+      case kPhScratchVdesc1:
+      case kPhScratchVdesc2:
+      case kPhScratchVdesc3:
+        v = aq->scratch_resource_descriptor[ph.kind - kPhScratchVdesc0];
+        break;
+      case kPhQueuePtrLo: v = static_cast<uint32_t>(qptr); break;
+      case kPhQueuePtrHi: v = static_cast<uint32_t>(qptr >> 32); break;
+      default: break;
+    }
+    ib[ph.offset] = v;
+  }
+
+  void* dev = allocExecIbFromData(ib.data(), static_cast<uint32_t>(ib.size()), deviceScoped);
+  if (dev == nullptr) return out;
+  out.ib = dev;
+  out.dw = static_cast<uint32_t>(ib.size());
+  out.status = kPm4Ready;
+  if (pm4Timing) {
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[pm4-timing] specialize %zu dispatches -> %u dw: patch+alloc+upload=%.1f us (arena=%d)",
+            t.numPackets, out.dw, (amd::Os::timeNanos() - tStart) / 1000.0,
+            pm4ArenaOwns(dev) ? 1 : 0);
+  }
+  ClPrint(amd::LOG_INFO, amd::LOG_AQL,
+          "PM4 graph: compiled %zu dispatches -> IB %u dwords @%p", t.numPackets, out.dw, out.ib);
+  return out;
+}
+
+// Full build = CPU encode + specialize+upload on THIS vdev's queue. Used on the
+// launch path when no capture-time template is available (e.g. post-mutation
+// rebuild and HIP_PM4_GRAPH_BUILD_AFTER). With a template the cache miss path
+// calls specializeFromTemplate() directly and skips the encode.
+VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t numPackets) {
+  const bool pm4Timing = getenv("HIP_PM4_GRAPH_TIMING") != nullptr;
+  const uint64_t tEncodeStart = pm4Timing ? amd::Os::timeNanos() : 0;
+  Pm4GraphTemplate t;
+  encodePm4GraphTemplate(packets, numPackets, t);
+  const uint64_t tEncodeEnd = pm4Timing ? amd::Os::timeNanos() : 0;
+  Pm4GraphIb out = specializeFromTemplate(t);
+  if (pm4Timing && out.status == kPm4Ready) {
+    const uint64_t tAllocEnd = amd::Os::timeNanos();
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[pm4-timing] build %zu dispatches -> %u dw: encode=%.1f us  alloc+upload=%.1f us "
+            "(arena=%d)",
+            numPackets, out.dw, (tEncodeEnd - tEncodeStart) / 1000.0,
+            (tAllocEnd - tEncodeEnd) / 1000.0, pm4ArenaOwns(out.ib) ? 1 : 0);
+  }
+  return out;
+}
+
+// Capture-time entry (called from hipGraphInstantiate via the base virtual): encode
+// the packets into a heap-owned template stamped with their content key. Returns
+// nullptr (and allocates nothing) if the graph is not PM4-replayable, so the launch
+// path stays on the existing build/AQL fallback. Queue-independent, so any vdev of
+// the graph's device produces an identical template.
+void* VirtualGPU::buildPm4GraphTemplate(void* const* packets, size_t numPackets) {
+  if (!pm4GraphActive() || numPackets == 0) return nullptr;
+  // A/B + safety toggle: HIP_PM4_GRAPH_TEMPLATE=0 disables capture-time encode so
+  // the first replay pays the full build (the pre-template behavior). Default on.
+  const char* te = getenv("HIP_PM4_GRAPH_TEMPLATE");
+  if (te != nullptr && te[0] == '0') return nullptr;
+  auto* t = new Pm4GraphTemplate();
+  const bool pm4Timing = getenv("HIP_PM4_GRAPH_TIMING") != nullptr;
+  const uint64_t t0 = pm4Timing ? amd::Os::timeNanos() : 0;
+  encodePm4GraphTemplate(packets, numPackets, *t);
+  if (t->status != kPm4Ready) {
+    delete t;
+    return nullptr;
+  }
+  t->key = pm4GraphKey(packets, numPackets);
+  if (pm4Timing) {
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[pm4-timing] capture-time encode %zu dispatches -> %zu dw: encode=%.1f us",
+            numPackets, t->dwords.size(), (amd::Os::timeNanos() - t0) / 1000.0);
+  }
+  // GraphExec-owned shared IB: a queue-independent graph (no placeholders) builds its
+  // device-scoped IB ONCE here, at instantiate, so every stream that replays it just
+  // references this single copy (no per-stream specialize/upload). Queue-dependent
+  // graphs (scratch / queue_ptr) keep per-stream IBs -- they encode per-queue values.
+  if (t->shareable() && pm4GraphSharedIbEnabled()) {
+    Pm4GraphIb shared = specializeFromTemplate(*t, /*deviceScoped=*/true);
+    if (shared.status == kPm4Ready) {
+      t->sharedIb = shared.ib;
+      t->sharedDw = shared.dw;
+      ClPrint(amd::LOG_INFO, amd::LOG_AQL,
+              "PM4 graph: shared IB %u dwords @%p (device-scoped, %zu dispatches)", t->sharedDw,
+              t->sharedIb, numPackets);
+    }
+  }
+  return t;
+}
+
+void VirtualGPU::freePm4GraphTemplate(void* tmpl) {
+  auto* t = static_cast<Pm4GraphTemplate*>(tmpl);
+  if (t == nullptr) {
+    return;
+  }
+  // The shared IB is device-scoped (allocated from the device pool, not the per-vdev
+  // arena), so it is released directly here regardless of which vdev built it.
+  if (t->sharedIb != nullptr) {
+    Hsa::memory_pool_free(t->sharedIb);
+    t->sharedIb = nullptr;
+  }
+  delete t;
+}
+
+bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking,
+                                   bool attach_signal, uint64_t recordedPacketVersion,
+                                   bool allowBuild, const Pm4GraphTemplate* tmpl) {
+  if (numPackets == 0) return false;
+
+  // Fast path: same recorded packet set as the previous launch -> reuse the cached
+  // IB pointer without recomputing the O(N) content hash (HIP_PM4_GRAPH_KEYCACHE).
+  // Validated by the graph-supplied recorded packet set version: nonzero, unique
+  // per GraphExec instantiation+batch, and bumped on ANY packet mutation (param
+  // update, enable/disable, re-capture). This is a RELIABLE invalidation, not a
+  // heuristic. version 0 (non-graph caller) always takes the slow path. Deferred-
+  // scratch entries are never cached here (status flips), so the fast path only
+  // serves kPm4Ready.
+  const bool keyCache = pm4GraphKeyCacheEnabled();
+  if (keyCache && recordedPacketVersion != 0) {
+    if (pm4IbCacheValid_ && pm4IbCacheVersion_ == recordedPacketVersion &&
+        pm4IbCacheEntry_ != nullptr && pm4IbCacheEntry_->status == kPm4Ready) {
+      submitPm4Ib(*pm4IbCacheEntry_, blocking, attach_signal);
+      return true;
+    }
+  }
+
+  // GraphExec-owned shared IB fast path (#5): a queue-independent graph already has
+  // its device-scoped IB built (at instantiate, shared across every stream). This
+  // stream just submits it -- no per-stream specialize/upload, no entry in the
+  // content-key cache (the shared IB's lifetime is the GraphExec, not this vdev, so
+  // it is never inserted into pm4Graphs_ where it could outlive its owner). The key
+  // match guards against a mutated/stale template; the O(N) hash is paid only when
+  // the keycache misses (first launch + after a mutation), then armed for O(1) reuse.
+  if (tmpl != nullptr && tmpl->sharedIb != nullptr && pm4GraphSharedIbEnabled() &&
+      tmpl->key == pm4GraphKey(packets, numPackets)) {
+    pm4SharedRef_.ib = tmpl->sharedIb;
+    pm4SharedRef_.dw = tmpl->sharedDw;
+    pm4SharedRef_.status = kPm4Ready;
+    pm4SharedRef_.owned = false;  // referenced only; the GraphExec frees the storage
+    if (keyCache && recordedPacketVersion != 0) {
+      pm4IbCacheValid_ = true;
+      pm4IbCacheVersion_ = recordedPacketVersion;
+      pm4IbCacheEntry_ = &pm4SharedRef_;
+    }
+    submitPm4Ib(pm4SharedRef_, blocking, attach_signal);
+    return true;
+  }
+
+  Pm4GraphIb* g = findOrBuildPm4Graph(packets, numPackets, recordedPacketVersion, allowBuild, tmpl);
+  if (g == nullptr) {
+    return false;  // cache miss with allowBuild=false, or unsupported/deferred build
+  }
+  submitPm4Ib(*g, blocking, attach_signal);
+  return true;
+}
+
+// ================================================================================================
+VirtualGPU::Pm4GraphIb* VirtualGPU::findOrBuildPm4Graph(void* const* packets, size_t numPackets,
+                                                        uint64_t recordedPacketVersion,
+                                                        bool allowBuild,
+                                                        const Pm4GraphTemplate* tmpl) {
+  // With a capture-time template, a cache miss only needs specialize+upload (patch
+  // the queue-dependent placeholders + DMA); the CPU encode already ran at
+  // instantiate. Without one, fall back to a full build (encode+specialize). The
+  // template must match these exact packets (same recorded set) -- enforced by the
+  // hip layer keying it to the batch -- so it is ignored if its dword count is 0.
+  const uint64_t key = pm4GraphKey(packets, numPackets);
+  // Only use the template if it was encoded from THESE exact packets: a stale
+  // template (graph mutated after instantiate -> different bytes) or a disabled-
+  // node filtered subset has a different key and must fall back to a full build.
+  // Per-stream path: specialize a per-stream IB from the template (queue-dependent
+  // graphs: scratch / queue_ptr), or full-build when there is no template. The
+  // GraphExec-owned SHARED IB (queue-independent graphs) is handled earlier in
+  // tryReplayPm4Graph and never reaches here.
+  const bool useTmpl = (tmpl != nullptr) && (tmpl->status == kPm4Ready) && (tmpl->key == key);
+  auto it = pm4Graphs_.find(key);
+  if (it == pm4Graphs_.end()) {
+    if (!allowBuild) {
+      return nullptr;  // build-after mode: this launch goes AQL; build happens post-submit
+    }
+    Pm4GraphIb built = useTmpl ? specializeFromTemplate(*tmpl) : buildPm4GraphIb(packets, numPackets);
+    it = pm4Graphs_.emplace(key, built).first;
+    pm4GraphKeyOrder_.push_back(key);
+    // A mutated graph lands here every time its packet content changes, leaving
+    // the previous content's IB unreferenced. Bound the VRAM held by dead IBs.
+    evictPm4GraphsIfNeeded(&it->second);
+  }
+  Pm4GraphIb& g = it->second;
+  // Deferred scratch: a prior launch fell back to AQL (which sizes the queue
+  // scratch); rebuild now that scratch may be ready. Free the stale IB first so
+  // the rebuild does not orphan it. specializeFromTemplate re-checks readiness.
+  if (g.status == kPm4DeferredScratch && allowBuild) {
+    freePm4GraphIb(g);
+    g = useTmpl ? specializeFromTemplate(*tmpl) : buildPm4GraphIb(packets, numPackets);
+  }
+  if (g.status != kPm4Ready) {
+    return nullptr;
+  }
+  // Arm the fast path for the next launch (ready IB + valid version).
+  if (pm4GraphKeyCacheEnabled() && recordedPacketVersion != 0) {
+    pm4IbCacheValid_ = true;
+    pm4IbCacheVersion_ = recordedPacketVersion;
+    pm4IbCacheEntry_ = &g;
+  }
+  return &g;
+}
+
+// ================================================================================================
+void VirtualGPU::submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_signal) {
+  bool attachSignal = timestamp_ != nullptr || attach_signal;
+  hsa_signal_t sig = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);
+
+  PwsVendorPkt pkt;
+  buildPwsVendorPkt(&pkt, g.ib, g.dw);
+  pkt.completion_signal = sig;  // CP signals it after the whole IB completes
+
+  const uint32_t queueMask = gpu_queue_->size - 1;
+  uint64_t index = Hsa::queue_add_write_index_screlease(gpu_queue_, 1);
+  while ((index - Hsa::queue_load_read_index_scacquire(gpu_queue_)) >= queueMask) {
+    amd::Os::yield();
+  }
+  PwsVendorPkt* slot =
+      &(reinterpret_cast<PwsVendorPkt*>(gpu_queue_->base_address))[index & queueMask];
+  memcpy(reinterpret_cast<uint8_t*>(slot) + sizeof(uint32_t),
+         reinterpret_cast<uint8_t*>(&pkt) + sizeof(uint32_t), sizeof(pkt) - sizeof(uint32_t));
+  packet_store_release(reinterpret_cast<uint32_t*>(slot), pkt.header, pkt.ven_hdr);
+  Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, index);
+  hasPendingDispatch_ = true;
+  TrackQueueProgress(pkt, index);
+
+  if (blocking) {
+    Barriers().WaitCurrent();
+  }
+}
+
+// ================================================================================================
+void VirtualGPU::prebuildPm4Graph(void* const* packets, size_t numPackets,
+                                  uint64_t recordedPacketVersion, const Pm4GraphTemplate* tmpl) {
+  // Build + insert + arm the IB without submitting. Called right after the AQL
+  // fallback submit (HIP_PM4_GRAPH_BUILD_AFTER), which has already sized scratch,
+  // so the build is never scratch-deferred. The next replay finds it armed. With a
+  // capture-time template this is just specialize+upload (no CPU re-encode).
+  (void)findOrBuildPm4Graph(packets, numPackets, recordedPacketVersion, /*allowBuild=*/true, tmpl);
 }
 
 // ================================================================================================
@@ -1947,15 +3123,59 @@ VirtualGPU::VirtualGPU(Device& device, bool profiling, bool cooperative,
 
   aqlHeader_ = dispatchPacketHeader_;
 
+  // ISOLATION TEST (inter-kernel gap study): env-gated overrides of the kernel
+  // dispatch packet header, to separate per-dispatch cache-fence cost from the
+  // command-processor AQL packet processing cost. Plain ASCII only.
+  //   GAP_NOSCOPE=1   strip acquire/release fence scope (NONE) -- no per-dispatch
+  //                   cache acquire/release at all.
+  //   GAP_NOBARRIER=1 clear the AQL barrier bit -- CP need not wait for the prior
+  //                   packet to complete before processing the next.
+  {
+    constexpr uint16_t kScopeMask =
+        static_cast<uint16_t>(~((3u << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) |
+                                (3u << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE)));
+    constexpr uint16_t kBarrierMask =
+        static_cast<uint16_t>(~(1u << HSA_PACKET_HEADER_BARRIER));
+    if (getenv("GAP_NOSCOPE") != nullptr) {
+      dispatchPacketHeader_ &= kScopeMask;
+      dispatchPacketHeaderNoSync_ &= kScopeMask;
+    }
+    if (getenv("GAP_NOBARRIER") != nullptr) {
+      dispatchPacketHeader_ &= kBarrierMask;
+    }
+    aqlHeader_ = dispatchPacketHeader_;
+  }
+
   // Note: Virtual GPU device creation must be a thread safe operation
   roc_device_.vgpus_.resize(roc_device_.numOfVgpus_);
   roc_device_.vgpus_[index()] = this;
+
+  // HIP_PM4_GRAPH_PREWARM: reserve the executable IB arena now (at stream/vgpu
+  // creation), so the one-time executable-pool first-touch cost is paid here --
+  // off the first-replay critical path -- rather than during the first launch.
+  ensurePm4Arena();
 }
 
 // ================================================================================================
 VirtualGPU::~VirtualGPU() {
   // Release SDMA engine assignment for this VirtualGPU
   ReleaseSdmaEngines();
+  // Free the executable PM4 IBs (PWS fence + compiled graphs). Arena-backed IBs
+  // are returned to the arena free list; the arena itself is freed below.
+  for (auto& kv : pm4Graphs_) {
+    freePm4GraphIb(kv.second);
+  }
+  pm4Graphs_.clear();
+  pm4GraphKeyOrder_.clear();
+  if (pm4Arena_ != nullptr) {
+    Hsa::memory_pool_free(pm4Arena_);
+    pm4Arena_ = nullptr;
+    pm4ArenaFree_.clear();
+  }
+  if (pwsIbBuf_ != nullptr) {
+    Hsa::memory_pool_free(pwsIbBuf_);
+    pwsIbBuf_ = nullptr;
+  }
 
   delete blitMgr_;
 
@@ -4396,6 +5616,20 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const 
     }
   }
 
+  // EXPERIMENTAL PWS inter-kernel fence: strip the dispatch packet's acquire/
+  // release cache scope (the appended PWS PM4-IB carries the cache flush instead).
+  // Applies to both eager and graph-capture paths; skipped for system-scope
+  // dispatches (host-visible boundary needs the real flush). The win is in the
+  // graph path where the recorded stream replays under a single doorbell, so the
+  // overlapped flush hides instead of paying an extra eager launch+doorbell.
+  const bool pwsFence = pwsFenceActive() && !addSystemScope_;
+  if (pwsFence) {
+    constexpr uint16_t kScopeMask =
+        static_cast<uint16_t>(~((3u << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) |
+                                (3u << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE)));
+    aqlHeaderWithOrder &= kScopeMask;
+  }
+
   // Copy scheduler's AQL packet for possible relaunch from the scheduler itself
     if (aql_packet != nullptr) {
       *aql_packet = dispatchPacket;
@@ -4416,7 +5650,6 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const 
       }
     }
 
-
     uint16_t rest = 0;
     if (extDispatchPacket) {
       // When launching an AQL packet, the 32 bits has to be written atomically for CP to track,
@@ -4434,6 +5667,14 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const 
                                         gpuKernel.MetadataPreloadOffset());
 
     if (isGraphCapture) {
+      // EXPERIMENTAL PWS inter-kernel fence: record the overlapped PWS cache fence
+      // as an extra captured packet BEFORE this dispatch, so the recorded stream is
+      // [..., PWS, dispatch] and the last graph packet stays a real dispatch (clean
+      // completion-signal semantics in the single-doorbell batch replay). The
+      // leading fence (before the very first kernel) is a harmless cache acquire.
+      if (pwsFence) {
+        capturePwsFence(const_cast<uint8_t*>(command_->getAqlPacket()));
+      }
       // Dispatch the packet
       if (!dispatchAqlPacket(&dispatchPacket, aqlHeaderWithOrder, rest,
                              GPU_FLUSH_ON_EXECUTION, command_->getPktCapturingState(),
@@ -4444,6 +5685,10 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const 
       if (!dispatchAqlPacket(&dispatchPacket, aqlHeaderWithOrder, rest,
                              GPU_FLUSH_ON_EXECUTION, false, nullptr, attach_signal)) {
         return false;
+      }
+      // Append the overlapped PWS cache fence right after the dispatch.
+      if (pwsFence) {
+        injectPwsFence();
       }
     }
 
