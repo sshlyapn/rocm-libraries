@@ -2764,19 +2764,14 @@ void* VirtualGPU::buildPm4GraphTemplate(void* const* packets, size_t numPackets)
             "[pm4-timing] capture-time encode %zu dispatches -> %zu dw: encode=%.1f us",
             numPackets, t->dwords.size(), (amd::Os::timeNanos() - t0) / 1000.0);
   }
-  // GraphExec-owned shared IB: a queue-independent graph (no placeholders) builds its
-  // device-scoped IB ONCE here, at instantiate, so every stream that replays it just
-  // references this single copy (no per-stream specialize/upload). Queue-dependent
-  // graphs (scratch / queue_ptr) keep per-stream IBs -- they encode per-queue values.
+  // GraphExec-owned shared IB: a queue-independent graph (no placeholders) gets ONE
+  // device-scoped IB shared by every stream that replays it (no per-stream
+  // specialize/upload). The build is DEFERRED to the first replay on the executing
+  // vdev (see tryReplayPm4Graph): specializing+uploading here, on the null-stream
+  // vdev at instantiate, produces an IB that is not guaranteed visible to a
+  // different execution queue's CP fetch and replays as garbage. Just mark intent.
   if (t->shareable() && pm4GraphSharedIbEnabled()) {
-    Pm4GraphIb shared = specializeFromTemplate(*t, /*deviceScoped=*/true);
-    if (shared.status == kPm4Ready) {
-      t->sharedIb = shared.ib;
-      t->sharedDw = shared.dw;
-      ClPrint(amd::LOG_INFO, amd::LOG_AQL,
-              "PM4 graph: shared IB %u dwords @%p (device-scoped, %zu dispatches)", t->sharedDw,
-              t->sharedIb, numPackets);
-    }
+    t->wantSharedIb = true;
   }
   return t;
 }
@@ -2824,6 +2819,29 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
   // it is never inserted into pm4Graphs_ where it could outlive its owner). The key
   // match guards against a mutated/stale template; the O(N) hash is paid only when
   // the keycache misses (first launch + after a mutation), then armed for O(1) reuse.
+  // Lazy build of the GraphExec-owned shared IB on THIS (executing) vdev. Deferred
+  // from instantiate so the SDMA upload and the CP fetch share a queue ordering
+  // edge; building it at instantiate on the null-stream vdev leaves the bytes
+  // potentially invisible to this queue's CP and replays garbage. Built once,
+  // guarded by sharedReady; concurrent first-replays on other streams that lose the
+  // race simply fall through to their per-stream IB for that one launch.
+  if (tmpl != nullptr && tmpl->wantSharedIb && pm4GraphSharedIbEnabled() &&
+      !tmpl->sharedReady.load(std::memory_order_acquire) &&
+      tmpl->key == pm4GraphKey(packets, numPackets)) {
+    auto* mt = const_cast<Pm4GraphTemplate*>(tmpl);
+    std::unique_lock<std::mutex> lk(mt->sharedMtx, std::try_to_lock);
+    if (lk.owns_lock() && !mt->sharedReady.load(std::memory_order_relaxed)) {
+      Pm4GraphIb shared = specializeFromTemplate(*tmpl, /*deviceScoped=*/true);
+      if (shared.status == kPm4Ready) {
+        mt->sharedIb = shared.ib;
+        mt->sharedDw = shared.dw;
+        ClPrint(amd::LOG_INFO, amd::LOG_AQL,
+                "PM4 graph: shared IB %u dwords @%p (device-scoped, lazy on exec vdev, %zu dispatches)",
+                mt->sharedDw, mt->sharedIb, numPackets);
+      }
+      mt->sharedReady.store(true, std::memory_order_release);
+    }
+  }
   if (tmpl != nullptr && tmpl->sharedIb != nullptr && pm4GraphSharedIbEnabled() &&
       tmpl->key == pm4GraphKey(packets, numPackets)) {
     pm4SharedRef_.ib = tmpl->sharedIb;

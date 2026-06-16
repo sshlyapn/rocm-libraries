@@ -21,7 +21,9 @@
 #include <stack>
 #include <string>
 #include <thread>
+#include <atomic>
 #include <deque>
+#include <mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -723,6 +725,17 @@ class VirtualGPU : public device::VirtualDevice {
     //! Owned here; freed (device pool) by freePm4GraphTemplate.
     void* sharedIb = nullptr;
     uint32_t sharedDw = 0;
+    //! Lazy shared-IB build. The device-scoped shared IB must be specialized and
+    //! uploaded on the EXECUTING vdev at first replay, NOT at instantiate on the
+    //! null-stream vdev: an IB whose bytes are SDMA-uploaded on one queue at
+    //! instantiate is not guaranteed visible to a DIFFERENT execution queue's CP
+    //! fetch later (no synchronization edge between the two), which silently
+    //! replays a stale/garbage IB. Building on the exec vdev gives the upload and
+    //! first CP fetch a queue ordering edge, exactly like the per-stream path.
+    //! wantSharedIb is set at instantiate; sharedReady guards the one-time build.
+    bool wantSharedIb = false;
+    std::atomic<bool> sharedReady{false};
+    std::mutex sharedMtx;
     //! true when the specialized IB does not depend on any per-queue runtime value.
     bool shareable() const { return status == kPm4Ready && patches.empty(); }
   };
