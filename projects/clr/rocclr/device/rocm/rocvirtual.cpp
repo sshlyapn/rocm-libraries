@@ -2132,6 +2132,24 @@ bool VirtualGPU::pm4GraphSharedIbEnabled() {
   return pm4GraphSharedIbState_ == 1;
 }
 
+// Per-edge fence scope inheritance: derive each kernel->kernel edge GCR mask from
+// the scope the runtime actually recorded in the captured packet headers instead
+// of forcing a blanket AGENT mask. For the fence after dispatch i we take
+// max(release_scope(i), acquire_scope(i+1)) and map NONE -> no fence (independent
+// kernels may overlap), AGENT -> kGcrAgent (invalidate GLK/GLV/GL1, no L2 flush),
+// SYSTEM -> full-L2. The graph boundaries (leading acquire, trailing release)
+// ALWAYS stay full-L2: the boundary SYSTEM requirement is injected at submit time
+// by the runtime's addSystemScope_ / fence_dirty_ state machine and is NOT carried
+// in the recorded packet, so the safe superset is to flush L2 at the ends.
+// DEFAULT ON (respect the runtime's per-packet scope decision); set
+// HIP_PM4_GRAPH_NO_INHERIT_SCOPE to fall back to the fixed blanket-AGENT policy.
+bool VirtualGPU::pm4GraphInheritScopeEnabled() {
+  if (pm4GraphInheritScopeState_ < 0) {
+    pm4GraphInheritScopeState_ = (getenv("HIP_PM4_GRAPH_NO_INHERIT_SCOPE") != nullptr) ? 0 : 1;
+  }
+  return pm4GraphInheritScopeState_ == 1;
+}
+
 // Reserve the executable IB arena once. The single allocation pays the one-time
 // executable-pool first-touch cost here (at init / first PM4 use) instead of on
 // the first replay. Idempotent.
@@ -2454,6 +2472,32 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
   const uint32_t edgeGcr =
       edgeGcrEnv ? static_cast<uint32_t>(strtoul(edgeGcrEnv, nullptr, 0)) : arch.gcrFull;
   const uint32_t edgeMask = fullFence ? edgeGcr : kGcrAgent;
+
+  // Per-edge mask derived from the recorded packet scope (default; disabled by
+  // HIP_PM4_GRAPH_NO_INHERIT_SCOPE, see pm4GraphInheritScopeEnabled). The
+  // diagnostic fullFence override takes precedence. Boundaries stay full-L2.
+  const bool inheritScope = pm4GraphInheritScopeEnabled() && !fullFence;
+  // Map an HSA fence scope (NONE<AGENT<SYSTEM) to a per-edge GCR mask. Returns 0
+  // for NONE to signal "emit no fence" (independent kernels may overlap).
+  auto scopeToEdgeMask = [&](uint32_t scope) -> uint32_t {
+    if (scope == HSA_FENCE_SCOPE_SYSTEM) return arch.gcrFull;
+    if (scope == HSA_FENCE_SCOPE_AGENT) return kGcrAgent;
+    return 0u;  // HSA_FENCE_SCOPE_NONE -> no fence
+  };
+  // Fence after dispatch i = max(this kernel's release, next kernel's acquire).
+  auto edgeMaskFor = [&](size_t i) -> uint32_t {
+    if (!inheritScope) return edgeMask;
+    auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
+    uint32_t rel = extractAqlBits(p->header, HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE,
+                                  HSA_PACKET_HEADER_WIDTH_SCRELEASE_FENCE_SCOPE);
+    uint32_t acq = HSA_FENCE_SCOPE_NONE;
+    if (i + 1 < numPackets) {
+      auto* pn = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i + 1]);
+      acq = extractAqlBits(pn->header, HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE,
+                           HSA_PACKET_HEADER_WIDTH_SCACQUIRE_FENCE_SCOPE);
+    }
+    return scopeToEdgeMask(std::max(rel, acq));
+  };
   struct ShadowReg { bool valid = false; uint32_t cnt = 0; uint32_t sig = 0; uint32_t v[8] = {0}; };
   ShadowReg shStartX, shPgm, shScratch, shRsrc, shResLim, shTmpring, shUserD;
   auto setshDelta = [&](ShadowReg& sh, uint32_t reg, const uint32_t* v, uint32_t cnt,
@@ -2610,6 +2654,12 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
   // first packet's acquire scope; the self-contained microbench hid the need.
   acquireFull(arch.gcrFull);
 
+  // DIAGNOSTIC histogram of the per-edge fence mask chosen, printed once under
+  // HIP_PM4_GRAPH_TIMING. Lets us see what scopes a real graph actually carries
+  // (e.g. whether INHERIT_SCOPE ever differs from the blanket AGENT default).
+  const bool scopeTiming = getenv("HIP_PM4_GRAPH_TIMING") != nullptr;
+  size_t edgeNone = 0, edgeAgent = 0, edgeSys = 0, edgeOther = 0;
+
   if (!usePws) {
     // DEFAULT: blocking AGENT fence per edge -- [regs i][dispatch i][drain][acquire].
     // Correct, deterministic, and faster than PWS. fullFence/EDGE_GCR override the
@@ -2619,8 +2669,23 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
       int st = emitRegs(p);
       if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
       emitDispatchPacket(p);
-      partialFlush();          // drain the producer's waves (writes reach L2)
-      acquireFull(edgeMask);   // blocking invalidate so the consumer sees them
+      const uint32_t mask = edgeMaskFor(i);  // edgeMask, or inherited per-edge scope
+      if (scopeTiming) {
+        if (mask == 0u) ++edgeNone;
+        else if (mask == kGcrAgent) ++edgeAgent;
+        else if (mask == arch.gcrFull) ++edgeSys;
+        else ++edgeOther;
+      }
+      if (mask != 0u) {
+        partialFlush();        // drain the producer's waves (writes reach L2)
+        acquireFull(mask);     // blocking invalidate so the consumer sees them
+      }
+      // mask == 0 (inherited NONE scope): no dependency recorded -> emit no fence,
+      // letting independent kernels overlap (matches the AQL NONE-scope behavior).
+    }
+    if (scopeTiming) {
+      fprintf(stderr, "[PM4 scope] edges=%zu inherit=%d NONE=%zu AGENT=%zu SYSTEM=%zu other=%zu\n",
+              numPackets, inheritScope ? 1 : 0, edgeNone, edgeAgent, edgeSys, edgeOther);
     }
   } else if (!reorder) {
     // LEGACY PWS (HIP_PM4_GRAPH_PWS): deferred-wait fence. UNSAFE (see above).

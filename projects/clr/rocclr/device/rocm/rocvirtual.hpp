@@ -756,6 +756,7 @@ class VirtualGPU : public device::VirtualDevice {
   int pm4GraphPrewarmState_ = -1;   //!< HIP_PM4_GRAPH_PREWARM env gate (reserve exec IB arena at init)
   int pm4GraphBuildAfterState_ = -1;//!< HIP_PM4_GRAPH_BUILD_AFTER env gate (AQL first, build IB after)
   int pm4GraphSharedIbState_ = -1;  //!< HIP_PM4_GRAPH_SHARED_IB env gate (GraphExec-owned shared IB)
+  int pm4GraphInheritScopeState_ = -1;//!< per-edge fence from packet scope (default on; HIP_PM4_GRAPH_NO_INHERIT_SCOPE disables)
   // Last-lookup fast path: when the SAME recorded packet set is replayed back to
   // back (the steady-state decode loop), skip recomputing the O(N) content hash.
   // Validated by the graph-supplied recorded packet set version, which is nonzero,
@@ -793,6 +794,7 @@ class VirtualGPU : public device::VirtualDevice {
   bool pm4GraphPrewarmEnabled();    //!< reserve the executable IB arena at init
   bool pm4GraphBuildAfterEnabled(); //!< first replay goes AQL, PM4 IB built right after
   bool pm4GraphSharedIbEnabled();   //!< build one device-scoped IB shared across streams
+  bool pm4GraphInheritScopeEnabled();//!< per-edge fence scope inherited from captured packet headers
   void ensurePm4Arena();                          //!< reserve the executable IB arena (idempotent)
   void* pm4ArenaAlloc(size_t bytes);              //!< slice from the arena, or nullptr if no fit
   bool pm4ArenaOwns(const void* p) const;         //!< true if p lies within the arena
