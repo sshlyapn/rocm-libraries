@@ -2287,6 +2287,30 @@ uint64_t VirtualGPU::pm4GraphKey(void* const* packets, size_t numPackets) {
   return h;
 }
 
+// Structural hash: like pm4GraphKey but EXCLUDING the mutable scalars (kernarg,
+// grid, workgroup). Two packet sets with the same skeleton differ only by fields
+// the in-place fast path can patch (kernarg/grid/workgroup), so a skeleton match
+// means the resident IB can be patched rather than rebuilt. (group/private segment
+// are not hashed here, matching pm4GraphKey, so a segment-only change is outside
+// the supported scalar-mutation set -- same blind spot as the content key.)
+uint64_t VirtualGPU::pm4GraphSkeletonKey(void* const* packets, size_t numPackets) {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&](uint64_t v) {
+    for (int b = 0; b < 8; ++b) {
+      h ^= (v & 0xff);
+      h *= 1099511628211ull;
+      v >>= 8;
+    }
+  };
+  mix(numPackets);
+  for (size_t i = 0; i < numPackets; ++i) {
+    auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
+    mix(p->header | (static_cast<uint64_t>(p->setup) << 16));
+    mix(p->kernel_object);
+  }
+  return h;
+}
+
 void VirtualGPU::evictPm4GraphsIfNeeded(const Pm4GraphIb* protect) {
   // Free oldest-inserted entries until under the cap. Skip the armed entry (its
   // pointer is cached for the fast path) and the entry just built this launch.
@@ -2439,8 +2463,15 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
   // 'sig' guards layout-sensitive groups (USER_DATA): a different enabled-SGPR
   // set means the same offset holds a different register, so we force a full
   // re-emit. Plain ASCII only.
-  const bool delta = pm4GraphDeltaEnabled();
+  // In-place mutation (HIP_PM4_GRAPH_INPLACE) forces delta-encoding OFF: every
+  // dispatch must emit its OWN copy of the mutable register groups so a scalar
+  // mutation has a dedicated dword slot to patch. With delta on, a dispatch whose
+  // value matched the previous one would share that latched slot, and patching it
+  // would corrupt the other dispatch. mutFields are recorded only in this mode.
+  const bool inplace = pm4GraphInplaceEnabled();
+  const bool delta = pm4GraphDeltaEnabled() && !inplace;
   const bool reorder = pm4GraphReorderEnabled();
+  std::vector<Pm4MutField>& muts = out.mutFields;
 
   // Per-edge fence mechanism. DEFAULT (and the only correct choice) is a BLOCKING
   // AGENT acquire: CS_PARTIAL_FLUSH (drain the producer's waves) + ACQUIRE_MEM
@@ -2500,27 +2531,34 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
   };
   struct ShadowReg { bool valid = false; uint32_t cnt = 0; uint32_t sig = 0; uint32_t v[8] = {0}; };
   ShadowReg shStartX, shPgm, shScratch, shRsrc, shResLim, shTmpring, shUserD;
+  // Returns the ib dword offset of value[0] when the FULL range was emitted (delta
+  // off / first emit / layout change), or kNoEmit when nothing/only a sub-range was
+  // emitted. The in-place recorder only consumes the full-emit case (delta is forced
+  // off in that mode), so value[j] lives at (returned offset + j).
+  constexpr uint32_t kNoEmit = 0xFFFFFFFFu;
   auto setshDelta = [&](ShadowReg& sh, uint32_t reg, const uint32_t* v, uint32_t cnt,
-                        uint32_t sig, const uint8_t* kinds = nullptr) {
+                        uint32_t sig, const uint8_t* kinds = nullptr) -> uint32_t {
     if (!delta || !sh.valid || sh.cnt != cnt || sh.sig != sig) {
+      const uint32_t valueStart = static_cast<uint32_t>(ib.size()) + 2;  // after hdr + reg
       setsh(reg, v, cnt, kinds);
       sh.valid = true; sh.cnt = cnt; sh.sig = sig;
       for (uint32_t i = 0; i < cnt; ++i) sh.v[i] = v[i];
-      return;
+      return valueStart;
     }
     uint32_t lo = 0;
     while (lo < cnt && v[lo] == sh.v[lo]) ++lo;
-    if (lo == cnt) return;  // nothing changed -> emit nothing
+    if (lo == cnt) return kNoEmit;  // nothing changed -> emit nothing
     uint32_t hi = cnt;
     while (hi > lo && v[hi - 1] == sh.v[hi - 1]) --hi;
     setsh(reg + lo, v + lo, hi - lo, kinds ? kinds + lo : nullptr);
     for (uint32_t i = lo; i < hi; ++i) sh.v[i] = v[i];
+    return kNoEmit;
   };
 
   // Emit the SET_SH_REG programming for one dispatch (delta-aware). Returns
   // kPm4Ready, or a fallback status (kPm4UnsupportedPermanent / kPm4DeferredScratch)
   // BEFORE emitting anything for this dispatch, so the caller can bail to AQL.
-  auto emitRegs = [&](hsa_kernel_dispatch_packet_t* p) -> int {
+  auto emitRegs = [&](hsa_kernel_dispatch_packet_t* p, size_t pkt) -> int {
     uint8_t type = extractAqlBits(p->header, HSA_PACKET_HEADER_TYPE, HSA_PACKET_HEADER_WIDTH_TYPE);
     if (type != HSA_PACKET_TYPE_KERNEL_DISPATCH) {
       return kPm4UnsupportedPermanent;  // non-dispatch packet -> AQL fallback
@@ -2557,7 +2595,13 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
 
     const uint32_t dims[8] = {0, 0, 0, p->workgroup_size_x, p->workgroup_size_y,
                               p->workgroup_size_z, 0, 0};
-    setshDelta(shStartX, kRegStartX, dims, 8, 0);
+    const uint32_t dimsOff = setshDelta(shStartX, kRegStartX, dims, 8, 0);
+    if (inplace && dimsOff != kNoEmit) {
+      // dims = {0,0,0, wgX, wgY, wgZ, 0,0} -> workgroup dims at value indices 3,4,5.
+      muts.push_back({dimsOff + 3, kMutWgX, static_cast<uint16_t>(pkt)});
+      muts.push_back({dimsOff + 4, kMutWgY, static_cast<uint16_t>(pkt)});
+      muts.push_back({dimsOff + 5, kMutWgZ, static_cast<uint16_t>(pkt)});
+    }
     uint64_t entry = (p->kernel_object + kd->kernel_code_entry_byte_offset) >> 8;
     const uint32_t pgm[2] = {static_cast<uint32_t>(entry), static_cast<uint32_t>(entry >> 32)};
     setshDelta(shPgm, kRegPgmLo, pgm, 2, 0);
@@ -2623,26 +2667,40 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
       ukinds[u + 1] = kPhQueuePtrHi;
       u += 2;
     }
+    uint32_t kaIdx = 0xFFFFFFFFu;  // udata index of the kernarg pointer, if present
     if (props & KCP_KERNARG_SEGMENT_PTR) {
       // kernarg base is graph-fixed (allocated at instantiate) -> bake it in.
       const uint64_t ka = reinterpret_cast<uint64_t>(p->kernarg_address);
+      kaIdx = u;
       udata[u + 0] = static_cast<uint32_t>(ka);
       udata[u + 1] = static_cast<uint32_t>(ka >> 32);
       u += 2;
     }
-    if (u > 0) setshDelta(shUserD, kRegUserD0, udata, u, props & kSupportedUserSgpr, ukinds);
+    if (u > 0) {
+      const uint32_t userOff = setshDelta(shUserD, kRegUserD0, udata, u,
+                                          props & kSupportedUserSgpr, ukinds);
+      if (inplace && userOff != kNoEmit && kaIdx != 0xFFFFFFFFu) {
+        muts.push_back({userOff + kaIdx + 0, kMutKernargLo, static_cast<uint16_t>(pkt)});
+        muts.push_back({userOff + kaIdx + 1, kMutKernargHi, static_cast<uint16_t>(pkt)});
+      }
+    }
     return kPm4Ready;
   };
 
   // Emit the DISPATCH_DIRECT packet that launches the kernel. Kept separate from
   // emitRegs so the reorder path can place the register programming BEFORE the
   // acquire while the launch stays AFTER it (coherence preserved).
-  auto emitDispatchPacket = [&](hsa_kernel_dispatch_packet_t* p) {
+  auto emitDispatchPacket = [&](hsa_kernel_dispatch_packet_t* p, size_t pkt) {
     auto* kd = reinterpret_cast<const AmdKernelDescriptor*>(p->kernel_object);
     const bool wave32 = (kd->kernel_code_properties & KCP_WAVEFRONT_SIZE32) != 0;
     const uint32_t dispatchInit = kDispatchBase | (wave32 ? kDispatchW32 : 0u);
     // DISPATCH_DIRECT: USE_THREAD_DIMS -> dim_x is total work-items (AQL grid_size).
     ib.push_back(pm4Hdr(kOpDispatchDirect, 5));
+    if (inplace) {
+      muts.push_back({static_cast<uint32_t>(ib.size()) + 0, kMutGridX, static_cast<uint16_t>(pkt)});
+      muts.push_back({static_cast<uint32_t>(ib.size()) + 1, kMutGridY, static_cast<uint16_t>(pkt)});
+      muts.push_back({static_cast<uint32_t>(ib.size()) + 2, kMutGridZ, static_cast<uint16_t>(pkt)});
+    }
     ib.push_back(p->grid_size_x);
     ib.push_back(p->grid_size_y ? p->grid_size_y : 1);
     ib.push_back(p->grid_size_z ? p->grid_size_z : 1);
@@ -2666,9 +2724,9 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
     // mask for diagnostics; otherwise it is kGcrAgent (no L2 flush per edge).
     for (size_t i = 0; i < numPackets; ++i) {
       auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
-      int st = emitRegs(p);
+      int st = emitRegs(p, i);
       if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
-      emitDispatchPacket(p);
+      emitDispatchPacket(p, i);
       const uint32_t mask = edgeMaskFor(i);  // edgeMask, or inherited per-edge scope
       if (scopeTiming) {
         if (mask == 0u) ++edgeNone;
@@ -2691,9 +2749,9 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
     // LEGACY PWS (HIP_PM4_GRAPH_PWS): deferred-wait fence. UNSAFE (see above).
     for (size_t i = 0; i < numPackets; ++i) {
       auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
-      int st = emitRegs(p);
+      int st = emitRegs(p, i);
       if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
-      emitDispatchPacket(p);
+      emitDispatchPacket(p, i);
       partialFlush();
       releaseMemPws(kGcrAgent);
       acquirePws();
@@ -2703,17 +2761,17 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
     // acquire. WARNING: reorder is a measured NO-OP on RDNA3 (the CP ME is in-order)
     // AND the PWS fence it builds on is UNSAFE. Experimentation only.
     auto* p0 = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[0]);
-    int st = emitRegs(p0);
+    int st = emitRegs(p0, 0);
     if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
-    emitDispatchPacket(p0);
+    emitDispatchPacket(p0, 0);
     for (size_t i = 1; i < numPackets; ++i) {
       partialFlush();              // drain kernel i-1 (its waves retire)
       releaseMemPws(kGcrAgent);    // async AGENT flush of kernel i-1 (PWS armed)
       auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[i]);
-      st = emitRegs(p);            // program kernel i during the flush / drain
+      st = emitRegs(p, i);         // program kernel i during the flush / drain
       if (st != kPm4Ready) { out.status = static_cast<Pm4GraphStatus>(st); return; }
       acquirePws();                // wait kernel i-1's flush counter
-      emitDispatchPacket(p);       // launch kernel i (coherent + registers latched)
+      emitDispatchPacket(p, i);    // launch kernel i (coherent + registers latched)
     }
   }
   // Final full-L2 writeback so the graph's results are system-visible (matches the
@@ -2824,6 +2882,7 @@ void* VirtualGPU::buildPm4GraphTemplate(void* const* packets, size_t numPackets)
     return nullptr;
   }
   t->key = pm4GraphKey(packets, numPackets);
+  t->skeletonKey = pm4GraphSkeletonKey(packets, numPackets);
   if (pm4Timing) {
     ClPrint(amd::LOG_INFO, amd::LOG_CODE,
             "[pm4-timing] capture-time encode %zu dispatches -> %zu dw: encode=%.1f us",
@@ -2859,6 +2918,17 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
                                    bool attach_signal, uint64_t recordedPacketVersion,
                                    bool allowBuild, const Pm4GraphTemplate* tmpl) {
   if (numPackets == 0) return false;
+
+  // In-place double-buffered fast path (HIP_PM4_GRAPH_INPLACE): for a graph mutated
+  // only in scalar node params, patch + ping-pong a resident IB instead of building
+  // a new one. Returns true if it submitted; false (not eligible) falls through to
+  // the keycache / shared-IB / rebuild path below. Skipped in build-after mode
+  // (allowBuild=false) where this launch intentionally goes AQL.
+  if (allowBuild &&
+      tryReplayPm4GraphInplace(packets, numPackets, blocking, attach_signal,
+                               recordedPacketVersion, tmpl)) {
+    return true;
+  }
 
   // Fast path: same recorded packet set as the previous launch -> reuse the cached
   // IB pointer without recomputing the O(N) content hash (HIP_PM4_GRAPH_KEYCACHE).
@@ -2982,9 +3052,11 @@ VirtualGPU::Pm4GraphIb* VirtualGPU::findOrBuildPm4Graph(void* const* packets, si
 }
 
 // ================================================================================================
-void VirtualGPU::submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_signal) {
+void VirtualGPU::submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_signal,
+                             hsa_signal_t* outSig) {
   bool attachSignal = timestamp_ != nullptr || attach_signal;
   hsa_signal_t sig = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);
+  if (outSig != nullptr) *outSig = sig;
 
   PwsVendorPkt pkt;
   buildPwsVendorPkt(&pkt, g.ib, g.dw);
@@ -3007,6 +3079,212 @@ void VirtualGPU::submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_sig
   if (blocking) {
     Barriers().WaitCurrent();
   }
+}
+
+// ================================================================================================
+// In-place double-buffered resident IB (HIP_PM4_GRAPH_INPLACE). For a graph mutated
+// only in scalar node params, patch the changed dwords of a resident device IB and
+// ping-pong between two slots instead of rebuilding a fresh IB + churning the LRU.
+
+bool VirtualGPU::pm4GraphInplaceEnabled() {
+  if (pm4GraphInplaceState_ < 0) {
+    pm4GraphInplaceState_ = (getenv("HIP_PM4_GRAPH_INPLACE") != nullptr) ? 1 : 0;
+  }
+  return pm4GraphInplaceState_ == 1;
+}
+
+uint32_t VirtualGPU::mutFieldValue(const Pm4MutField& mf, void* const* packets) {
+  auto* p = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(packets[mf.pkt]);
+  const uint64_t ka = reinterpret_cast<uint64_t>(p->kernarg_address);
+  switch (mf.kind) {
+    case kMutKernargLo: return static_cast<uint32_t>(ka);
+    case kMutKernargHi: return static_cast<uint32_t>(ka >> 32);
+    case kMutGridX:     return p->grid_size_x;
+    case kMutGridY:     return p->grid_size_y ? p->grid_size_y : 1;  // matches emitDispatchPacket
+    case kMutGridZ:     return p->grid_size_z ? p->grid_size_z : 1;
+    case kMutWgX:       return p->workgroup_size_x;
+    case kMutWgY:       return p->workgroup_size_y;
+    case kMutWgZ:       return p->workgroup_size_z;
+    default:            return 0;
+  }
+}
+
+void VirtualGPU::freeInplaceResident() {
+  for (int s = 0; s < 2; ++s) {
+    if (pm4Inplace_.slot[s] != nullptr) {
+      Hsa::memory_pool_free(pm4Inplace_.slot[s]);
+    }
+  }
+  if (pm4Inplace_.stage != nullptr) {
+    Hsa::memory_pool_free(pm4Inplace_.stage);
+  }
+  pm4Inplace_ = Pm4InplaceResident{};
+}
+
+bool VirtualGPU::buildInplaceResident(void* const* packets, size_t numPackets,
+                                      const Pm4GraphTemplate* tmpl, uint64_t skeletonKey) {
+  if (tmpl == nullptr || tmpl->status != kPm4Ready || tmpl->dwords.empty()) return false;
+  // Specialize the queue-dependent placeholders for THIS vdev's queue (same as
+  // specializeFromTemplate). If scratch is not sized yet, bail and let the normal
+  // path run + size it; a later launch will build the resident.
+  auto* aq = reinterpret_cast<amd_queue_t*>(gpu_queue_);
+  const uint64_t scratchBase = aq->scratch_backing_memory_location;
+  const uint32_t tmpringSz = aq->compute_tmpring_size;
+  if (tmpl->needsScratch && !((tmpringSz != 0) && (scratchBase != 0))) return false;
+
+  std::vector<uint32_t> hostd = tmpl->dwords;
+  const uint64_t sbase = scratchBase >> 8;
+  const uint64_t qptr = reinterpret_cast<uint64_t>(gpu_queue_);
+  for (const auto& ph : tmpl->patches) {
+    uint32_t v = 0;
+    switch (ph.kind) {
+      case kPhScratchBaseLo: v = static_cast<uint32_t>(sbase); break;
+      case kPhScratchBaseHi: v = static_cast<uint32_t>(sbase >> 32); break;
+      case kPhTmpring:       v = tmpringSz; break;
+      case kPhScratchVdesc0:
+      case kPhScratchVdesc1:
+      case kPhScratchVdesc2:
+      case kPhScratchVdesc3:
+        v = aq->scratch_resource_descriptor[ph.kind - kPhScratchVdesc0];
+        break;
+      case kPhQueuePtrLo: v = static_cast<uint32_t>(qptr); break;
+      case kPhQueuePtrHi: v = static_cast<uint32_t>(qptr >> 32); break;
+      default: break;
+    }
+    hostd[ph.offset] = v;
+  }
+  // Bake the CURRENT packet values into the mutable slots so the first active slot
+  // reflects this launch (the template's baked values are the instantiate-time set).
+  uint32_t spanLo = 0xFFFFFFFFu, spanHi = 0;
+  for (const auto& mf : tmpl->mutFields) {
+    hostd[mf.offset] = mutFieldValue(mf, packets);
+    if (mf.offset < spanLo) spanLo = mf.offset;
+    if (mf.offset > spanHi) spanHi = mf.offset;
+  }
+
+  const uint32_t dw = static_cast<uint32_t>(hostd.size());
+  const size_t bytes = (static_cast<size_t>(dw) * 4 + 0xFFF) & ~static_cast<size_t>(0xFFF);
+  hsa_agent_t gpu = roc_device_.getBackendDevice();
+  void* stage = nullptr;
+  if (Hsa::memory_pool_allocate(roc_device_.getCpuFineGrainPool(), bytes, 0, &stage) !=
+      HSA_STATUS_SUCCESS) {
+    return false;
+  }
+  hsa_agent_t agents[2] = {gpu, roc_device_.getCpuAgent()};
+  Hsa::agents_allow_access(2, agents, nullptr, stage);
+  memcpy(stage, hostd.data(), static_cast<size_t>(dw) * 4);
+
+  void* slot[2] = {nullptr, nullptr};
+  for (int s = 0; s < 2; ++s) {
+    if (Hsa::memory_pool_allocate(roc_device_.getGpuvmSegment(), bytes,
+                                  HSA_AMD_MEMORY_POOL_EXECUTABLE_FLAG, &slot[s]) !=
+        HSA_STATUS_SUCCESS) {
+      if (slot[0] != nullptr && s == 1) Hsa::memory_pool_free(slot[0]);
+      Hsa::memory_pool_free(stage);
+      return false;
+    }
+    Hsa::agents_allow_access(1, &gpu, nullptr, slot[s]);
+    hsa_signal_t cs;
+    Hsa::signal_create(1, 0, nullptr, &cs);
+    Hsa::memory_async_copy(slot[s], gpu, stage, roc_device_.getCpuAgent(),
+                           static_cast<size_t>(dw) * 4, 0, nullptr, cs);
+    while (Hsa::signal_wait_scacquire(cs, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX,
+                                      HSA_WAIT_STATE_BLOCKED) >= 1) {}
+    Hsa::signal_destroy(cs);
+  }
+
+  freeInplaceResident();  // release any previous graph's resident
+  pm4Inplace_.valid = true;
+  pm4Inplace_.tmpl = tmpl;
+  pm4Inplace_.skeletonKey = skeletonKey;
+  pm4Inplace_.version = 0;  // set by caller after the first submit
+  pm4Inplace_.slot[0] = slot[0];
+  pm4Inplace_.slot[1] = slot[1];
+  pm4Inplace_.dw = dw;
+  pm4Inplace_.activeSlot = 0;
+  pm4Inplace_.spanLo = (spanLo <= spanHi) ? spanLo : 0;
+  pm4Inplace_.spanHi = (spanLo <= spanHi) ? spanHi : 0;
+  pm4Inplace_.stage = stage;
+  pm4Inplace_.mutFields = tmpl->mutFields;  // private copy; never deref tmpl again
+  ClPrint(amd::LOG_INFO, amd::LOG_AQL,
+          "PM4 graph: in-place resident %u dw, 2 slots, %zu mutable fields, span [%u,%u]",
+          dw, pm4Inplace_.mutFields.size(), pm4Inplace_.spanLo, pm4Inplace_.spanHi);
+  return true;
+}
+
+void VirtualGPU::patchInplaceSlot(uint32_t slot, void* const* packets, size_t numPackets) {
+  (void)numPackets;
+  uint32_t* stage = reinterpret_cast<uint32_t*>(pm4Inplace_.stage);
+  // Write the COMPLETE current mutable set into the shared stage, then SDMA the
+  // contiguous span covering all mutable fields into this slot. Writing the full
+  // set (not just the deltas) makes the slot fully current regardless of which
+  // values the OTHER slot last carried -- so a single shared stage is correct.
+  for (const auto& mf : pm4Inplace_.mutFields) {
+    stage[mf.offset] = mutFieldValue(mf, packets);
+  }
+  if (pm4Inplace_.mutFields.empty()) return;  // nothing to patch (skeleton-only IB)
+  const uint32_t lo = pm4Inplace_.spanLo;
+  const uint32_t hi = pm4Inplace_.spanHi;
+  const size_t off = static_cast<size_t>(lo) * 4;
+  const size_t len = static_cast<size_t>(hi - lo + 1) * 4;
+  hsa_agent_t gpu = roc_device_.getBackendDevice();
+  hsa_signal_t cs;
+  Hsa::signal_create(1, 0, nullptr, &cs);
+  Hsa::memory_async_copy(reinterpret_cast<uint8_t*>(pm4Inplace_.slot[slot]) + off, gpu,
+                         reinterpret_cast<uint8_t*>(pm4Inplace_.stage) + off,
+                         roc_device_.getCpuAgent(), len, 0, nullptr, cs);
+  while (Hsa::signal_wait_scacquire(cs, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX,
+                                    HSA_WAIT_STATE_BLOCKED) >= 1) {}
+  Hsa::signal_destroy(cs);
+}
+
+bool VirtualGPU::tryReplayPm4GraphInplace(void* const* packets, size_t numPackets, bool blocking,
+                                          bool attach_signal, uint64_t recordedPacketVersion,
+                                          const Pm4GraphTemplate* tmpl) {
+  if (!pm4GraphInplaceEnabled()) return false;
+  if (tmpl == nullptr || tmpl->status != kPm4Ready) return false;
+  if (recordedPacketVersion == 0) return false;  // no reliable invalidation signal
+  if (getenv("HIP_PM4_GRAPH_PWS") != nullptr) return false;  // PWS fence path not supported
+
+  const uint64_t skel = pm4GraphSkeletonKey(packets, numPackets);
+
+  auto submitSlot = [&](uint32_t s) {
+    Pm4GraphIb g;
+    g.ib = pm4Inplace_.slot[s];
+    g.dw = pm4Inplace_.dw;
+    g.status = kPm4Ready;
+    g.owned = false;
+    hsa_signal_t sig{0};
+    submitPm4Ib(g, blocking, attach_signal, &sig);
+    pm4Inplace_.lastCompletion[s] = sig;
+  };
+
+  // Different graph / structural change -> (re)build the resident, or fall back.
+  if (!pm4Inplace_.valid || pm4Inplace_.tmpl != tmpl || pm4Inplace_.skeletonKey != skel) {
+    if (!buildInplaceResident(packets, numPackets, tmpl, skel)) return false;
+    pm4Inplace_.version = recordedPacketVersion;
+    submitSlot(pm4Inplace_.activeSlot);
+    return true;
+  }
+
+  // Same structure, same version -> submit the active slot (O(1), like the keycache).
+  if (pm4Inplace_.version == recordedPacketVersion) {
+    submitSlot(pm4Inplace_.activeSlot);
+    return true;
+  }
+
+  // Scalar mutation: patch the idle slot, swap, submit. Guard against patching a
+  // slot whose previous submission is still in flight (usually already complete).
+  const uint32_t idle = pm4Inplace_.activeSlot ^ 1u;
+  if (pm4Inplace_.lastCompletion[idle].handle != 0) {
+    while (Hsa::signal_wait_scacquire(pm4Inplace_.lastCompletion[idle], HSA_SIGNAL_CONDITION_LT, 1,
+                                      UINT64_MAX, HSA_WAIT_STATE_BLOCKED) >= 1) {}
+  }
+  patchInplaceSlot(idle, packets, numPackets);
+  pm4Inplace_.activeSlot = idle;
+  pm4Inplace_.version = recordedPacketVersion;
+  submitSlot(idle);
+  return true;
 }
 
 // ================================================================================================
@@ -3250,6 +3528,7 @@ VirtualGPU::~VirtualGPU() {
   }
   pm4Graphs_.clear();
   pm4GraphKeyOrder_.clear();
+  freeInplaceResident();  // release the in-place double-buffered slots + staging
   if (pm4Arena_ != nullptr) {
     Hsa::memory_pool_free(pm4Arena_);
     pm4Arena_ = nullptr;

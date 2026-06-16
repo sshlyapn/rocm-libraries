@@ -701,6 +701,18 @@ class VirtualGPU : public device::VirtualDevice {
     kPhNone = 0xFF                       //!< not a placeholder (graph-fixed dword)
   };
   struct Pm4Placeholder { uint32_t offset; uint8_t kind; };
+  //!< A baked scalar dword that a scalar node-param mutation can change in place.
+  //!< Recorded at encode time (only when HIP_PM4_GRAPH_INPLACE is on, which forces
+  //!< delta-encoding off so every dispatch has its own patchable slot) so a mutated
+  //!< graph can patch the resident VRAM IB instead of rebuilding a new one. kind
+  //!< selects which AQL packet field supplies the new value; pkt is the dispatch
+  //!< index into the launch packet array.
+  enum Pm4MutKind : uint8_t {
+    kMutKernargLo, kMutKernargHi,        //!< kernarg_address user-SGPR words
+    kMutGridX, kMutGridY, kMutGridZ,     //!< DISPATCH_DIRECT grid dims
+    kMutWgX, kMutWgY, kMutWgZ            //!< COMPUTE_NUM_THREAD workgroup dims
+  };
+  struct Pm4MutField { uint32_t offset; uint8_t kind; uint16_t pkt; };
   //!< CPU-only encode of a captured graph: the PM4 dwords with queue-dependent
   //!< fields zeroed, plus the offsets of those fields. Produced at capture/
   //!< instantiate (queue-independent) and specialized per launch stream. status
@@ -717,6 +729,15 @@ class VirtualGPU : public device::VirtualDevice {
     //! (pm4GraphKey), so a stale template (graph mutated -> different bytes) or a
     //! disabled-node filtered subset is ignored and falls back to a full build.
     uint64_t key = 0;
+    //! Content hash over STRUCTURAL fields only (numPackets, per-packet header|setup
+    //! and kernel_object), excluding the mutable scalars (kernarg, grid, workgroup).
+    //! Two packet sets with the same skeletonKey differ only by patchable scalars,
+    //! so the in-place fast path can patch the resident IB instead of rebuilding.
+    uint64_t skeletonKey = 0;
+    //! Offsets of the baked mutable scalar dwords (see Pm4MutField). Populated only
+    //! when HIP_PM4_GRAPH_INPLACE is on (which forces delta off so each dispatch has
+    //! its own slot); empty otherwise (in-place patching disabled for this template).
+    std::vector<Pm4MutField> mutFields;
     //! GraphExec-owned, device-scoped specialized IB, built ONCE and shared by every
     //! stream that replays this graph (each stream's cache just references it, never
     //! re-specializes/uploads). Only populated when the template is queue-INDEPENDENT
@@ -774,6 +795,32 @@ class VirtualGPU : public device::VirtualDevice {
   //! content key); the keycache version stamp guards reuse, so a stale reference here
   //! is never submitted (a new GraphExec has a new version -> re-arm before submit).
   Pm4GraphIb pm4SharedRef_;
+  //! In-place double-buffered resident IB (HIP_PM4_GRAPH_INPLACE). For a graph that
+  //! is mutated only in scalar node params (kernarg pointer, grid/workgroup dims),
+  //! keep TWO resident device IBs (ping-pong) plus a persistent host staging buffer.
+  //! On a scalar mutation we patch the changed dwords into the IDLE slot and swap the
+  //! submit pointer -- no new device allocation, no full re-encode, no LRU churn. The
+  //! idle slot is guaranteed not in flight: before patching we wait on the completion
+  //! signal of its last submission (usually already complete -> no stall). A
+  //! structural mutation (skeleton change) tears this down and falls back to the
+  //! rebuild+cache path.
+  struct Pm4InplaceResident {
+    bool valid = false;
+    //! Identity tag only -- NEVER dereferenced after build (the owning GraphExec may
+    //! free the template on a different vdev). mutFields below is a private copy.
+    const Pm4GraphTemplate* tmpl = nullptr;
+    uint64_t skeletonKey = 0;                //!< structural identity of the resident IB
+    uint64_t version = 0;                    //!< recorded packet version in the active slot
+    void* slot[2] = {nullptr, nullptr};      //!< the two device-local exec IBs
+    uint32_t dw = 0;
+    uint32_t activeSlot = 0;
+    uint32_t spanLo = 0, spanHi = 0;         //!< contiguous dword span covering all mutFields
+    void* stage = nullptr;                   //!< fine-grain host staging (CPU+GPU), dw dwords
+    hsa_signal_t lastCompletion[2] = {{0}, {0}};  //!< last submit's completion per slot
+    std::vector<Pm4MutField> mutFields;      //!< copy of the template's mutable-field offsets
+  };
+  Pm4InplaceResident pm4Inplace_;
+  int pm4GraphInplaceState_ = -1;   //!< HIP_PM4_GRAPH_INPLACE env gate (in-place VRAM patch)
   // Executable IB arena (HIP_PM4_GRAPH_PREWARM): one device-local executable
   // buffer reserved once, with IBs sub-allocated from it via a first-fit free
   // list. This both (a) warms the executable memory pool off the launch critical
@@ -795,6 +842,25 @@ class VirtualGPU : public device::VirtualDevice {
   bool pm4GraphBuildAfterEnabled(); //!< first replay goes AQL, PM4 IB built right after
   bool pm4GraphSharedIbEnabled();   //!< build one device-scoped IB shared across streams
   bool pm4GraphInheritScopeEnabled();//!< per-edge fence scope inherited from captured packet headers
+  bool pm4GraphInplaceEnabled();    //!< double-buffered in-place VRAM patch for scalar mutations
+  static uint64_t pm4GraphSkeletonKey(void* const* packets, size_t numPackets);  //!< structural hash
+  static uint32_t mutFieldValue(const Pm4MutField& mf, void* const* packets);    //!< current value
+  //! In-place fast path: handle this replay by patching/swapping the resident
+  //! double-buffered IB. Returns true if it submitted (caller is done); false to
+  //! fall through to the normal keycache/shared/rebuild path (not eligible: in-place
+  //! off, no template, scratch-deferred, or a structural/skeleton change).
+  bool tryReplayPm4GraphInplace(void* const* packets, size_t numPackets, bool blocking,
+                                bool attach_signal, uint64_t recordedPacketVersion,
+                                const Pm4GraphTemplate* tmpl);
+  //! Build the resident double-buffered IB for these packets (specialize host dwords,
+  //! allocate two device slots, upload both). Returns false on failure/deferred.
+  bool buildInplaceResident(void* const* packets, size_t numPackets,
+                            const Pm4GraphTemplate* tmpl, uint64_t skeletonKey);
+  //! Patch the mutable scalar dwords for the current packets into resident slot, then
+  //! SDMA the dirty span host->device. Caller must ensure the slot is not in flight.
+  void patchInplaceSlot(uint32_t slot, void* const* packets, size_t numPackets);
+  //! Release the resident double-buffered IB (both slots, staging, signals).
+  void freeInplaceResident();
   void ensurePm4Arena();                          //!< reserve the executable IB arena (idempotent)
   void* pm4ArenaAlloc(size_t bytes);              //!< slice from the arena, or nullptr if no fit
   bool pm4ArenaOwns(const void* p) const;         //!< true if p lies within the arena
@@ -830,7 +896,10 @@ class VirtualGPU : public device::VirtualDevice {
                                   uint64_t recordedPacketVersion, bool allowBuild,
                                   const Pm4GraphTemplate* tmpl);
   //! Submit one compiled IB as a single vendor PM4-IB packet (ring write + doorbell).
-  void submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_signal);
+  //! outSig (optional) receives the completion signal the CP decrements after the IB
+  //! finishes, so the in-place path can guard a slot against being patched mid-flight.
+  void submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_signal,
+                   hsa_signal_t* outSig = nullptr);
   //! Build + insert + arm the IB for these packets WITHOUT submitting. Used by
   //! HIP_PM4_GRAPH_BUILD_AFTER after the AQL fallback submit has sized scratch.
   void prebuildPm4Graph(void* const* packets, size_t numPackets, uint64_t recordedPacketVersion,
