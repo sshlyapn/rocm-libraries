@@ -2011,11 +2011,27 @@ inline uint32_t pm4Hdr(uint32_t opcode, uint32_t dw) {
   // type3 (3<<30), count=(dw-2)<<16, opcode<<8, shaderType=1 (bit1).
   return 0xC0000000u | ((dw - 2u) << 16) | (opcode << 8) | 0x2u;
 }
+
+// Tri-state parse of a PM4 boolean env var that RESPECTS the value, so that
+// HIP_PM4_GRAPH=0 means OFF (not "the variable is set, therefore on"). This
+// avoids the foot-gun where =0 and =1 behaved identically. Semantics:
+//   unset                         -> def (documented default for this knob)
+//   "0","false","off","no","" etc -> false (case-insensitive)
+//   any other non-empty value     -> true  (e.g. "1","yes","on","true")
+static bool pm4EnvBool(const char* name, bool def) {
+  const char* v = getenv(name);
+  if (v == nullptr) return def;          // unset: take the knob default
+  const char c = v[0];
+  if (c == '\0') return false;           // empty string: treat as off
+  if (c == '0' || c == 'f' || c == 'F' || c == 'n' || c == 'N') return false;  // 0/false/no
+  if ((c == 'o' || c == 'O') && (v[1] == 'f' || v[1] == 'F')) return false;    // off (not "on")
+  return true;                           // 1/yes/on/true/...
+}
 }  // namespace
 
 bool VirtualGPU::pm4GraphActive() {
   if (pm4GraphState_ < 0) {
-    pm4GraphState_ = (getenv("HIP_PM4_GRAPH") != nullptr) ? 1 : 0;
+    pm4GraphState_ = pm4EnvBool("HIP_PM4_GRAPH", false) ? 1 : 0;
   }
   return pm4GraphState_ == 1;
 }
@@ -2026,7 +2042,7 @@ bool VirtualGPU::pm4GraphActive() {
 // the safe AQL fallback.
 bool VirtualGPU::pm4GraphScratchEnabled() {
   if (pm4GraphScratchState_ < 0) {
-    pm4GraphScratchState_ = (getenv("HIP_PM4_GRAPH_SCRATCH") != nullptr) ? 1 : 0;
+    pm4GraphScratchState_ = pm4EnvBool("HIP_PM4_GRAPH_SCRATCH", false) ? 1 : 0;
   }
   return pm4GraphScratchState_ == 1;
 }
@@ -2039,7 +2055,7 @@ bool VirtualGPU::pm4GraphScratchEnabled() {
 // byte-identical to the baseline emitter. See HIP_VS_VULKAN.md Appendix D-impl.
 bool VirtualGPU::pm4GraphDeltaEnabled() {
   if (pm4GraphDeltaState_ < 0) {
-    pm4GraphDeltaState_ = (getenv("HIP_PM4_GRAPH_DELTA") != nullptr) ? 1 : 0;
+    pm4GraphDeltaState_ = pm4EnvBool("HIP_PM4_GRAPH_DELTA", false) ? 1 : 0;
   }
   return pm4GraphDeltaState_ == 1;
 }
@@ -2060,7 +2076,7 @@ bool VirtualGPU::pm4GraphDeltaEnabled() {
 // path is correct (bit-exact) and harmless, but pointless on this hardware.
 bool VirtualGPU::pm4GraphReorderEnabled() {
   if (pm4GraphReorderState_ < 0) {
-    pm4GraphReorderState_ = (getenv("HIP_PM4_GRAPH_REORDER") != nullptr) ? 1 : 0;
+    pm4GraphReorderState_ = pm4EnvBool("HIP_PM4_GRAPH_REORDER", false) ? 1 : 0;
     if (pm4GraphReorderState_ == 1) {
       ClPrint(amd::LOG_WARNING, amd::LOG_AQL,
               "HIP_PM4_GRAPH_REORDER is enabled but is a NO-OP for performance on "
@@ -2089,8 +2105,7 @@ bool VirtualGPU::pm4GraphReorderEnabled() {
 // version 0 (non-graph caller) always takes the slow rehash path regardless.
 bool VirtualGPU::pm4GraphKeyCacheEnabled() {
   if (pm4GraphKeyCacheState_ < 0) {
-    const char* env = getenv("HIP_PM4_GRAPH_KEYCACHE");
-    pm4GraphKeyCacheState_ = (env != nullptr && env[0] == '0') ? 0 : 1;
+    pm4GraphKeyCacheState_ = pm4EnvBool("HIP_PM4_GRAPH_KEYCACHE", true) ? 1 : 0;
   }
   return pm4GraphKeyCacheState_ == 1;
 }
@@ -2101,7 +2116,7 @@ bool VirtualGPU::pm4GraphKeyCacheEnabled() {
 // considering default-on. See HIP_VS_VULKAN.md Appendix D.
 bool VirtualGPU::pm4GraphPrewarmEnabled() {
   if (pm4GraphPrewarmState_ < 0) {
-    pm4GraphPrewarmState_ = (getenv("HIP_PM4_GRAPH_PREWARM") != nullptr) ? 1 : 0;
+    pm4GraphPrewarmState_ = pm4EnvBool("HIP_PM4_GRAPH_PREWARM", false) ? 1 : 0;
   }
   return pm4GraphPrewarmState_ == 1;
 }
@@ -2115,7 +2130,7 @@ bool VirtualGPU::pm4GraphPrewarmEnabled() {
 // scratch-deferred. The next replay reuses the cached IB. Opt-in.
 bool VirtualGPU::pm4GraphBuildAfterEnabled() {
   if (pm4GraphBuildAfterState_ < 0) {
-    pm4GraphBuildAfterState_ = (getenv("HIP_PM4_GRAPH_BUILD_AFTER") != nullptr) ? 1 : 0;
+    pm4GraphBuildAfterState_ = pm4EnvBool("HIP_PM4_GRAPH_BUILD_AFTER", false) ? 1 : 0;
   }
   return pm4GraphBuildAfterState_ == 1;
 }
@@ -2126,8 +2141,7 @@ bool VirtualGPU::pm4GraphBuildAfterEnabled() {
 // on; HIP_PM4_GRAPH_SHARED_IB=0 disables (each stream specializes its own IB).
 bool VirtualGPU::pm4GraphSharedIbEnabled() {
   if (pm4GraphSharedIbState_ < 0) {
-    const char* e = getenv("HIP_PM4_GRAPH_SHARED_IB");
-    pm4GraphSharedIbState_ = (e != nullptr && e[0] == '0') ? 0 : 1;
+    pm4GraphSharedIbState_ = pm4EnvBool("HIP_PM4_GRAPH_SHARED_IB", true) ? 1 : 0;
   }
   return pm4GraphSharedIbState_ == 1;
 }
@@ -2145,7 +2159,7 @@ bool VirtualGPU::pm4GraphSharedIbEnabled() {
 // HIP_PM4_GRAPH_NO_INHERIT_SCOPE to fall back to the fixed blanket-AGENT policy.
 bool VirtualGPU::pm4GraphInheritScopeEnabled() {
   if (pm4GraphInheritScopeState_ < 0) {
-    pm4GraphInheritScopeState_ = (getenv("HIP_PM4_GRAPH_NO_INHERIT_SCOPE") != nullptr) ? 0 : 1;
+    pm4GraphInheritScopeState_ = pm4EnvBool("HIP_PM4_GRAPH_NO_INHERIT_SCOPE", false) ? 0 : 1;
   }
   return pm4GraphInheritScopeState_ == 1;
 }
@@ -2491,7 +2505,7 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
   // data NON-deterministically and diverges from the AQL baseline. Larger dense
   // kernels (Llama-8B) happened to hide the race behind launch latency. Kept only
   // for A/B; do NOT use in production. (See HIP_VS_VULKAN.md D.13/D.14.)
-  const bool usePws = (getenv("HIP_PM4_GRAPH_PWS") != nullptr);
+  const bool usePws = pm4EnvBool("HIP_PM4_GRAPH_PWS", false);
 
   // DIAGNOSTIC (HIP_PM4_GRAPH_FULLFENCE / HIP_PM4_GRAPH_EDGE_GCR): override the
   // blocking per-edge GCR mask. FULLFENCE uses the full-L2 mask; EDGE_GCR=<hexmask>
@@ -2499,7 +2513,7 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
   // GCR bits: GLI_INV(0) GLM_WB(4) GLM_INV(5) GLK_INV(7) GLV_INV(8) GL1_INV(9)
   //           GL2_INV(14) GL2_WB(15). kGcrAgent=0x380, full gfx11=0xC3B1.
   const char* edgeGcrEnv = getenv("HIP_PM4_GRAPH_EDGE_GCR");
-  const bool fullFence = (getenv("HIP_PM4_GRAPH_FULLFENCE") != nullptr) || (edgeGcrEnv != nullptr);
+  const bool fullFence = pm4EnvBool("HIP_PM4_GRAPH_FULLFENCE", false) || (edgeGcrEnv != nullptr);
   const uint32_t edgeGcr =
       edgeGcrEnv ? static_cast<uint32_t>(strtoul(edgeGcrEnv, nullptr, 0)) : arch.gcrFull;
   const uint32_t edgeMask = fullFence ? edgeGcr : kGcrAgent;
@@ -2715,7 +2729,7 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
   // DIAGNOSTIC histogram of the per-edge fence mask chosen, printed once under
   // HIP_PM4_GRAPH_TIMING. Lets us see what scopes a real graph actually carries
   // (e.g. whether INHERIT_SCOPE ever differs from the blanket AGENT default).
-  const bool scopeTiming = getenv("HIP_PM4_GRAPH_TIMING") != nullptr;
+  const bool scopeTiming = pm4EnvBool("HIP_PM4_GRAPH_TIMING", false);
   size_t edgeNone = 0, edgeAgent = 0, edgeSys = 0, edgeOther = 0;
 
   if (!usePws) {
@@ -2792,7 +2806,7 @@ VirtualGPU::Pm4GraphIb VirtualGPU::specializeFromTemplate(const Pm4GraphTemplate
   out.status = kPm4UnsupportedPermanent;
   if (t.status != kPm4Ready) { out.status = t.status; return out; }
 
-  const bool pm4Timing = getenv("HIP_PM4_GRAPH_TIMING") != nullptr;
+  const bool pm4Timing = pm4EnvBool("HIP_PM4_GRAPH_TIMING", false);
   const uint64_t tStart = pm4Timing ? amd::Os::timeNanos() : 0;
   auto* aq = reinterpret_cast<amd_queue_t*>(gpu_queue_);
   const uint64_t scratchBase = aq->scratch_backing_memory_location;
@@ -2845,7 +2859,7 @@ VirtualGPU::Pm4GraphIb VirtualGPU::specializeFromTemplate(const Pm4GraphTemplate
 // rebuild and HIP_PM4_GRAPH_BUILD_AFTER). With a template the cache miss path
 // calls specializeFromTemplate() directly and skips the encode.
 VirtualGPU::Pm4GraphIb VirtualGPU::buildPm4GraphIb(void* const* packets, size_t numPackets) {
-  const bool pm4Timing = getenv("HIP_PM4_GRAPH_TIMING") != nullptr;
+  const bool pm4Timing = pm4EnvBool("HIP_PM4_GRAPH_TIMING", false);
   const uint64_t tEncodeStart = pm4Timing ? amd::Os::timeNanos() : 0;
   Pm4GraphTemplate t;
   encodePm4GraphTemplate(packets, numPackets, t);
@@ -2874,7 +2888,7 @@ void* VirtualGPU::buildPm4GraphTemplate(void* const* packets, size_t numPackets)
   const char* te = getenv("HIP_PM4_GRAPH_TEMPLATE");
   if (te != nullptr && te[0] == '0') return nullptr;
   auto* t = new Pm4GraphTemplate();
-  const bool pm4Timing = getenv("HIP_PM4_GRAPH_TIMING") != nullptr;
+  const bool pm4Timing = pm4EnvBool("HIP_PM4_GRAPH_TIMING", false);
   const uint64_t t0 = pm4Timing ? amd::Os::timeNanos() : 0;
   encodePm4GraphTemplate(packets, numPackets, *t);
   if (t->status != kPm4Ready) {
@@ -3088,7 +3102,7 @@ void VirtualGPU::submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_sig
 
 bool VirtualGPU::pm4GraphInplaceEnabled() {
   if (pm4GraphInplaceState_ < 0) {
-    pm4GraphInplaceState_ = (getenv("HIP_PM4_GRAPH_INPLACE") != nullptr) ? 1 : 0;
+    pm4GraphInplaceState_ = pm4EnvBool("HIP_PM4_GRAPH_INPLACE", false) ? 1 : 0;
   }
   return pm4GraphInplaceState_ == 1;
 }
@@ -3244,7 +3258,7 @@ bool VirtualGPU::tryReplayPm4GraphInplace(void* const* packets, size_t numPacket
   if (!pm4GraphInplaceEnabled()) return false;
   if (tmpl == nullptr || tmpl->status != kPm4Ready) return false;
   if (recordedPacketVersion == 0) return false;  // no reliable invalidation signal
-  if (getenv("HIP_PM4_GRAPH_PWS") != nullptr) return false;  // PWS fence path not supported
+  if (pm4EnvBool("HIP_PM4_GRAPH_PWS", false)) return false;  // PWS fence path not supported
 
   const uint64_t skel = pm4GraphSkeletonKey(packets, numPackets);
 
