@@ -135,5 +135,8 @@ int main(int argc, char ** argv) {
     };
     printf("  calib %.4f ns/tick | kernel busy median = %.3f us | GAP median = %.3f us | period(span/K) = %.3f us\n",
            ns_per_tick, med(kern), med(gap), to_us((long long)span_ticks) / K);
+    // Directly measured end-to-end GPU wall time of the whole graph launch
+    // (single start/stop event pair around hipGraphLaunch; no per-dispatch math).
+    printf("  E2E_WALL_MS = %.4f  (K=%d dispatches)\n", wall_ms, K);
     return 0;
 }

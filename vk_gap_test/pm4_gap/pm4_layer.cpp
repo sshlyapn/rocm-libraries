@@ -256,8 +256,8 @@ int main(int argc,char** argv){
         if(hsaKmtGetNodeProperties(n,&np)!=HSAKMT_STATUS_SUCCESS) continue;
         if(np.NumFComputeCores==0) continue;
         if(forced>=0){ if((int)n==forced) node=n; }
-        else if(np.EngineId.ui32.Major==11 && node==(uint32_t)-1) node=n; }
-    if(node==(uint32_t)-1){fprintf(stderr,"no gfx11 node\n");return 1;}
+        else if((np.EngineId.ui32.Major==11||np.EngineId.ui32.Major==12) && node==(uint32_t)-1) node=n; }
+    if(node==(uint32_t)-1){fprintf(stderr,"no gfx11/gfx12 node\n");return 1;}
     printf("using KFD node %u, M=%d N=%d\n",node,M,N);
 
     load_code_object(node,co);
