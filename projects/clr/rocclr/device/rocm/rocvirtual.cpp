@@ -30,6 +30,10 @@
 #include <atomic>
 #include <cinttypes>
 
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
+
 #if defined(__AVX__)
 #if defined(__MINGW64__)
 #include <intrin.h>
@@ -1488,6 +1492,9 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const std::vector<uint8_t>& flatPack
       memcpy(hdrRestored.data() + i * kAqlBytes, &hdr, sizeof(hdr));
       pktPtrs[i] = hdrRestored.data() + i * kAqlBytes;
     }
+    // Hand the per-packet kernel names to the (instrumented) replay so the per-kernel
+    // timestamp log can print the shader name; aligned 1:1 with the dispatch packets.
+    pm4LaunchKernelNames_ = kernelNames;
     if (tryReplayPm4Graph(pktPtrs.data(), numPackets, blocking, attach_signal,
                           recordedPacketVersion, /*allowBuild=*/!pm4BuildAfter, tmpl)) {
       return true;
@@ -2164,6 +2171,54 @@ bool VirtualGPU::pm4GraphInheritScopeEnabled() {
   return pm4GraphInheritScopeState_ == 1;
 }
 
+// Per-kernel GPU-clock profiling for the PM4 replay path. PM4 IB submission is
+// invisible to a tool (one vendor INDIRECT_BUFFER packet hides the N dispatches), so
+// this path bakes a RELEASE_MEM(BOTTOM_OF_PIPE_TS, send-GPU-clock) per kernel boundary
+// into the IB, then reads the GPU-domain ticks back on the host and ClPrints per-kernel
+// timing. There is no dedicated env var: it is gated on the SAME HIP logging channel
+// the per-kernel output uses (LOG_INFO + LOG_AQL, i.e. AMD_LOG_LEVEL/AMD_LOG_MASK),
+// mirroring the existing AQL / "Graph ShaderName" kernel logs -- so it turns on exactly
+// when AQL-packet logging is requested and is otherwise fully dormant. IsLogEnabled
+// reads the process-global log level/mask (set at startup), so the capture-time encode
+// and the submit-time readback agree. While a profiler is armed the runtime falls back
+// to AQL anyway (see tryReplayPm4Graph), so the two never fight over the same launch.
+bool VirtualGPU::pm4GraphProfileEnabled() {
+  return IsLogEnabled(amd::LOG_INFO, amd::LOG_AQL);
+}
+
+// True when a kernel-dispatch profiler is intercepting the queue, in which case the
+// PM4 IB replay (one opaque vendor packet that hides the N dispatches) must give way
+// to AQL so every kernel stays visible. There are two INDEPENDENT profiling planes,
+// and neither alone is sufficient:
+//
+//  1. HIP-ops / roctracer plane (amd::activity_prof): a callback registered via
+//     hipRegisterTracerCallback. This is the path roctracer and the legacy HIP
+//     profiler use; it can be armed/disarmed at RUNTIME, so it is checked live.
+//
+//  2. rocprofiler-sdk plane (rocprofv3 --kernel-trace, etc): intercepts dispatches
+//     below CLR, at the HSA api-table level via rocprofiler-register (see ROCr
+//     runtime.cpp). It does NOT register the HIP-ops callback, so IsEnabled() is
+//     false under it -- that is exactly why a kernel-trace run was capturing PM4 as
+//     zero kernels. The runtime contract is that every rocprofiler-sdk TOOL exports
+//     a strong rocprofiler_configure entry point (the core lib only carries a weak
+//     undefined ref), so dlsym(RTLD_DEFAULT) resolving it means a tool is loaded in
+//     this process. This is tool-agnostic (works for rocprofv3, HSA_TOOLS_LIB, a
+//     direct LD_PRELOAD, ...) and far more robust than sniffing tool-specific env
+//     vars. A tool loads at process init, so the lookup is done once and cached.
+bool VirtualGPU::pm4TracingArmed() {
+  if (amd::activity_prof::IsEnabled(OP_ID_DISPATCH)) {
+    return true;
+  }
+#if defined(__linux__)
+  if (pm4SdkProfilerState_ < 0) {
+    pm4SdkProfilerState_ = (dlsym(RTLD_DEFAULT, "rocprofiler_configure") != nullptr) ? 1 : 0;
+  }
+  return pm4SdkProfilerState_ == 1;
+#else
+  return false;
+#endif
+}
+
 // Reserve the executable IB arena once. The single allocation pays the one-time
 // executable-pool first-touch cost here (at init / first PM4 use) instead of on
 // the first replay. Idempotent.
@@ -2260,6 +2315,13 @@ void VirtualGPU::pm4ArenaFreeBytes(void* p, size_t bytes) {
 void VirtualGPU::freePm4GraphIb(Pm4GraphIb& g) {
   if (g.ib == nullptr) {
     return;
+  }
+  // Per-kernel profiling buffer is always per-IB owned,
+  // even when the IB itself is a non-owning shared reference, so free it first.
+  if (g.tsBuf != nullptr) {
+    Hsa::memory_pool_free(g.tsBuf);
+    g.tsBuf = nullptr;
+    g.tsCount = 0;
   }
   // Non-owning entry: only a reference to a GraphExec-owned shared IB. Drop the
   // reference; the GraphExec frees the storage in freePm4GraphTemplate.
@@ -2417,6 +2479,14 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
     return;  // only RDNA3/RDNA4 carry this PWS encoding
   }
 
+  // Per-kernel GPU-clock profiling, gated on the LOG_INFO+LOG_AQL logging channel.
+  // Decided at encode time (process-stable log level), so a graph captured with AQL
+  // logging on carries timestamp packets and one captured without it does not. Only
+  // the default blocking-AGENT path emits them; the legacy PWS paths are untouched.
+  const bool instrument = pm4GraphProfileEnabled();
+  out.instrumented = instrument;
+  out.tsAddrOff.clear();
+
   std::vector<uint32_t>& ib = out.dwords;
   std::vector<Pm4Placeholder>& patches = out.patches;
   ib.reserve(numPackets * 64 + 24);
@@ -2465,6 +2535,25 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
     ib.push_back(0);            // CP_COHER_BASE_HI
     ib.push_back(0x0Au);        // POLL_INTERVAL
     ib.push_back(gcr);          // GCR_CNTL
+  };
+  // RELEASE_MEM that writes the 64-bit GPU clock counter to a TS slot (no cache op,
+  // no PWS). The address is a placeholder (0) patched in specializeFromTemplate; its
+  // ADDRESS_LO dword offset is recorded so the slot index == position in tsAddrOff.
+  // EVENT_TYPE=BOTTOM_OF_PIPE_TS fires after the preceding kernel's waves drain, so
+  // consecutive slots bracket per-kernel wall time on the GPU timeline.
+  auto emitTs = [&]() {
+    if (!instrument) return;
+    ib.push_back(pm4Hdr(kOpReleaseMem, 8));
+    ib.push_back(40u | (5u << 8));            // EVENT_TYPE=BOTTOM_OF_PIPE_TS, EVENT_INDEX=end_of_pipe(5)
+    // DST_SEL=memory_controller(0) so the clock write bypasses L2 straight to memory
+    // (host fine-grain visible without a cache flush); DATA_SEL=send_gpu_clock(3).
+    ib.push_back(3u << 29);
+    out.tsAddrOff.push_back(static_cast<uint32_t>(ib.size()));  // ADDRESS_LO offset
+    ib.push_back(0);                          // ADDRESS_LO (patched to TS slot)
+    ib.push_back(0);                          // ADDRESS_HI (patched)
+    ib.push_back(0);                          // DATA_LO  (ignored for DATA_SEL=3)
+    ib.push_back(0);                          // DATA_HI
+    ib.push_back(0);                          // INT_CTXID
   };
 
   // Register delta-encoding (HIP_PM4_GRAPH_DELTA). SH registers are sticky and the
@@ -2726,6 +2815,10 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
   // first packet's acquire scope; the self-contained microbench hid the need.
   acquireFull(arch.gcrFull);
 
+  // Profiling: slot 0 = graph start (before kernel 0). Subsequent slots are the
+  // per-edge kernel-end timestamps emitted in the default loop below.
+  emitTs();
+
   // DIAGNOSTIC histogram of the per-edge fence mask chosen, printed once under
   // HIP_PM4_GRAPH_TIMING. Lets us see what scopes a real graph actually carries
   // (e.g. whether INHERIT_SCOPE ever differs from the blanket AGENT default).
@@ -2754,6 +2847,9 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
       }
       // mask == 0 (inherited NONE scope): no dependency recorded -> emit no fence,
       // letting independent kernels overlap (matches the AQL NONE-scope behavior).
+      // Profiling: slot i+1 = end of kernel i. When the edge had no fence the
+      // BOTTOM_OF_PIPE_TS still drains kernel i's waves before firing.
+      emitTs();
     }
     if (scopeTiming) {
       fprintf(stderr, "[PM4 scope] edges=%zu inherit=%d NONE=%zu AGENT=%zu SYSTEM=%zu other=%zu\n",
@@ -2838,8 +2934,38 @@ VirtualGPU::Pm4GraphIb VirtualGPU::specializeFromTemplate(const Pm4GraphTemplate
     ib[ph.offset] = v;
   }
 
+  // Per-kernel profiling: allocate a CPU fine-grain buffer
+  // the CP can write the GPU clock into and the host can read directly, then patch
+  // each RELEASE_MEM's ADDRESS_LO/HI to its slot. Done BEFORE the upload below so
+  // the patched addresses ride along in the uploaded IB. Skipped for device-scoped
+  // (shared) IBs -- profiling forces the per-stream path, so this is never shared.
+  if (t.instrumented && !t.tsAddrOff.empty() && !deviceScoped) {
+    const uint32_t slots = static_cast<uint32_t>(t.tsAddrOff.size());
+    const size_t bytes = (static_cast<size_t>(slots) * kPm4TsStride + 0xFFF) & ~size_t(0xFFF);
+    void* ts = nullptr;
+    if (Hsa::memory_pool_allocate(roc_device_.getCpuFineGrainPool(), bytes, 0, &ts) ==
+        HSA_STATUS_SUCCESS) {
+      hsa_agent_t agents[2] = {roc_device_.getBackendDevice(), roc_device_.getCpuAgent()};
+      Hsa::agents_allow_access(2, agents, nullptr, ts);
+      memset(ts, 0, bytes);
+      const uint64_t base = reinterpret_cast<uint64_t>(ts);
+      for (uint32_t k = 0; k < slots; ++k) {
+        const uint64_t addr = base + static_cast<uint64_t>(k) * kPm4TsStride;
+        ib[t.tsAddrOff[k] + 0] = static_cast<uint32_t>(addr);
+        ib[t.tsAddrOff[k] + 1] = static_cast<uint32_t>(addr >> 32);
+      }
+      out.tsBuf = ts;
+      out.tsCount = slots;
+    } else {
+      LogError("PM4 graph profile: timestamp buffer allocation failed");
+    }
+  }
+
   void* dev = allocExecIbFromData(ib.data(), static_cast<uint32_t>(ib.size()), deviceScoped);
-  if (dev == nullptr) return out;
+  if (dev == nullptr) {
+    if (out.tsBuf != nullptr) { Hsa::memory_pool_free(out.tsBuf); out.tsBuf = nullptr; }
+    return out;
+  }
   out.ib = dev;
   out.dw = static_cast<uint32_t>(ib.size());
   out.status = kPm4Ready;
@@ -2933,12 +3059,30 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
                                    bool allowBuild, const Pm4GraphTemplate* tmpl) {
   if (numPackets == 0) return false;
 
+  // Profiler visibility fallback: rocprofiler intercepts AQL dispatch packets, but a
+  // PM4 IB replay submits ONE vendor packet that hides the N dispatches, so a
+  // profiled run would capture nothing. When dispatch tracing is armed -- whether
+  // from process start or attached at runtime -- fall back to AQL so every kernel
+  // stays profilable. The caller treats a false return as "run this launch on AQL",
+  // so returning here is the entire fallback (it also covers the per-kernel profiling
+  // case: if a real profiler is attached, defer to it instead of the HIP-log path).
+  if (pm4TracingArmed()) {
+    return false;
+  }
+
+  // Per-kernel GPU-clock profiling (LOG_INFO+LOG_AQL) instruments a per-stream IB
+  // with timestamp packets and reads them back blocking. That is incompatible
+  // with the cross-stream shared IB (one buffer, many concurrent writers) and the
+  // double-buffered in-place resident, so force the per-stream specialize/keycache
+  // path where each IB owns its own TS buffer.
+  const bool profileTs = pm4GraphProfileEnabled();
+
   // In-place double-buffered fast path (HIP_PM4_GRAPH_INPLACE): for a graph mutated
   // only in scalar node params, patch + ping-pong a resident IB instead of building
   // a new one. Returns true if it submitted; false (not eligible) falls through to
   // the keycache / shared-IB / rebuild path below. Skipped in build-after mode
   // (allowBuild=false) where this launch intentionally goes AQL.
-  if (allowBuild &&
+  if (allowBuild && !profileTs &&
       tryReplayPm4GraphInplace(packets, numPackets, blocking, attach_signal,
                                recordedPacketVersion, tmpl)) {
     return true;
@@ -2974,7 +3118,7 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
   // potentially invisible to this queue's CP and replays garbage. Built once,
   // guarded by sharedReady; concurrent first-replays on other streams that lose the
   // race simply fall through to their per-stream IB for that one launch.
-  if (tmpl != nullptr && tmpl->wantSharedIb && pm4GraphSharedIbEnabled() &&
+  if (tmpl != nullptr && tmpl->wantSharedIb && !profileTs && pm4GraphSharedIbEnabled() &&
       !tmpl->sharedReady.load(std::memory_order_acquire) &&
       tmpl->key == pm4GraphKey(packets, numPackets)) {
     auto* mt = const_cast<Pm4GraphTemplate*>(tmpl);
@@ -2991,7 +3135,7 @@ bool VirtualGPU::tryReplayPm4Graph(void* const* packets, size_t numPackets, bool
       mt->sharedReady.store(true, std::memory_order_release);
     }
   }
-  if (tmpl != nullptr && tmpl->sharedIb != nullptr && pm4GraphSharedIbEnabled() &&
+  if (tmpl != nullptr && tmpl->sharedIb != nullptr && !profileTs && pm4GraphSharedIbEnabled() &&
       tmpl->key == pm4GraphKey(packets, numPackets)) {
     pm4SharedRef_.ib = tmpl->sharedIb;
     pm4SharedRef_.dw = tmpl->sharedDw;
@@ -3068,6 +3212,18 @@ VirtualGPU::Pm4GraphIb* VirtualGPU::findOrBuildPm4Graph(void* const* packets, si
 // ================================================================================================
 void VirtualGPU::submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_signal,
                              hsa_signal_t* outSig) {
+  // Per-kernel profiling needs the IB to retire before the host can read the GPU
+  // clock slots, so force a blocking wait for instrumented IBs (HIP-log facility,
+  // not the fast production path -- the extra sync is acceptable here).
+  if (g.tsBuf != nullptr && g.tsCount > 0) {
+    blocking = true;
+  }
+  // Clear the timestamp slots before the GPU writes them so a stale value from a
+  // previous launch (the IB + its TS buffer are cached and reused) can never be
+  // mistaken for this launch's data; the post-wait poll then keys off slot[n-1].
+  if (g.tsBuf != nullptr && g.tsCount > 0) {
+    memset(g.tsBuf, 0, static_cast<size_t>(g.tsCount) * kPm4TsStride);
+  }
   bool attachSignal = timestamp_ != nullptr || attach_signal;
   hsa_signal_t sig = Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);
   if (outSig != nullptr) *outSig = sig;
@@ -3092,6 +3248,58 @@ void VirtualGPU::submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_sig
 
   if (blocking) {
     Barriers().WaitCurrent();
+  }
+
+  if (g.tsBuf != nullptr && g.tsCount > 0) {
+    reportPm4Timestamps(g);
+  }
+}
+
+// Read the per-kernel GPU-clock slots written by the instrumented IB and ClPrint
+// per-kernel timing. Slot 0 is the graph start, slot k (k>0) the end of kernel k-1,
+// so the GPU-domain delta between consecutive slots is kernel (k-1)'s wall time.
+// Ticks are GPU clock cycles; getGpuTicksToTime() scales them to nanoseconds.
+void VirtualGPU::reportPm4Timestamps(const Pm4GraphIb& g) {
+  if (g.tsBuf == nullptr || g.tsCount < 2) return;
+  const auto* slots = reinterpret_cast<const volatile uint64_t*>(g.tsBuf);
+  const uint32_t n = g.tsCount;
+
+  // The RELEASE_MEM(memory_controller) clock writes are posted: they can still be
+  // in flight when the queue completion signal we waited on fires. EOP events drain
+  // in pipe order, so the LAST slot lands last -- spin briefly until it is non-zero
+  // (cleared before submit), guaranteeing all earlier slots are visible too.
+  for (int spins = 0; slots[n - 1] == 0 && spins < 100000; ++spins) {
+    amd::Os::yield();
+  }
+
+  // data_sel=send_gpu_clock_counter ticks in the AGENT timestamp domain (e.g. gfx12
+  // reports 100 MHz here while the SYSTEM frequency, which getGpuTicksToTime() uses,
+  // is 1 GHz), so convert with the agent frequency, queried once and cached.
+  if (pm4TsNsPerTick_ == 0.0) {
+    uint64_t agentFreq = 0;
+    if (Hsa::agent_get_info(roc_device_.getBackendDevice(),
+                            (hsa_agent_info_t)HSA_AMD_AGENT_INFO_TIMESTAMP_FREQUENCY,
+                            &agentFreq) == HSA_STATUS_SUCCESS && agentFreq != 0) {
+      pm4TsNsPerTick_ = 1e9 / static_cast<double>(agentFreq);
+    } else {
+      pm4TsNsPerTick_ = Timestamp::getGpuTicksToTime();
+    }
+  }
+  const double nsPerTick = pm4TsNsPerTick_;
+
+  const double totalNs = static_cast<double>(slots[n - 1] - slots[0]) * nsPerTick;
+  ClPrint(amd::LOG_INFO, amd::LOG_AQL,
+          "HipGraph launch PM4: %u dispatches, total %.3f us (per-kernel GPU timestamps)",
+          n - 1, totalNs / 1000.0);
+  // Slot k (k>=1) ends kernel k-1, which is dispatch packet k-1, so the name comes
+  // from the same index in the launch's per-packet kernel-name vector (when present).
+  const auto* names = pm4LaunchKernelNames_;
+  for (uint32_t k = 1; k < n; ++k) {
+    const double ns = static_cast<double>(slots[k] - slots[k - 1]) * nsPerTick;
+    const char* name = (names != nullptr && (k - 1) < names->size() &&
+                        (*names)[k - 1] != nullptr) ? (*names)[k - 1]->c_str() : "?";
+    ClPrint(amd::LOG_INFO, amd::LOG_AQL,
+            "HipGraph launch PM4:   kernel %u %s: %.3f us", k - 1, name, ns / 1000.0);
   }
 }
 

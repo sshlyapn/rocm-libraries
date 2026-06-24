@@ -688,6 +688,11 @@ class VirtualGPU : public device::VirtualDevice {
     //! (device-scoped, built once across streams): freePm4GraphIb / eviction must
     //! not release the storage in that case (the GraphExec owns it).
     bool owned = true;
+    //! Per-kernel GPU-clock timestamp buffer (per-kernel profiling). CP-writable,
+    //! host-readable (CPU fine-grain pool). Holds tsCount 64-bit ticks at
+    //! kPm4TsStride byte stride. nullptr when profiling is not instrumented.
+    void* tsBuf = nullptr;
+    uint32_t tsCount = 0;
   };
   //!< Queue-runtime-dependent dword that a capture-time template leaves as a
   //!< placeholder (written as 0) and that specializeFromTemplate() patches from
@@ -759,6 +764,12 @@ class VirtualGPU : public device::VirtualDevice {
     std::mutex sharedMtx;
     //! true when the specialized IB does not depend on any per-queue runtime value.
     bool shareable() const { return status == kPm4Ready && patches.empty(); }
+    //! Per-kernel GPU-clock profiling (gated on LOG_INFO+LOG_AQL, decided at capture).
+    //! When set, the encoder appends a RELEASE_MEM(BOTTOM_OF_PIPE_TS, GPU-clock)
+    //! per kernel boundary; tsAddrOff holds the dword offset of each packet's
+    //! ADDRESS_LO so specializeFromTemplate can patch in a per-IB TS buffer.
+    bool instrumented = false;
+    std::vector<uint32_t> tsAddrOff;
   };
   std::unordered_map<uint64_t, Pm4GraphIb> pm4Graphs_;  //!< compiled IB cache, keyed by content hash
   //! Insertion order of pm4Graphs_ keys, used to bound the VRAM held by compiled
@@ -778,6 +789,14 @@ class VirtualGPU : public device::VirtualDevice {
   int pm4GraphBuildAfterState_ = -1;//!< HIP_PM4_GRAPH_BUILD_AFTER env gate (AQL first, build IB after)
   int pm4GraphSharedIbState_ = -1;  //!< HIP_PM4_GRAPH_SHARED_IB env gate (GraphExec-owned shared IB)
   int pm4GraphInheritScopeState_ = -1;//!< per-edge fence from packet scope (default on; HIP_PM4_GRAPH_NO_INHERIT_SCOPE disables)
+  double pm4TsNsPerTick_ = 0.0;     //!< cached ns-per-tick for the agent-domain RELEASE_MEM GPU clock (0 = not queried)
+  //! Per-packet kernel names for the current PM4 graph launch (borrowed, not owned),
+  //! used only to label per-kernel timestamp logs; set at the launch site.
+  const std::vector<const std::string*>* pm4LaunchKernelNames_ = nullptr;
+  int pm4SdkProfilerState_ = -1;    //!< cached rocprofiler-sdk tool presence (dlsym rocprofiler_configure): -1 unknown, 0 absent, 1 attached
+  //! Byte stride between per-kernel timestamp slots. The RELEASE_MEM writes a 64-bit
+  //! GPU clock, so 8-byte slots (read back as a packed uint64_t array) is exact.
+  static constexpr uint32_t kPm4TsStride = 8;
   // Last-lookup fast path: when the SAME recorded packet set is replayed back to
   // back (the steady-state decode loop), skip recomputing the O(N) content hash.
   // Validated by the graph-supplied recorded packet set version, which is nonzero,
@@ -842,6 +861,9 @@ class VirtualGPU : public device::VirtualDevice {
   bool pm4GraphBuildAfterEnabled(); //!< first replay goes AQL, PM4 IB built right after
   bool pm4GraphSharedIbEnabled();   //!< build one device-scoped IB shared across streams
   bool pm4GraphInheritScopeEnabled();//!< per-edge fence scope inherited from captured packet headers
+  bool pm4GraphProfileEnabled();     //!< per-kernel GPU-clock timestamps, gated on LOG_INFO+LOG_AQL logging
+  bool pm4TracingArmed();            //!< a kernel-dispatch profiler (legacy activity OR rocprofiler-sdk) is active
+  void reportPm4Timestamps(const Pm4GraphIb& g);  //!< read TS buffer, convert ticks, ClPrint per-kernel
   bool pm4GraphInplaceEnabled();    //!< double-buffered in-place VRAM patch for scalar mutations
   static uint64_t pm4GraphSkeletonKey(void* const* packets, size_t numPackets);  //!< structural hash
   static uint32_t mutFieldValue(const Pm4MutField& mf, void* const* packets);    //!< current value
