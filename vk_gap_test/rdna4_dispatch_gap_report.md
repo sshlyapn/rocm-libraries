@@ -142,12 +142,16 @@ Whole-graph e2e -- clocks LOCKED (profile_peak, GFX ~2319 MHz):
 
 Whole-graph e2e -- clocks FREE (default DVFS, e2e median of 5):
 
-| spin | AQL e2e (ms) | PM4 e2e (ms) | PM4 saves (% of e2e) |
-|---|---|---|---|
-| 250  | 3.83  | 2.75  | 28.0% |
-| 500  | 5.88  | 4.83  | 18.0% |
-| 1000 | 17.19 | 14.87 | 13.5% |
-| 2000 | 75.29 | 70.85 | 5.9% |
+| spin | avg busy (us)* | AQL e2e (ms) | PM4 e2e (ms) | PM4 saves (% of e2e) |
+|---|---|---|---|---|
+| 250  | 3.75  | 3.83  | 2.75  | 28.0% |
+| 500  | 10.72 | 5.88  | 4.83  | 18.0% |
+| 1000 | 26.84 | 17.19 | 14.87 | 13.5% |
+| 2000 | 77.87 | 75.29 | 70.85 | 5.9% |
+
+\* avg busy is profiled (forces AQL) at a different DVFS state than the e2e
+runs, so it does not line up with the e2e columns -- shown for reference only;
+no free-clock gap is derived from it.
 
 Takeaway: varying launch dims and kernarg layout/size per dispatch does NOT
 change the result. PM4 IB replay is faster in EVERY case, locked and free,
