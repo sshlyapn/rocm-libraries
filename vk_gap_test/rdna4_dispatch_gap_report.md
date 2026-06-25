@@ -111,6 +111,39 @@ at long=5000) or faster (1243 vs 1598 us at long=100000) depending on which cloc
 state DVFS settles into for that workload mix. This is exactly why the LOCKED
 interleave table is the canonical one.
 
+## Results -- heterogeneous interleave (4 distinct kernels, LOCKED)
+
+`hip_gap_hetero.x <spin> 16384 K` cycles four DIFFERENT kernels per node, each
+with a different block size AND a different kernarg signature (varying pointer
+count incl. unused pointers, plus extra unused scalar args) -- closer to a real
+workload where successive dispatches differ in launch dims and kernarg
+layout/size. All do the same dependent-FMA spin on the shared buffer with a
+gid<n guard, so the active thread count (and thus busy) is similar:
+
+| kernel | block | args | busy @ spin=500 | busy @ spin=2000 |
+|---|---|---|---|---|
+| k1 | 256 | 1 ptr, 2 scalars              | 7.80 us | 47.20 us |
+| k2 | 128 | 3 ptr (2 unused), 2 scalars  | 7.84 us | 47.20 us |
+| k3 | 64  | 5 ptr (4 unused), 4 scalars (2 unused int)   | 8.88 us | 50.64 us |
+| k4 | 512 | 2 ptr (1 unused), 4 scalars (2 unused float) | 7.80 us | 47.24 us |
+
+Whole-graph e2e (K=800):
+
+| spin | avg busy (us) | AQL e2e (ms) | PM4 e2e (ms) | AQL gap (us) | PM4 gap (us) | PM4 saves |
+|---|---|---|---|---|---|---|
+| 500  | 8.08  | 7.74 | 6.50  | 1.60 | ~0.00 | 1.56 us (16.1%) |
+| 2000 | 48.07 | 42.00 | 37.56 | 4.43 | ~0.00 | 5.56 us (10.6%) |
+
+FREE (default DVFS, e2e median of 5): spin=500 AQL 5.89 / PM4 4.83 ms (18.0%);
+spin=2000 AQL 75.34 / PM4 71.05 ms (5.7%) -- same DVFS inflation as elsewhere
+(spin=2000 e2e 75 ms free vs 42 ms pinned).
+
+Takeaway: varying launch dims and kernarg layout/size per dispatch does NOT
+change the result. PM4 IB replay still removes essentially the whole per-dispatch
+gap (PM4 gap ~0; 10-16% e2e savings on these short/mid kernels), matching the
+homogeneous and short/long interleave cases -- PM4's advantage is not limited to
+repeated identical kernels.
+
 ## Why busy jumps so much between spin=1000 and spin=1500 (esp. free)
 
 Two independent effects stack at this exact spot:
