@@ -127,22 +127,37 @@ gid<n guard, so the active thread count (and thus busy) is similar:
 | k3 | 64  | 5 ptr (4 unused), 4 scalars (2 unused int)   | 8.88 us | 50.64 us |
 | k4 | 512 | 2 ptr (1 unused), 4 scalars (2 unused float) | 7.80 us | 47.24 us |
 
-Whole-graph e2e (K=800):
+K=800 = 200 of each kernel = 800 TOTAL dispatches (the four kernels cycle, node
+k uses kernel k%4); it is NOT 800x4. avg busy = mean of the four per-kernel
+medians.
+
+Whole-graph e2e -- clocks LOCKED (profile_peak, GFX ~2319 MHz):
 
 | spin | avg busy (us) | AQL e2e (ms) | PM4 e2e (ms) | AQL gap (us) | PM4 gap (us) | PM4 saves |
 |---|---|---|---|---|---|---|
-| 500  | 8.08  | 7.74 | 6.50  | 1.60 | ~0.00 | 1.56 us (16.1%) |
-| 2000 | 48.07 | 42.00 | 37.56 | 4.43 | ~0.00 | 5.56 us (10.6%) |
+| 250  | 4.49  | 4.88  | 3.63  | 1.62 | 0.05  | 1.57 us (25.6%) |
+| 500  | 8.07  | 7.76  | 6.49  | 1.64 | 0.04  | 1.59 us (16.4%) |
+| 1000 | 19.14 | 18.46 | 16.20 | 3.93 | 1.12  | 2.82 us (12.2%) |
+| 2000 | 48.16 | 42.38 | 38.08 | 4.83 | ~0.00 | 5.39 us (10.2%) |
 
-FREE (default DVFS, e2e median of 5): spin=500 AQL 5.89 / PM4 4.83 ms (18.0%);
-spin=2000 AQL 75.34 / PM4 71.05 ms (5.7%) -- same DVFS inflation as elsewhere
-(spin=2000 e2e 75 ms free vs 42 ms pinned).
+Whole-graph e2e -- clocks FREE (default DVFS, e2e median of 5):
+
+| spin | AQL e2e (ms) | PM4 e2e (ms) | PM4 saves (% of e2e) |
+|---|---|---|---|
+| 250  | 3.83  | 2.75  | 28.0% |
+| 500  | 5.88  | 4.83  | 18.0% |
+| 1000 | 17.19 | 14.87 | 13.5% |
+| 2000 | 75.29 | 70.85 | 5.9% |
 
 Takeaway: varying launch dims and kernarg layout/size per dispatch does NOT
-change the result. PM4 IB replay still removes essentially the whole per-dispatch
-gap (PM4 gap ~0; 10-16% e2e savings on these short/mid kernels), matching the
-homogeneous and short/long interleave cases -- PM4's advantage is not limited to
-repeated identical kernels.
+change the result. PM4 IB replay is faster in EVERY case, locked and free,
+removing essentially the whole per-dispatch gap (PM4 gap ~0; 10-26% e2e savings
+on these short/mid kernels). Note this heterogeneous mix does NOT reproduce the
+PM4-slower-under-free anomaly seen for the minimal homogeneous spin=1000 kernel:
+the extra per-dispatch host work (distinct kernels, larger kernargs) keeps the
+clock boosted, so PM4 stays ahead. PM4's advantage is not limited to repeated
+identical kernels. (Free spin=2000 e2e is ~75 ms vs ~42 ms locked -- the usual
+DVFS clock drop for the longer post-step kernel.)
 
 ## Why busy jumps so much between spin=1000 and spin=1500 (esp. free)
 
