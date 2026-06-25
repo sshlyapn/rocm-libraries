@@ -152,12 +152,22 @@ Whole-graph e2e -- clocks FREE (default DVFS, e2e median of 5):
 Takeaway: varying launch dims and kernarg layout/size per dispatch does NOT
 change the result. PM4 IB replay is faster in EVERY case, locked and free,
 removing essentially the whole per-dispatch gap (PM4 gap ~0; 10-26% e2e savings
-on these short/mid kernels). Note this heterogeneous mix does NOT reproduce the
-PM4-slower-under-free anomaly seen for the minimal homogeneous spin=1000 kernel:
-the extra per-dispatch host work (distinct kernels, larger kernargs) keeps the
-clock boosted, so PM4 stays ahead. PM4's advantage is not limited to repeated
-identical kernels. (Free spin=2000 e2e is ~75 ms vs ~42 ms locked -- the usual
-DVFS clock drop for the longer post-step kernel.)
+on these short/mid kernels). PM4's advantage is not limited to repeated identical
+kernels.
+
+On the free PM4-slower anomaly (minimal homogeneous spin=1000 kernel only):
+PM4 has fewer/smaller gaps than AQL, so at the SAME clock it can never be slower
+-- yet free homogeneous spin=1000 gave PM4 37 ms vs AQL 27 ms (~1.37x). The only
+consistent reading is that the PM4 run settled at a LOWER GFX clock under free
+DVFS; it is a clock-state artifact, not a dispatch-path cost. (PM4 replays a
+prebaked PM4 IB from VRAM and the CP pulls the packets itself, so there is no
+meaningful per-dispatch host-work difference -- the earlier "host work" wording
+was wrong.) The exact DVFS trigger -- why the SMU clocks AQL's gappy stream and
+PM4's tightly packed stream differently on that minimal kernel -- was not pinned
+down (short-kernel clock sampling is dominated by the idle state between graphs
+and is unreliable). The heterogeneous mix does not show the anomaly, and pinning
+clocks removes it entirely (PM4 always faster). Free spin=2000 e2e is ~75 ms vs
+~42 ms locked -- the usual DVFS clock drop for the longer post-step kernel.
 
 ## Why busy jumps so much between spin=1000 and spin=1500 (esp. free)
 
