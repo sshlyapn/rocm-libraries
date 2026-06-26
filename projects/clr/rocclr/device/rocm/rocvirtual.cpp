@@ -2611,12 +2611,33 @@ void VirtualGPU::encodePm4GraphTemplate(void* const* packets, size_t numPackets,
   // HIP_PM4_GRAPH_NO_INHERIT_SCOPE, see pm4GraphInheritScopeEnabled). The
   // diagnostic fullFence override takes precedence. Boundaries stay full-L2.
   const bool inheritScope = pm4GraphInheritScopeEnabled() && !fullFence;
+  // INTRA-GRAPH SCOPE REDUCTION (default ON; opt-out HIP_PM4_GRAPH_EDGE_FULL_L2=1).
+  // On gfx12 the runtime stamps EVERY kernel dispatch packet with acquire=SYSTEM
+  // (see dispatchPacketHeader_ / sysAcquireAgentReleaseHBits), a blanket-conservative
+  // default that is NOT derived from any real data-dependency analysis. With
+  // inherit-scope on, edgeMaskFor would therefore promote ~every interior edge to a
+  // full-L2 flush (gcrFull), even for a pure device-local kernel->kernel RAW chain.
+  // That full-L2 work is REDUNDANT in the interior of a graph: GL2 is the single
+  // device coherence point shared by all CUs. The producer drain (CS_PARTIAL_FLUSH)
+  // retires its waves and its write-through L0/L1 land in GL2; an AGENT acquire on the
+  // consumer (invalidate per-CU GL0/GL1/GLK, NO L2 op) then misses to GL2 and reads
+  // fresh data. A SYSTEM acquire's extra GL2 invalidate/writeback only buys HOST/peer
+  // visibility, which mid-graph kernels never need: the graph's LEADING acquireFull
+  // (pre-kernel-0) already pulls system state into coherence, and the TRAILING
+  // acquireFull writes results back to system at the end. So we cap every INTERIOR
+  // edge at AGENT and keep full-L2 strictly at the leading/trailing boundaries. This
+  // matches this path's own stated intent ("AGENT ... the only correct choice") and
+  // is correctness-preserving for device-local RAW; HIP_PM4_GRAPH_EDGE_FULL_L2
+  // restores the old promote-to-SYSTEM behavior for paranoid A/B. Plain ASCII only.
+  const bool edgeFullL2 = pm4EnvBool("HIP_PM4_GRAPH_EDGE_FULL_L2", false);
   // Map an HSA fence scope (NONE<AGENT<SYSTEM) to a per-edge GCR mask. Returns 0
   // for NONE to signal "emit no fence" (independent kernels may overlap).
   auto scopeToEdgeMask = [&](uint32_t scope) -> uint32_t {
-    if (scope == HSA_FENCE_SCOPE_SYSTEM) return arch.gcrFull;
-    if (scope == HSA_FENCE_SCOPE_AGENT) return kGcrAgent;
-    return 0u;  // HSA_FENCE_SCOPE_NONE -> no fence
+    if (scope == HSA_FENCE_SCOPE_NONE) return 0u;  // independent -> no fence (overlap)
+    // Interior RAW edge: AGENT is sufficient (see note above). Only the opt-out
+    // keeps the hardware-conservative SYSTEM promotion.
+    if (edgeFullL2 && scope == HSA_FENCE_SCOPE_SYSTEM) return arch.gcrFull;
+    return kGcrAgent;
   };
   // Fence after dispatch i = max(this kernel's release, next kernel's acquire).
   auto edgeMaskFor = [&](size_t i) -> uint32_t {

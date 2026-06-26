@@ -21,6 +21,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -170,16 +171,23 @@ int main(int argc, char** argv) {
     HIPCHECK(hipEventCreate(&g0));
     HIPCHECK(hipEventCreate(&g1));
     double best_ms = 1e30;
+    double best_ms_host = 1e30;
     for (int r = 0; r < 5; r++) {
+        auto h0 = std::chrono::high_resolution_clock::now();
         HIPCHECK(hipEventRecord(g0, stream));
         HIPCHECK(hipGraphLaunch(exec, stream));
         HIPCHECK(hipEventRecord(g1, stream));
         HIPCHECK(hipStreamSynchronize(stream));
+        auto h1 = std::chrono::high_resolution_clock::now();
+        double host_ms =
+            std::chrono::duration<double, std::milli>(h1 - h0).count();
+        best_ms_host = std::min(best_ms_host, host_ms);
         float ms = 0;
         HIPCHECK(hipEventElapsedTime(&ms, g0, g1));
         best_ms = std::min(best_ms, (double)ms);
     }
     double period_us = best_ms * 1000.0 / K;
+    double period_us_host = best_ms_host * 1000.0 / K;
 
     auto to_us = [&](long long t) { return (double)t / ticks_per_us; };
     std::vector<double> busy, gap;
@@ -198,6 +206,7 @@ int main(int argc, char** argv) {
     };
     printf("inkernel: busy_med=%.2f us  gap_med=%.2f us  (atomic cross-check)\n", med(busy),
            med(gap));
-    printf("e2e     : period=%.3f us/dispatch  (best-of-5, K=%d) PERIOD\n", period_us, K);
+    printf("e2e     : period=%.3f us/dispatch (hipEvent)  host_period=%.3f us/dispatch (chrono)  (best-of-5, K=%d) PERIOD\n",
+           period_us, period_us_host, K);
     return 0;
 }
